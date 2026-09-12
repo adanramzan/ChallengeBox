@@ -56,6 +56,16 @@ def _reader(stream, cap: int, sink: list):
             take = chunk[: cap - kept]; sink.append(take); kept += len(take)
     stream.close()
 
+def _writer(stream, data: bytes):
+    try:
+        if data:
+            stream.write(data)
+    except (BrokenPipeError, OSError):
+        pass
+    finally:
+        try: stream.close()
+        except OSError: pass
+
 def run_cmd(argv: list[str], *, stdin: bytes = b"", timeout_s: float, cwd: str | None = None,
             mem_mb: int = 4096, max_output: int = 1_000_000) -> RunResult:
     # HOME must be the real home for rustup/rustc toolchain discovery, not cwd
@@ -66,11 +76,8 @@ def run_cmd(argv: list[str], *, stdin: bytes = b"", timeout_s: float, cwd: str |
     out_parts, err_parts = [], []
     out_thread = threading.Thread(target=_reader, args=(p.stdout, max_output, out_parts), daemon=True)
     err_thread = threading.Thread(target=_reader, args=(p.stderr, max_output, err_parts), daemon=True)
-    out_thread.start(); err_thread.start()
-    try:
-        p.stdin.write(stdin); p.stdin.close()
-    except (BrokenPipeError, OSError):
-        pass
+    stdin_thread = threading.Thread(target=_writer, args=(p.stdin, stdin), daemon=True)
+    out_thread.start(); err_thread.start(); stdin_thread.start()
     timed_out = False
     try:
         p.wait(timeout=max(0.05, timeout_s))
@@ -81,7 +88,7 @@ def run_cmd(argv: list[str], *, stdin: bytes = b"", timeout_s: float, cwd: str |
         except ProcessLookupError:
             pass
         p.wait()
-    out_thread.join(timeout=5); err_thread.join(timeout=5)
+    out_thread.join(timeout=5); err_thread.join(timeout=5); stdin_thread.join(timeout=1)
     return RunResult(p.returncode, b"".join(out_parts), b"".join(err_parts), time.monotonic() - t0, timed_out)
 
 @dataclass
@@ -162,15 +169,15 @@ def python_static(source: str, entrypoint: str) -> list[str]:
         problems.append(f"entrypoint {entrypoint} not defined at top level")
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            root = module.split(".")[0] if module else ""
             # from sys import ... is always forbidden
-            if node.module == "sys":
+            if root == "sys":
                 problems.append(f"forbidden import sys")
-            elif node.module and node.module not in sys.stdlib_module_names:
-                problems.append(f"non-stdlib import {node.module}")
-            # Check for aliased names (import sys as s)
-            for alias in node.names:
-                if alias.asname is not None and alias.name == "sys":
-                    problems.append(f"forbidden import sys as {alias.asname}")
+            elif root and root not in sys.stdlib_module_names:
+                problems.append(f"non-stdlib import {module}")
+            elif root in _PY_FORBIDDEN_MODULES:
+                problems.append(f"forbidden import {module}")
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(".")[0]
@@ -179,7 +186,11 @@ def python_static(source: str, entrypoint: str) -> list[str]:
                     problems.append(f"forbidden import sys as {alias.asname}")
                 elif root not in sys.stdlib_module_names:
                     problems.append(f"non-stdlib import {alias.name}")
-                elif root in _PY_FORBIDDEN_MODULES and not (root == "sys" and _only_setrecursionlimit(tree)):
+                elif root == "sys":
+                    # import sys allowed only if used for setrecursionlimit/getrecursionlimit/maxsize
+                    if not _only_setrecursionlimit(tree):
+                        problems.append(f"forbidden import {alias.name}")
+                elif root in _PY_FORBIDDEN_MODULES:
                     problems.append(f"forbidden import {alias.name}")
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _PY_FORBIDDEN_CALLS:
             problems.append(f"forbidden call {node.func.id}")

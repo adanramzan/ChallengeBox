@@ -25,16 +25,35 @@ def test_run_cmd_caps_output_both_streams(tmp_path):
     r = run_cmd([sys.executable, "-c", code], timeout_s=10, cwd=str(tmp_path), max_output=10_000)
     assert len(r.stdout) <= 10_000 and len(r.stderr) <= 10_000
 
+def test_run_cmd_times_out_even_when_child_ignores_large_stdin(tmp_path):
+    # Child ignores stdin but sleeps 10s; timeout is 1.0s; must return in <4s with timed_out=True
+    t0 = time.monotonic()
+    r = run_cmd([sys.executable, "-c", "import time; time.sleep(10)"], stdin=b"x"*50_000_000, timeout_s=1.0, cwd=str(tmp_path))
+    elapsed = time.monotonic() - t0
+    assert r.timed_out and elapsed < 4
+
+def test_run_cmd_delivers_stdin(tmp_path):
+    # Child reads stdin and prints its length
+    code = "import sys; print(len(sys.stdin.buffer.read()))"
+    r = run_cmd([sys.executable, "-c", code], stdin=b"x"*5_000_000, timeout_s=10, cwd=str(tmp_path))
+    assert r.stdout.strip() == b"5000000"
+
 def test_run_cmd_env_is_clean(tmp_path, monkeypatch):
     monkeypatch.setenv("SECRET_KEY", "leak")
-    r = run_cmd([sys.executable, "-c", "import os; print(os.environ.get('SECRET_KEY','none')); import json; print(json.dumps(sorted(os.environ)))"], timeout_s=5, cwd=str(tmp_path))
+    r = run_cmd([sys.executable, "-c", "import os; print(os.environ.get('SECRET_KEY','none')); print(sorted(os.environ))"], timeout_s=5, cwd=str(tmp_path))
     lines = r.stdout.strip().split(b'\n')
     assert lines[0] == b"none"
-    import json
-    env_keys = json.loads(lines[1].decode())
-    # Check that required keys are present and SECRET_KEY is not leaked
-    assert set(env_keys) >= {"HOME", "LANG", "PATH"}
-    assert "SECRET_KEY" not in env_keys
+    # Parse subprocess environment
+    env_str = lines[1].decode()
+    env_list = eval(env_str)  # Safe here since we control the subprocess
+    # Verify required keys are present and SECRET_KEY is not leaked
+    assert set(env_list) >= {"HOME", "LANG", "PATH"}
+    assert "SECRET_KEY" not in env_list
+    # On most systems (non-macOS), should be exactly these three
+    # macOS adds __CF_USER_TEXT_ENCODING and other vars at OS level
+    if "__CF_USER_TEXT_ENCODING" not in os.environ:
+        # Not on macOS, should be exactly these three
+        assert env_list == ["HOME", "LANG", "PATH"]
 
 def test_run_python_cases_basic(tmp_path):
     src = "def add(a, b):\n    return a + b\n"
@@ -80,6 +99,16 @@ def test_python_static_sys_bypass():
     assert any("sys" in v for v in python_static("import sys as s\ndef solve(x):\n    return s.maxsize\n", "solve"))
     assert python_static("import sys\nsys.setrecursionlimit(10**6)\ndef solve(x):\n    return x\n", "solve") == []
     assert any("forbidden import" in v for v in python_static("import os\ndef solve(x):\n    return x\n", "solve"))
+
+def test_python_static_from_forbidden_imports():
+    # from os import path should be forbidden (os is in forbidden modules)
+    assert any("forbidden" in v for v in python_static("from os import path\ndef solve(x):\n    return x\n", "solve"))
+    # from subprocess import Popen should be forbidden
+    assert any("forbidden" in v for v in python_static("from subprocess import Popen\ndef solve(x):\n    return x\n", "solve"))
+    # from os.path import join should be forbidden (root is os)
+    assert any("forbidden" in v for v in python_static("from os.path import join\ndef solve(x):\n    return x\n", "solve"))
+    # from collections.abc import Mapping should be allowed (collections not forbidden)
+    assert python_static("from collections.abc import Mapping\ndef solve(x):\n    return x\n", "solve") == []
 
 def test_problem_load_validates(tmp_path):
     p = tmp_path / "p.json"
