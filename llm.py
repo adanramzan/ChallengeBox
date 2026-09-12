@@ -1,0 +1,135 @@
+"""One OpenAI-compatible chat client. Provider is chosen purely by config."""
+from __future__ import annotations
+import json, os, re, threading, time, tomllib, urllib.request, urllib.error
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Role:
+    name: str
+    base_url: str
+    model: str
+    api_key_env: str
+    max_tokens: int
+    max_concurrent: int
+    timeout_cap_s: float
+    extra: dict = field(default_factory=dict)
+
+
+@dataclass
+class Reply:
+    content: str
+    reasoning: str
+    usage: dict
+    latency_s: float
+    model: str
+    error: str | None = None
+
+    @property
+    def text(self) -> str:
+        return self.content if self.content.strip() else self.reasoning
+
+
+def load_config(path: str, profile: str) -> dict:
+    with open(path, "rb") as f:
+        cfg = tomllib.load(f)
+    prof = cfg["profiles"][profile]  # KeyError on unknown profile is intended
+    roles = {name: Role(name, r["base_url"].rstrip("/"), r["model"], r.get("api_key_env", ""), int(r["max_tokens"]),
+                        int(r.get("max_concurrent", 1)), float(r.get("timeout_cap_s", 120.0)), dict(r.get("extra", {})))
+             for name, r in prof.items()}
+    return {"roles": roles, "limits": cfg["limits"], "phases": cfg["phases"], "profile": profile}
+
+
+class LLM:
+    def __init__(self, roles: dict[str, Role]):
+        self.roles = roles
+        self.calls: list[dict] = []
+        self._sems: dict[tuple, threading.Semaphore] = {}
+        limits: dict[tuple, int] = {}
+        for r in roles.values():
+            key = (r.base_url, r.model)
+            limits[key] = min(limits[key], r.max_concurrent) if key in limits else r.max_concurrent
+        for key, n in limits.items():
+            self._sems[key] = threading.Semaphore(n)
+
+    def chat(self, role: str, system: str, user: str, *, timeout_s: float, max_tokens: int | None = None, tag: str = "") -> Reply:
+        r = self.roles[role]
+        body = {"model": r.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                "max_tokens": max_tokens or r.max_tokens, "temperature": 0.2, "stream": False, **r.extra}
+        if timeout_s <= 0:
+            reply = Reply("", "", {}, 0.0, r.model, "timeout")
+            self.calls.append({"role": role, "tag": tag, "model": reply.model, "latency_s": 0.0, "usage": {},
+                               "error": "timeout", "timed_out": True, "max_tokens": body["max_tokens"]})
+            return reply
+        headers = {"Content-Type": "application/json"}
+        key = os.environ.get(r.api_key_env) if r.api_key_env else None
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        req = urllib.request.Request(r.base_url + "/chat/completions", data=json.dumps(body).encode(), headers=headers)
+        result: dict = {}
+        sem = self._sems[(r.base_url, r.model)]
+        sem.acquire()
+
+        def work():
+            try:
+                with urllib.request.urlopen(req, timeout=timeout_s + 5) as resp:
+                    result["data"] = json.load(resp)
+            except urllib.error.HTTPError as e:
+                result["error"] = f"http {e.code}: {e.read().decode('utf-8', 'replace')[:300]}"
+            except Exception as e:  # transport errors
+                result["error"] = f"transport: {e!r}"[:300]
+            finally:
+                sem.release()
+
+        t0 = time.monotonic()
+        th = threading.Thread(target=work, daemon=True); th.start(); th.join(timeout=timeout_s)
+        timed_out = th.is_alive()
+        latency = time.monotonic() - t0
+        if timed_out:
+            reply = Reply("", "", {}, latency, r.model, "timeout")
+        elif "error" in result:
+            reply = Reply("", "", {}, latency, r.model, result["error"])
+        else:
+            d = result["data"]; msg = d["choices"][0]["message"]
+            reply = Reply(msg.get("content") or "", msg.get("reasoning_content") or msg.get("reasoning") or "",
+                          d.get("usage") or {}, latency, d.get("model", r.model), None)
+        self.calls.append({"role": role, "tag": tag, "model": reply.model, "latency_s": round(latency, 2), "usage": reply.usage,
+                           "error": reply.error, "timed_out": timed_out, "max_tokens": body["max_tokens"]})
+        return reply
+
+
+_BLOCK = re.compile(r"===([A-Z_]+)===\s*\n(.*?)(?:\n===END===|\Z)", re.S)
+_FENCE = re.compile(r"```[a-zA-Z0-9_+-]*[ \t]*\n(.*?)\n```", re.S)
+
+
+def _unfence(body: str) -> str:
+    fences = _FENCE.findall(body)
+    if not fences:
+        return body
+    return max(fences, key=len).strip()
+
+
+def parse_blocks(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for name, body in _BLOCK.findall(text):
+        if name == "END":
+            continue
+        out[name] = _unfence(body.strip())  # last occurrence wins
+    return out
+
+
+class FakeLLM:
+    def __init__(self, script: dict[str, list[str]]):
+        self.script = {k: list(v) for k, v in script.items()}
+        self.calls: list[dict] = []
+        self.prompts: list[tuple[str, str, str]] = []
+        self._lock = threading.Lock()
+
+    def chat(self, role: str, system: str, user: str, *, timeout_s: float, max_tokens: int | None = None, tag: str = "") -> Reply:
+        with self._lock:
+            key = tag if tag in self.script else role
+            assert self.script.get(key), f"FakeLLM: no scripted reply left for {key!r} (tag={tag!r}, role={role!r})"
+            text = self.script[key].pop(0)
+            self.prompts.append((role, system, user))
+            self.calls.append({"role": role, "tag": tag, "model": "fake", "latency_s": 0.0, "usage": {"prompt_tokens": 1, "completion_tokens": 1}, "error": None, "timed_out": False})
+        return Reply(text, "", {"prompt_tokens": 1, "completion_tokens": 1}, 0.0, "fake", None)

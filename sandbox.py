@@ -111,12 +111,12 @@ except Exception:
 for line in open(sys.argv[3], encoding="utf-8"):
     line = line.rstrip("\n")
     if not line: continue
-    args = ast.literal_eval(line); before = copy.deepcopy(args)
     t0 = time.perf_counter()
     try:
+        args = ast.literal_eval(line); before = copy.deepcopy(args)
         out = fn(*args); ok = True; err = ""
     except BaseException:
-        out = None; ok = False; err = traceback.format_exc()[-1500:]
+        args = before = None; out = None; ok = False; err = traceback.format_exc()[-1500:]
     dt = time.perf_counter() - t0
     try:
         mutated = args != before

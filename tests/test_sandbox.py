@@ -1,6 +1,6 @@
 import os, sys, time, ast, pytest, shutil
 import sandbox
-from sandbox import run_cmd, run_python_cases, python_static, Problem, rust_static, compile_rust, run_rust_cases, tokens
+from sandbox import run_cmd, run_python_cases, python_static, Problem, rust_static, compile_rust, run_rust_cases, tokens, _PY_HARNESS, PYTHON
 
 ALLOWED_OS_INJECTED = {"__CF_USER_TEXT_ENCODING"}  # macOS injects this into every child; not inherited from our env dict
 
@@ -76,6 +76,18 @@ def test_run_python_cases_unrepresentable_result(tmp_path):
     assert not res[0].ok and "unrepresentable" in res[0].error
     assert not res[1].ok and ("unrepresentable" in res[1].error or "unparseable" in res[1].error)
     assert len(res) == 2
+
+def test_harness_recovers_from_unparseable_case_line(tmp_path):
+    # Minor fix: ast.literal_eval(line) used to run OUTSIDE the per-case try, so one unparseable line
+    # crashed the harness process entirely and no later case (even valid ones) got a result.
+    cand = tmp_path / "cand.py"; cand.write_text("def f(x):\n    return x + 1\n")
+    harness = tmp_path / "harness.py"; harness.write_text(_PY_HARNESS)
+    cases = tmp_path / "cases.txt"; cases.write_text("not a literal(((\n(2,)\n")
+    r = run_cmd([PYTHON, str(harness), str(cand), "f", str(cases)], timeout_s=10, cwd=str(tmp_path))
+    lines = r.stdout.decode().splitlines()
+    assert len(lines) == 2   # both lines produced a result; the bad one didn't kill the harness
+    first = ast.literal_eval(lines[0]); assert first["ok"] is False
+    second = ast.literal_eval(lines[1]); assert second["ok"] is True and second["output"] == 3
 
 def test_python_static_rules():
     assert python_static("def solve(x):\n    return x\n", "solve") == []
