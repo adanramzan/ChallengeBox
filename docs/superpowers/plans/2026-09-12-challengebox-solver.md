@@ -87,6 +87,7 @@ runs/
 __pycache__/
 *.pyc
 .pytest_cache/
+.superpowers/
 ```
 
 - [ ] **Step 4: Write `config.toml`**
@@ -684,7 +685,7 @@ git commit -m "feat: monotonic budget controller with phase transitions"
 `tests/test_llm.py`:
 ```python
 import json, threading, time, pathlib
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 from llm import LLM, Role, FakeLLM, parse_blocks, load_config
 
@@ -721,7 +722,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def server():
-    srv = HTTPServer(("127.0.0.1", 0), _Handler); th = threading.Thread(target=srv.serve_forever, daemon=True); th.start()
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler); th = threading.Thread(target=srv.serve_forever, daemon=True); th.start()   # threaded, so the semaphore is what serializes
     yield f"http://127.0.0.1:{srv.server_port}/v1"; srv.shutdown()
 
 def test_chat_serializes_when_max_concurrent_1(server):
@@ -1040,7 +1041,7 @@ def cfg():
 
 SOLVE_OK = "===RULES===\nr\n===END===\n===TRAPS===\nt\n===END===\n===ALGORITHM===\na\n===END===\n===CODE===\n```python\ndef add(a, b):\n    return a + b\n```\n===END===\n"
 ORACLE_OK = "===ORACLE===\nimport random\ndef reference(a, b):\n    return a + b\ndef gen(seed, mode):\n    r = random.Random(seed)\n    return (r.randint(0, 20), r.randint(0, 20))\n===END===\n"
-STRESS_OK = "===STRESS===\ndef gen_max(seed):\n    return (10**18, 10**18)\nEDGES = [(0, 0), (1, 0)]\n===END===\n"
+STRESS_OK = "===STRESS===\ndef gen_max(seed):\n    return (10**18, 10**18)\nEDGES = [(0, 0), (15, 0)]\n===END===\n"   # (15, 0) deterministically exposes the planted a>=15 bug used in later tests
 
 def test_single_shot_emits_solution_and_report(tmp_path):
     llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
