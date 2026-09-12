@@ -19,18 +19,18 @@ settle_until = 0.93
 # Any OpenAI-compatible endpoint can be added as another [profiles.<name>.<role>] table.
 [profiles.openrouter.strong]
 base_url = "https://openrouter.ai/api/v1"
-model = "deepseek/deepseek-v4.1-flash"
+model = "qwen/qwen3-coder"
 api_key_env = "OPENROUTER_API_KEY"
-max_tokens = 16000
+max_tokens = 12000
 max_concurrent = 3
 timeout_cap_s = 120.0
-extra = { reasoning = { effort = "medium" } }
+extra = {}   # non-reasoning models: reasoning params are ignored and burn the whole budget
 
 [profiles.openrouter.fast]
 base_url = "https://openrouter.ai/api/v1"
-model = "qwen/qwen3.7-flash"
+model = "deepseek/deepseek-chat-v3-0324"
 api_key_env = "OPENROUTER_API_KEY"
-max_tokens = 6000
+max_tokens = 8000
 max_concurrent = 3
 timeout_cap_s = 60.0
-extra = { reasoning = { effort = "low" } }
+extra = {}
