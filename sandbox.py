@@ -1,0 +1,152 @@
+"""Untrusted-code execution: process isolation, harnesses, static contract checks."""
+from __future__ import annotations
+import ast, json, os, resource, signal, subprocess, sys, time
+from dataclasses import dataclass, field
+
+PYTHON = sys.executable
+
+@dataclass
+class Problem:
+    problem_id: str
+    language: str
+    statement: str
+    entrypoint: str
+    public_examples: list
+    deadline_s: float
+
+    @staticmethod
+    def load(path: str) -> "Problem":
+        with open(path, "rb") as f:
+            d = json.load(f)
+        for k in ("problem_id", "language", "statement", "entrypoint", "deadline_s"):
+            if k not in d:
+                raise ValueError(f"missing field {k}")
+        if d["language"] not in ("python", "rust"):
+            raise ValueError(f"unsupported language {d['language']}")
+        if not isinstance(d["deadline_s"], (int, float)) or d["deadline_s"] <= 0:
+            raise ValueError("deadline_s must be positive")
+        return Problem(d["problem_id"], d["language"], d["statement"], d["entrypoint"],
+                       list(d.get("public_examples") or []), float(d["deadline_s"]))
+
+@dataclass
+class RunResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    duration_s: float
+    timed_out: bool
+
+def _limits(mem_mb: int):
+    def fn():
+        try:
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            # RLIMIT_AS is unreliable on macOS; set RLIMIT_DATA where possible and ignore failure.
+            resource.setrlimit(resource.RLIMIT_DATA, (mem_mb << 20, mem_mb << 20))
+        except (ValueError, OSError):
+            pass
+    return fn
+
+def run_cmd(argv: list[str], *, stdin: bytes = b"", timeout_s: float, cwd: str | None = None,
+            mem_mb: int = 4096, max_output: int = 1_000_000) -> RunResult:
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": cwd or "/tmp", "LANG": "C.UTF-8"}
+    t0 = time.monotonic()
+    p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         cwd=cwd, env=env, start_new_session=True, preexec_fn=_limits(mem_mb))
+    timed_out = False
+    try:
+        out, err = p.communicate(stdin, timeout=max(0.05, timeout_s))
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        out, err = p.communicate()
+    return RunResult(p.returncode, out[:max_output], err[:max_output], time.monotonic() - t0, timed_out)
+
+@dataclass
+class CaseResult:
+    ok: bool
+    output: object = None
+    error: str = ""
+    duration_s: float = 0.0
+    mutated: bool = False
+    timed_out: bool = False
+
+# Trusted harness. Reads one repr(args_tuple) per line from cases.txt, prints one repr(dict) per line.
+_PY_HARNESS = r'''
+import ast, copy, importlib.util, sys, time, traceback
+spec = importlib.util.spec_from_file_location("cand", sys.argv[1]); mod = importlib.util.module_from_spec(spec)
+try:
+    spec.loader.exec_module(mod); fn = getattr(mod, sys.argv[2])
+except Exception:
+    print(repr({"ok": False, "error": "IMPORT: " + traceback.format_exc()[-1500:]}), flush=True); sys.exit(2)
+for line in open(sys.argv[3], encoding="utf-8"):
+    line = line.rstrip("\n")
+    if not line: continue
+    args = ast.literal_eval(line); before = copy.deepcopy(args)
+    t0 = time.perf_counter()
+    try:
+        out = fn(*args); ok = True; err = ""
+    except BaseException:
+        out = None; ok = False; err = traceback.format_exc()[-1500:]
+    dt = time.perf_counter() - t0
+    try:
+        mutated = args != before
+    except Exception:
+        mutated = True
+    print(repr({"ok": ok, "output": out, "error": err, "duration_s": dt, "mutated": mutated}), flush=True)
+'''
+
+def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, timeout_s: float, workdir: str) -> list[CaseResult]:
+    os.makedirs(workdir, exist_ok=True)
+    cand = os.path.join(workdir, "cand.py"); harness = os.path.join(workdir, "harness.py"); cases = os.path.join(workdir, "cases.txt")
+    with open(cand, "w", encoding="utf-8") as f: f.write(source)
+    with open(harness, "w", encoding="utf-8") as f: f.write(_PY_HARNESS)
+    with open(cases, "w", encoding="utf-8") as f:
+        for a in args_list: f.write(repr(tuple(a)) + "\n")
+    r = run_cmd([PYTHON, harness, cand, entrypoint, cases], timeout_s=timeout_s, cwd=workdir, max_output=50_000_000)
+    results: list[CaseResult] = []
+    for line in r.stdout.decode("utf-8", "replace").splitlines():
+        try:
+            d = ast.literal_eval(line)
+        except Exception:
+            continue
+        if d.get("error", "").startswith("IMPORT:"):
+            return [CaseResult(False, error=d["error"]) for _ in args_list]
+        results.append(CaseResult(d["ok"], d.get("output"), d.get("error", ""), d.get("duration_s", 0.0), d.get("mutated", False)))
+    while len(results) < len(args_list):
+        results.append(CaseResult(False, error="timeout" if r.timed_out else "harness died: " + r.stderr.decode("utf-8", "replace")[-500:], timed_out=r.timed_out))
+    return results[:len(args_list)]
+
+_PY_FORBIDDEN_CALLS = {"open", "input", "print", "exec", "eval", "compile", "__import__", "breakpoint"}
+_PY_FORBIDDEN_MODULES = {"os", "subprocess", "socket", "sys", "shutil", "pathlib", "threading", "multiprocessing", "ctypes", "signal", "random"}
+
+def python_static(source: str, entrypoint: str) -> list[str]:
+    problems: list[str] = []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        return [f"syntax error: {e}"]
+    names = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+    if entrypoint not in names:
+        problems.append(f"entrypoint {entrypoint} not defined at top level")
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            mods = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
+            for m in mods:
+                root = m.split(".")[0]
+                if root not in sys.stdlib_module_names:
+                    problems.append(f"non-stdlib import {m}")
+                elif root in _PY_FORBIDDEN_MODULES and not (root == "sys" and _only_setrecursionlimit(tree)):
+                    problems.append(f"forbidden import {m}")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _PY_FORBIDDEN_CALLS:
+            problems.append(f"forbidden call {node.func.id}")
+    return problems
+
+def _only_setrecursionlimit(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "sys":
+            if node.attr not in ("setrecursionlimit", "getrecursionlimit", "maxsize"):
+                return False
+    return True
