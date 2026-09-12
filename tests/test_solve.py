@@ -473,3 +473,55 @@ def test_oracle_selfrepair_and_adjudication_regen_counters_are_independent(tmp_p
     assert rep["status"] in ("passed_all_gates", "emitted_unverified")
     evs = {e["kind"]: e for e in rep["evidence"][rep["final_candidate"]]}
     assert evs["diff_small"]["passed"] and not evs["diff_small"]["skipped"]
+
+
+def cfg_n(n):
+    c = cfg(); c["limits"]["solve_attempts"] = n; return c
+
+SOLVE_BUGGY = SOLVE_OK.replace("return a + b", "return a + b if a < 15 else a + b + 1")
+ORACLE_MED = "===ORACLE===\nimport random\ndef reference(a, b):\n    return a + b\ndef gen(seed, mode):\n    r = random.Random(seed)\n    hi = 20 if mode == 'small' else 10**5\n    return (r.randint(hi // 2, hi), r.randint(0, 20))\n===END===\n"
+
+
+def test_best_of_n_prefers_a_passing_attempt_over_repairing_a_failing_one(tmp_path):
+    # Attempt 1 carries the planted a>=15 bug that EDGES (15, 0) exposes; attempt 2 is correct.
+    # The correct attempt must win without any repair call being spent.
+    llm = FakeLLM({"solve": [SOLVE_BUGGY, SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg_n(2), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["repairs"] == 0, "a second attempt is cheaper than a repair and must be tried first"
+    assert not any(c["tag"] == "repair" for c in rep["calls"])
+    assert rep["status"] == "passed_all_gates" and rep["final_candidate"] == "c2"
+    assert (tmp_path / "s.py").read_text().strip() == "def add(a, b):\n    return a + b"
+
+
+def test_best_of_n_issues_one_solve_call_per_attempt(tmp_path):
+    llm = FakeLLM({"solve": [SOLVE_OK, SOLVE_BUGGY, SOLVE_BUGGY], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg_n(3), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert sum(1 for c in rep["calls"] if c["tag"] == "solve") == 3
+    assert rep["status"] == "passed_all_gates"   # the good one wins wherever it lands
+
+
+def test_identical_attempts_are_not_gated_twice(tmp_path):
+    # Duplicate source buys nothing and a gate pass is the scarce resource, so it must be dropped.
+    llm = FakeLLM({"solve": [SOLVE_OK, SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg_n(2), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert list(rep["evidence"]) == ["c1"]
+    assert any("solve.duplicate" in e for e in rep["events"])
+
+
+def test_single_attempt_remains_the_default_behaviour(tmp_path):
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert sum(1 for c in rep["calls"] if c["tag"] == "solve") == 1 and list(rep["evidence"]) == ["c1"]
+
+
+def test_repair_targets_the_best_attempt_not_the_last_gated(tmp_path):
+    # Attempt 1 fails only the LAST differential tier; attempt 2 fails an earlier one, so attempt 1
+    # got further. Once both are gated the repair must be spent on attempt 1 (c1), not on whichever
+    # happened to be gated last.
+    ok_small_bad_medium = SOLVE_OK.replace("return a + b", "return a + b if a < 10**4 else a + b + 1")
+    bad_small = SOLVE_OK.replace("return a + b", "return a + b if a < 15 else a + b + 1")
+    llm = FakeLLM({"solve": [ok_small_bad_medium, bad_small], "oracle": [ORACLE_MED], "stress": [STRESS_OK],
+                   "repair": ["===VERDICT===\ncandidate\n===END===\n===CODE===\ndef add(a, b):\n    return a + b\n===END===\n"]})
+    rep = S.solve(prob(tmp_path), llm, cfg_n(2), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["parents"].get("c3") == "c1", f"repair should build on the better attempt, got {rep['parents']}"
+    assert any("repair.target c1" in e for e in rep["events"])

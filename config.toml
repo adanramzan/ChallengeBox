@@ -5,6 +5,14 @@ cases_medium = 20
 stress_limit_python_s = 5.0
 stress_limit_rust_s = 2.0
 max_repairs = 2
+# Independent SOLVE attempts, gated against the same oracle; best_candidate() keeps whichever
+# passes the most gates. They are issued concurrently, so N costs max() latency, not sum -- the
+# strong model returns in ~10-20s of a ~157s generate allowance, so the spare time buys extra
+# shots at a correct solution rather than a slower model (no reasoning model on OpenRouter
+# returns inside a 300s deadline at this prompt size; see BENCHMARK-FINDINGS-ROUND2.md).
+# Each attempt costs one strong call plus, if it is reached, one gate pass -- gating is the
+# scarcer resource, so raise this only with the measured elapsed headroom to spend.
+solve_attempts = 2
 max_syntax_repairs = 2   # separate, smaller-scope budget for a static/compile failure -- a mechanical
                          # fix (missing import, missing mut) must not consume a semantic repair attempt
 mem_mb = 4096

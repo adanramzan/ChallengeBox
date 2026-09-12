@@ -140,19 +140,28 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     run = Run(problem, llm, cfg, run_dir, deadline_scale, clock)
     run.log(f"intake lang={problem.language} deadline={problem.deadline_s} scale={deadline_scale} usable={run.budget.usable_s:.0f}")
     pv = prompt_vars(problem)
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        # These three run concurrently, so the generate phase costs max(), not sum() —
-        # each call can therefore have the whole generate budget rather than a third of it.
+    attempts = max(1, int(cfg["limits"].get("solve_attempts", 1)))
+    with ThreadPoolExecutor(max_workers=attempts + 2) as ex:
+        # All of these run concurrently, so the generate phase costs max(), not sum() —
+        # each call can therefore have the whole generate budget rather than a share of it.
         gen_cap = cfg["phases"]["generate_call_share"] * run.budget.usable_s
-        f_solve = ex.submit(run.chat, "strong", "solve", gen_cap, **pv)
+        f_solves = [ex.submit(run.chat, "strong", "solve", gen_cap, **pv) for _ in range(attempts)]
         f_oracle = ex.submit(run.chat, "fast", "oracle", gen_cap, **pv)
         f_stress = ex.submit(run.chat, "fast", "stress", gen_cap, **pv)
-        r_solve, r_oracle, r_stress = f_solve.result(), f_oracle.result(), f_stress.result()
-    code = parse_blocks(r_solve.text).get("CODE", "")
-    if not code.strip() and r_solve.text.strip():
-        code = r_solve.text.strip()   # no ===CODE=== block parsed at all: fall back to the raw reply so a file is still emitted
-        run.log("solve.no_code_block using raw reply text")
-    if code.strip():
+        r_solves = [f.result() for f in f_solves]
+        r_oracle, r_stress = f_oracle.result(), f_stress.result()
+    for i, r_solve in enumerate(r_solves):
+        code = parse_blocks(r_solve.text).get("CODE", "")
+        if not code.strip() and r_solve.text.strip():
+            code = r_solve.text.strip()   # no ===CODE=== block parsed at all: fall back to the raw reply so a file is still emitted
+            run.log(f"solve.no_code_block attempt={i + 1} using raw reply text")
+        if not code.strip():
+            continue
+        # Identical attempts are one candidate: gating a duplicate costs a full gate pass and can
+        # only reach the same verdict. Sampling at temperature > 0 usually differs, but not always.
+        if any(c.source.strip() == code.strip() for c in run.cands):
+            run.log(f"solve.duplicate attempt={i + 1} identical to an earlier attempt, dropped")
+            continue
         cand = run.add_candidate(code, None); cand.evidence.append(static_evidence(problem, code))
     oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
     # The oracle is the single source of ground truth for every gate step, so a timeout here
@@ -190,9 +199,14 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     repairs = 0
     syntax_repairs = 0
     while run.cands:
-        cand = run.cands[-1]
+        # Gate every attempt that still has only its static evidence before spending a repair: a
+        # second independent attempt is cheaper than a repair and often already correct. Once all
+        # are gated, work on whichever passed the most gates (best_candidate's ranking), which is
+        # also the one that gets emitted.
+        ungated = [c for c in run.cands if len(c.evidence) == 1 and c.evidence[0].passed]
+        cand = ungated[0] if ungated else best_candidate(run.cands)
         try:
-            if cand.evidence and cand.evidence[0].passed:
+            if len(cand.evidence) == 1 and cand.evidence[0].passed:
                 cand.evidence = [cand.evidence[0]] + V.run_gate(problem, cand.source, gi, workdir=os.path.join(run_dir, cand.id), budget=run.budget, limits=cfg["limits"], log=run.log)
             if cand.all_passed():
                 # "static"/"compile" are pre-flight checks, not verification against the oracle; if
@@ -205,7 +219,20 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
                     run.log("gate.passed")
                 break
             failed = next(e for e in cand.evidence if not e.passed)
-            run.log(f"gate.failed kind={failed.kind} detail={json.dumps(failed.detail)[:300]}")
+            run.log(f"gate.failed cand={cand.id} kind={failed.kind} detail={json.dumps(failed.detail)[:300]}")
+            # Another independent attempt is still ungated: gate it before spending a repair call.
+            # It costs no model call, and an attempt that already passes beats a repaired one.
+            if len(ungated) > 1 and run.budget.can_afford(cfg["limits"]["repair_afford_s"]):
+                run.log(f"gate.next_attempt {len(ungated) - 1} attempt(s) still ungated, trying before repair")
+                continue
+            # Every attempt is now gated, and `cand` is merely the one gated last -- repair the one
+            # that got furthest instead, which is also the candidate that would be emitted.
+            cand = best_candidate(run.cands)
+            failed = next((e for e in cand.evidence if not e.passed), None)
+            if failed is None:
+                run.log("gate.passed"); break
+            if ungated and cand.id != ungated[0].id:
+                run.log(f"repair.target {cand.id} (best of {len(run.cands)} candidates), not the last gated")
             # A static/compile failure is mechanical (missing import, missing mut), not a semantic
             # defect -- it gets its own small budget so it can't eat the attempts meant for an actual
             # behavioral bug (diff_*, behavior, stress, overflow).
