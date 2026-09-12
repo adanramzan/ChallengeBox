@@ -133,7 +133,7 @@ for line in open(sys.argv[3], encoding="utf-8"):
     print(line, flush=True)
 '''
 
-def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, timeout_s: float, workdir: str) -> list[CaseResult]:
+def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, timeout_s: float, workdir: str, mem_mb: int = 4096) -> list[CaseResult]:
     # run_cmd sets cwd=workdir, so every path handed to the child must be absolute: a relative
     # workdir would otherwise be resolved a second time against itself and double the path.
     workdir = os.path.abspath(workdir)
@@ -143,7 +143,7 @@ def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, ti
     with open(harness, "w", encoding="utf-8") as f: f.write(_PY_HARNESS)
     with open(cases, "w", encoding="utf-8") as f:
         for a in args_list: f.write(repr(tuple(a)) + "\n")
-    r = run_cmd([PYTHON, harness, cand, entrypoint, cases], timeout_s=timeout_s, cwd=workdir, max_output=50_000_000)
+    r = run_cmd([PYTHON, harness, cand, entrypoint, cases], timeout_s=timeout_s, cwd=workdir, max_output=50_000_000, mem_mb=mem_mb)
     results: list[CaseResult] = []
     for line in r.stdout.decode("utf-8", "replace").splitlines():
         try:

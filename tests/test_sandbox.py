@@ -273,3 +273,17 @@ def test_relative_workdir_works_for_rust(tmp_path, monkeypatch):
     binp, err = compile_rust(RS_OK, overflow_checks=True, workdir="rel/rust")
     assert binp, err
     assert tokens(run_rust_cases(binp, ["21\n"], timeout_s=10)[0].output) == ["42"]
+
+def test_run_python_cases_forwards_mem_mb_to_run_cmd(tmp_path, monkeypatch):
+    # config.toml's [limits] mem_mb was threaded into Rust execution but run_python_cases had no
+    # mem_mb parameter at all, so Python candidates always ran at run_cmd's hardcoded 4096 default --
+    # invisible only because the two numbers happened to coincide. This must actually reach run_cmd.
+    captured = {}
+    orig_run_cmd = sandbox.run_cmd
+    def spy(argv, **kw):
+        captured["mem_mb"] = kw.get("mem_mb")
+        return orig_run_cmd(argv, **kw)
+    monkeypatch.setattr(sandbox, "run_cmd", spy)
+    res = run_python_cases("def add(a, b):\n    return a + b\n", "add", [(2, 3)], timeout_s=10, workdir=str(tmp_path), mem_mb=256)
+    assert res[0].ok and res[0].output == 5
+    assert captured["mem_mb"] == 256   # not run_cmd's default of 4096

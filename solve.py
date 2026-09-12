@@ -172,7 +172,21 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         run.log(f"gate.crashed {type(e).__name__}: {e}")
         if run.cands:
             run.cands[-1].evidence.append(V.Evidence("gate_error", False, detail={"error": f"{type(e).__name__}: {e}"}))
-        gi = V.GateInputs(oracle_src=oracle_src)
+        gi = V.GateInputs(oracle_src=oracle_src, notes=[f"prepare_gate_inputs crashed: {type(e).__name__}: {e}"])
+    # The oracle CALL can succeed while the CODE it wrote crashes at runtime -- reference() raising on
+    # every input, gen() raising while unpacking its own tuple -- leaving zero usable cases in every
+    # tier even though prepare_gate_inputs ran to completion. That's silent: no gate step fails (there's
+    # nothing to check), so the run would ship unverified. Recover once, the same way adjudication
+    # does (regenerate_oracle, reusing the fast model with the collected failure notes as context), but
+    # through its OWN one-shot counter (gi.oracle_selfrepairs) so this can fire and the unrelated
+    # adjudication regeneration (gi.oracle_regens, in the repair loop below) can still fire later in
+    # the same run -- one broken-oracle recovery must never spend the other's budget.
+    if V.oracle_unusable(gi) and run.budget.can_afford(cfg["limits"]["oracle_selfrepair_afford_s"]):
+        run.log(f"oracle.selfrepair triggered: no usable case in any tier; notes={'; '.join(gi.notes)[:300]}")
+        try:
+            gi = V.regenerate_oracle(run, gi, V.selfrepair_extra(gi), pv, counter="oracle_selfrepairs", workdir_tag="oracle_selfrepair")
+        except Exception as e:
+            run.log(f"oracle.selfrepair crashed {type(e).__name__}: {e}")
     repairs = 0
     syntax_repairs = 0
     while run.cands:
@@ -208,7 +222,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
                 repairs += 1
             new_source, verdict = V.repair(run, cand, failed, gi, pv)
             if verdict == "oracle" and gi.oracle_regens == 0:
-                gi = V.regenerate_oracle(run, gi, failed, pv)
+                gi = V.regenerate_oracle(run, gi, V.dispute_extra(gi, failed), pv, counter="oracle_regens")
                 if gi.regen_failed:
                     run.log("oracle.regen failed: stopping repair loop"); break
                 cand.evidence = cand.evidence[:1]   # re-gate the same candidate against the new oracle
@@ -238,6 +252,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     report = {"problem_id": problem.problem_id, "language": problem.language, "profile": cfg.get("profile"), "deadline_s": problem.deadline_s,
               "deadline_scale": deadline_scale, "elapsed_s": round(run.budget.elapsed(), 1), "status": status,
               "final_candidate": best.id if best else None, "repairs": repairs, "syntax_repairs": syntax_repairs, "oracle_regenerated": gi.oracle_regens,
+              "oracle_selfrepaired": gi.oracle_selfrepairs,
               "evidence": {c.id: [asdict(e) for e in c.evidence] for c in run.cands}, "parents": {c.id: c.parent for c in run.cands},
               "calls": list(llm.calls),
               "token_usage": {"prompt": sum((c["usage"] or {}).get("prompt_tokens", 0) for c in llm.calls),
@@ -263,15 +278,15 @@ def bench(sample_dir: str, out_dir: str, cfg: dict, llm, deadline_scale: float) 
                 rep = solve(p, llm, cfg, out_path=os.path.join(out_dir, f"{pid}.{'py' if p.language == 'python' else 'rs'}"), run_dir=os.path.join(out_dir, pid), deadline_scale=deadline_scale)
                 ev = {e["kind"]: e for e in rep["evidence"].get(rep["final_candidate"] or "", [])}
                 mark = lambda k: "n/a" if k not in ev else "skip" if ev[k].get("skipped") else ("pass" if ev[k]["passed"] else "FAIL")
-                rows.append({"id": pid, "lang": p.language, "compiles": mark("compile"), "edge": mark("diff_edge"), "small": mark("diff_small"),
+                rows.append({"id": pid, "lang": p.language, "compiles": mark("compile"), "public": mark("diff_public"), "edge": mark("diff_edge"), "small": mark("diff_small"),
                              "medium": mark("diff_medium"), "behavior": mark("behavior"), "stress": mark("stress"), "overflow": mark("overflow"), "repairs": rep["repairs"], "syntax_repairs": rep["syntax_repairs"], "calls": len(rep["calls"]),
                              "tokens": f"{rep['token_usage']['prompt']}/{rep['token_usage']['completion']}", "elapsed": rep["elapsed_s"], "cost": rep["cost_usd"], "status": rep["status"]})
             except Exception as e:
-                rows.append({"id": pid, "lang": "?", "compiles": "n/a", "edge": "n/a", "small": "n/a", "medium": "n/a", "behavior": "n/a", "stress": "n/a", "overflow": "n/a",
+                rows.append({"id": pid, "lang": "?", "compiles": "n/a", "public": "n/a", "edge": "n/a", "small": "n/a", "medium": "n/a", "behavior": "n/a", "stress": "n/a", "overflow": "n/a",
                              "repairs": 0, "syntax_repairs": 0, "calls": 0, "tokens": "0/0", "elapsed": 0.0, "cost": None, "status": f"error: {type(e).__name__}: {str(e)[:200]}"})
     finally:
-        hdr = "| Problem | Lang | Compiles | Edge | Small | Medium | Behavior | Stress | Overflow | Repairs | Syntax Repairs | Calls | Tokens in/out | Elapsed s | Cost USD | Status | Hidden tests |\n|---|---|---|---|---|---|---|---|---|---:|---:|---:|---|---:|---:|---|---|\n"
-        body = "".join(f"| {r['id']} | {r['lang']} | {r['compiles']} | {r['edge']} | {r['small']} | {r['medium']} | {r['behavior']} | {r['stress']} | {r['overflow']} | {r['repairs']} | {r['syntax_repairs']} | {r['calls']} | {r['tokens']} | {r['elapsed']} | {r['cost'] if r['cost'] is not None else 'n/a'} | {r['status']} | unknown |\n" for r in rows)
+        hdr = "| Problem | Lang | Compiles | Public | Edge | Small | Medium | Behavior | Stress | Overflow | Repairs | Syntax Repairs | Calls | Tokens in/out | Elapsed s | Cost USD | Status | Hidden tests |\n|---|---|---|---|---|---|---|---|---|---|---:|---:|---:|---|---:|---:|---|---|\n"
+        body = "".join(f"| {r['id']} | {r['lang']} | {r['compiles']} | {r['public']} | {r['edge']} | {r['small']} | {r['medium']} | {r['behavior']} | {r['stress']} | {r['overflow']} | {r['repairs']} | {r['syntax_repairs']} | {r['calls']} | {r['tokens']} | {r['elapsed']} | {r['cost'] if r['cost'] is not None else 'n/a'} | {r['status']} | unknown |\n" for r in rows)
         costs = [r["cost"] for r in rows if r["cost"] is not None]
         total_cost = f"{sum(costs):.4f}" if costs else "unknown"
         note = f"\nprofile={cfg.get('profile')} deadline_scale={deadline_scale} total_cost_usd={total_cost}. 'pass' = passed local gates; hidden-test status is unknown.\n"

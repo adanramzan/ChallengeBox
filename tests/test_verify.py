@@ -130,7 +130,7 @@ def test_differential_rust_divides_timeout_by_case_count(tmp_path, monkeypatch):
     # cases before reaching it, or a 200-case differential with a 60s cap has a 3-hour ceiling.
     rust = Problem("p", "rust", "s", "main", [], 300.0)
     captured = {}
-    def fake_run_candidate(problem, source, inputs, *, workdir, timeout_s, binary=None, overflow_checks=True):
+    def fake_run_candidate(problem, source, inputs, *, workdir, timeout_s, binary=None, overflow_checks=True, mem_mb=4096):
         captured["timeout_s"] = timeout_s; captured["n"] = len(inputs)
         return [V.CaseResult(True, output=str(i)) for i in inputs]
     monkeypatch.setattr(V, "run_candidate", fake_run_candidate)
@@ -145,7 +145,7 @@ def test_behavior_rust_divides_timeout_by_case_count(tmp_path, monkeypatch):
     # same division differential() got, or 10 cases * 60s * 2 calls = 1200s against a 285s budget.
     rust = Problem("p", "rust", "s", "main", [], 300.0)
     captured = []
-    def fake_run_candidate(problem, source, inputs, *, workdir, timeout_s, binary=None, overflow_checks=True):
+    def fake_run_candidate(problem, source, inputs, *, workdir, timeout_s, binary=None, overflow_checks=True, mem_mb=4096):
         captured.append((timeout_s, len(inputs)))
         return [V.CaseResult(True, output=str(i)) for i in inputs]
     monkeypatch.setattr(V, "run_candidate", fake_run_candidate)
@@ -341,3 +341,62 @@ def test_gen_max_failure_with_no_medium_cases_still_skips(tmp_path):
     assert gi.stress_input is None and gi.stress_degraded is False
     ev = V.stress(PY, GOOD, gi.stress_input, workdir=str(tmp_path / "s"), limit_s=5.0, mem_mb=2048, degraded=gi.stress_degraded)
     assert ev.skipped
+
+# --- oracle self-repair: prepare_gate_inputs yielded zero usable cases in every tier ---
+
+ORACLE_ALWAYS_RAISES = "def reference(a, b):\n    raise NameError('boom')\ndef gen(seed, mode):\n    return (1, 2)\n"
+
+def test_oracle_unusable_true_when_every_tier_is_empty(tmp_path):
+    gi = V.prepare_gate_inputs(PY, ORACLE_ALWAYS_RAISES, "", {"cases_small": 3, "cases_medium": 2, "mem_mb": 2048}, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+    assert gi.cases_small == [] and gi.cases_medium == [] and gi.cases_edge == []
+    assert V.oracle_unusable(gi)
+
+def test_oracle_unusable_false_when_any_tier_has_cases(tmp_path):
+    gi = V.prepare_gate_inputs(PY, ORACLE, "", {"cases_small": 3, "cases_medium": 2, "mem_mb": 2048}, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+    assert gi.cases_small   # ORACLE is healthy: small tier is non-empty
+    assert not V.oracle_unusable(gi)
+
+# --- public examples: parsed and honest, ground truth, never validated or dropped ---
+
+WRONG_ON_PUBLIC = "def add(a, b):\n    return a + b + 1\n"
+
+def test_public_examples_run_as_own_gate_step_before_generated_tiers_and_fail_a_wrong_candidate(tmp_path):
+    p = Problem("p", "python", "s", "add", [{"input": [2, 3], "output": 5}], 300.0)
+    limits = {"cases_small": 3, "cases_medium": 2, "mem_mb": 2048}
+    gi = V.prepare_gate_inputs(p, ORACLE, "", limits, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None)
+    assert len(gi.cases_public) == 1 and gi.cases_public[0].input == (2, 3) and gi.cases_public[0].expected == 5
+    ev = V.run_gate(p, WRONG_ON_PUBLIC, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lambda m: None)
+    # diff_public is its own evidence kind and runs right after compile, before any generated tier --
+    # the gate stops here, never reaching diff_small/diff_medium against the model-written oracle.
+    assert [e.kind for e in ev] == ["compile", "diff_public"]
+    assert not ev[1].passed
+    assert ev[1].detail["input"] == (2, 3) and ev[1].detail["expected"] == 5 and ev[1].detail["actual"] == 6
+
+def test_public_example_disagreeing_with_oracle_reference_is_kept_and_recorded(tmp_path):
+    p = Problem("p", "python", "s", "add", [{"input": [2, 3], "output": 5}], 300.0)
+    wrong_oracle = "def reference(a, b):\n    return a + b + 100\ndef gen(seed, mode):\n    return (seed, seed)\n"
+    limits = {"cases_small": 2, "cases_medium": 1, "mem_mb": 2048}
+    gi = V.prepare_gate_inputs(p, wrong_oracle, "", limits, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None)
+    # kept exactly as given -- not dropped, not overridden by the oracle's (wrong) answer
+    assert len(gi.cases_public) == 1 and gi.cases_public[0].expected == 5
+    assert gi.public_disagreements and gi.public_disagreements[0]["public_expected"] == 5
+    assert any("disagrees with a public example" in n for n in gi.notes)
+    ev = V.run_gate(p, GOOD, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lambda m: None)
+    diff_public = next(e for e in ev if e.kind == "diff_public")
+    assert diff_public.passed   # candidate matches the PUBLIC example even though the oracle disagreed
+    assert "oracle_disagreements" in diff_public.detail
+
+def test_unparseable_public_example_entry_is_skipped_with_a_note(tmp_path):
+    p = Problem("p", "python", "s", "add", [{"input": [2, 3], "output": 5}, "not a valid example", [1, 2, 3]], 300.0)
+    limits = {"cases_small": 2, "cases_medium": 1, "mem_mb": 2048}
+    gi = V.prepare_gate_inputs(p, ORACLE, "", limits, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+    assert len(gi.cases_public) == 1   # only the recognizable entry kept; nothing crashed
+    assert sum("unrecognized shape" in n for n in gi.notes) == 2
+
+def test_no_public_examples_behaves_exactly_as_before(tmp_path):
+    limits = {"cases_small": 5, "cases_medium": 2, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0, "mem_mb": 2048, "shrink_budget_s": 1.0}
+    stress = "def gen_max(seed):\n    return (10**18, 10**18)\nEDGES = [(0, 0), (15, 0)]\n"
+    gi = V.prepare_gate_inputs(PY, ORACLE, stress, limits, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None)
+    assert gi.cases_public == [] and gi.public_disagreements == []
+    ev = V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lambda m: None)
+    assert [e.kind for e in ev] == ["compile", "diff_edge", "diff_small", "diff_medium", "behavior", "stress", "overflow"]

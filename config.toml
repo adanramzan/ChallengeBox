@@ -22,6 +22,15 @@ oracle_retry_afford_s = 130.0
 # step_timeout's reserve; raise if a slower model is configured for the "strong" role.
 repair_afford_s = 60.0
 
+# Minimum remaining budget (seconds) required to trigger one oracle self-repair regeneration when
+# prepare_gate_inputs comes back with zero usable cases in every tier (small/medium/edge) -- the
+# oracle CALL succeeded but its reference()/gen()/validate() code crashed at runtime. Same cost
+# profile as the initial ORACLE call and its retry (oracle_retry_afford_s), since regeneration writes
+# the same reference+gen+validate functions; independent of, and can fire alongside, the adjudication
+# regeneration in the repair loop (that one has no separate afford threshold -- it's gated by the
+# repair loop's own repair_afford_s check instead).
+oracle_selfrepair_afford_s = 130.0
+
 # Phase boundaries as fractions of usable time (deadline*scale - margin)
 [phases]
 generate_until = 0.32

@@ -7,7 +7,7 @@ def prob(tmp_path, lang="python"):
     return Problem("pid", lang, "Return a+b for ints a,b. At most 10^18.", "add" if lang == "python" else "main", [], 300.0)
 
 def cfg():
-    return {"limits": {"safety_margin_s": 15.0, "cases_small": 5, "cases_medium": 2, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0, "max_repairs": 2, "max_syntax_repairs": 2, "mem_mb": 2048, "shrink_budget_s": 1.0, "max_cost_usd_per_problem": 0.10, "oracle_retry_afford_s": 130.0, "repair_afford_s": 60.0},
+    return {"limits": {"safety_margin_s": 15.0, "cases_small": 5, "cases_medium": 2, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0, "max_repairs": 2, "max_syntax_repairs": 2, "mem_mb": 2048, "shrink_budget_s": 1.0, "max_cost_usd_per_problem": 0.10, "oracle_retry_afford_s": 130.0, "repair_afford_s": 60.0, "oracle_selfrepair_afford_s": 130.0},
             "phases": {"generate_until": 0.32, "gate_until": 0.39, "repair_until": 0.81, "settle_until": 0.93, "generate_call_share": 0.45, "repair_call_share": 0.25}, "profile": "fake"}
 
 SOLVE_OK = "===RULES===\nr\n===END===\n===TRAPS===\nt\n===END===\n===ALGORITHM===\na\n===END===\n===CODE===\n```python\ndef add(a, b):\n    return a + b\n```\n===END===\n"
@@ -435,3 +435,41 @@ def test_second_repair_prompt_notes_previous_change_did_not_fix_the_case(tmp_pat
     assert len(repair_prompts) == 2
     assert "did not fix" not in repair_prompts[0].lower()   # first attempt: no history to report yet
     assert "did not fix" in repair_prompts[1].lower()       # second attempt: must say the prior change failed
+
+# --- oracle self-repair: the oracle CALL succeeds but its own reference()/gen() crashes at runtime,
+# leaving zero usable cases in every tier; nothing failed, so nothing would normally react ---
+
+ORACLE_ALWAYS_RAISES = "===ORACLE===\ndef reference(a, b):\n    raise NameError('boom')\ndef gen(seed, mode):\n    return (1, 2)\n===END===\n"
+ORACLE_WRONG_DETERMINISTIC = "===ORACLE===\ndef reference(a, b):\n    return a + b if a < 15 else a + b + 1\ndef gen(seed, mode):\n    return (15, 0)\n===END===\n"
+
+def test_oracle_selfrepair_triggers_once_and_recovers_with_good_oracle(tmp_path):
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_ALWAYS_RAISES, ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 1
+    assert rep["oracle_regenerated"] == 0   # this is not the adjudication path
+    assert rep["gate_inputs"]["small"] == 5 and rep["gate_inputs"]["medium"] == 2   # recovered via the good second oracle
+    assert any("oracle.selfrepair" in l for l in rep["events"])
+    assert len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 2
+    # the recovered oracle never regenerated edge cases (the original edges never survived the broken
+    # reference() in the first place), so diff_edge stays skipped -- that alone keeps status off
+    # passed_all_gates, but every case that WAS checked (small/medium) must have genuinely passed.
+    assert rep["status"] in ("passed_all_gates", "emitted_unverified")
+    evs = {e["kind"]: e for e in rep["evidence"][rep["final_candidate"]]}
+    assert evs["diff_small"]["passed"] and not evs["diff_small"]["skipped"]
+    assert evs["diff_medium"]["passed"] and not evs["diff_medium"]["skipped"]
+
+def test_oracle_selfrepair_and_adjudication_regen_counters_are_independent(tmp_path):
+    # A broken oracle triggers self-repair first (recovering a usable-but-WRONG oracle), and that
+    # wrong oracle then disagrees with the (correct) candidate -- a genuine repair-loop disagreement
+    # that gets adjudicated and blamed on the oracle. Both recovery paths fire, once each, in one run:
+    # oracle_selfrepaired and oracle_regenerated must both read 1, proving the two counters don't share
+    # a single one-shot budget.
+    llm = FakeLLM({"solve": [SOLVE_OK], "repair": [REPAIR_BLAME_ORACLE],
+                   "oracle": [ORACLE_ALWAYS_RAISES, ORACLE_WRONG_DETERMINISTIC, ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 1
+    assert rep["oracle_regenerated"] == 1
+    assert len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 3
+    assert rep["status"] in ("passed_all_gates", "emitted_unverified")
+    evs = {e["kind"]: e for e in rep["evidence"][rep["final_candidate"]]}
+    assert evs["diff_small"]["passed"] and not evs["diff_small"]["skipped"]
