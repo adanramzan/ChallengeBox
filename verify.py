@@ -94,6 +94,19 @@ def same(problem, actual: CaseResult, expected) -> bool:
     if problem.language == "rust": return tokens(actual.output) == tokens(expected if isinstance(expected, str) else str(expected))
     return actual.output == expected
 
+def _actual_for_report(r: CaseResult):
+    """What to show as the candidate's answer in failure evidence -- and, via repair(), in the
+    repair prompt. A run that crashed or timed out has no answer: whatever reached stdout before
+    the panic is a fragment, and showing it invites the repair model to chase a formatting diff
+    that does not exist (a Rust panic after one correct line reads as a stray trailing newline).
+    Say plainly that there was no answer, and let `error` carry the cause."""
+    if r.ok:
+        return r.output
+    if r.timed_out:
+        return "(no answer: timed out)"
+    last = [l for l in (r.error or "").strip().splitlines() if l.strip()][-2:]
+    return "(no answer: crashed before completing) " + " | ".join(last) if last else "(no answer: crashed before completing)"
+
 def differential(problem, source: str, cases: list[Case], kind: str, *, workdir: str, timeout_s: float, binary: str | None = None, mem_mb: int = 4096) -> Evidence:
     t0 = time.monotonic()
     if not cases:
@@ -108,7 +121,8 @@ def differential(problem, source: str, cases: list[Case], kind: str, *, workdir:
     for i, (c, r) in enumerate(zip(cases, res)):
         if not same(problem, r, c.expected):
             return Evidence(kind, False, len(cases), time.monotonic() - t0,
-                            {"index": i, "input": c.input, "expected": c.expected, "actual": r.output, "error": r.error[-600:], "timed_out": r.timed_out})
+                            {"index": i, "input": c.input, "expected": c.expected, "actual": _actual_for_report(r),
+                             "error": r.error[-600:], "timed_out": r.timed_out})
     return Evidence(kind, True, len(cases), time.monotonic() - t0)
 
 def _fails(problem, source, oracle_src, inp, workdir, binary, timeout_s: float = 5.0) -> tuple[bool, object]:
@@ -225,12 +239,14 @@ def _check_public_against_oracle(problem, gi: GateInputs, oracle_src: str, *, wo
         log(f"oracle.disagrees_with_public input={_fmt(c.input, 120)}")
 
 def oracle_unusable(gi: GateInputs) -> bool:
-    """True when the oracle yielded no usable case at all across every generated tier -- small,
-    medium, and edge -- so nothing in the gate could actually be checked against it (the oracle's own
-    reference()/gen()/validate() crashed, or it produced no ===ORACLE=== block at all). Public
-    examples don't count either way here: they're ground truth from the problem, not something the
-    oracle produced, so they say nothing about whether the oracle itself is usable."""
-    return not gi.cases_small and not gi.cases_medium and not gi.cases_edge
+    """True when the oracle's own gen()/reference() produced nothing across BOTH generated tiers,
+    so there is no real differential coverage (its code crashed, or it produced no ===ORACLE===
+    block at all). Edge cases are deliberately excluded: they are literals authored by the STRESS
+    call and merely priced by reference(), so one surviving edge fixture says nothing about whether
+    the oracle works -- counting it here let a hallucinated-stdlib oracle with 0 small / 0 medium
+    cases pass as "usable" and skip self-repair. Public examples are excluded for the same reason:
+    they are ground truth from the problem, not something the oracle produced."""
+    return not gi.cases_small and not gi.cases_medium
 
 def selfrepair_extra(gi: GateInputs) -> str:
     """Extra context for regenerate_oracle when the oracle is being reissued because its own code

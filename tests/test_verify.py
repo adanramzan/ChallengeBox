@@ -400,3 +400,31 @@ def test_no_public_examples_behaves_exactly_as_before(tmp_path):
     assert gi.cases_public == [] and gi.public_disagreements == []
     ev = V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lambda m: None)
     assert [e.kind for e in ev] == ["compile", "diff_edge", "diff_small", "diff_medium", "behavior", "stress", "overflow"]
+
+
+def test_oracle_unusable_ignores_edge_cases(tmp_path):
+    # A hallucinated-stdlib oracle produces 0 small / 0 medium but the STRESS call's literal EDGES
+    # still price fine. One surviving edge fixture must not mask a dead oracle (R2-1).
+    edge_only = V.GateInputs(oracle_src="x", cases_edge=[V.Case((1, 2), 3, "edge")])
+    assert V.oracle_unusable(edge_only)
+    assert V.oracle_unusable(V.GateInputs(oracle_src="x"))
+    assert not V.oracle_unusable(V.GateInputs(oracle_src="x", cases_small=[V.Case((1, 2), 3, "small")]))
+    assert not V.oracle_unusable(V.GateInputs(oracle_src="x", cases_medium=[V.Case((1, 2), 3, "medium")]))
+
+
+def test_crashed_candidate_is_not_reported_as_a_near_miss_diff(tmp_path):
+    # A candidate that raises must not have its partial output presented as the answer: the repair
+    # prompt reads `actual`, and a fragment that looks almost right sends it after a phantom
+    # formatting bug instead of the crash (R2-2).
+    crashes = "def add(a, b):\n    raise ValueError('boom')\n"
+    ev = V.differential(PY, crashes, [V.Case((1, 2), 3, "small")], "diff_small",
+                        workdir=str(tmp_path / "d"), timeout_s=10)
+    assert not ev.passed
+    assert "no answer" in str(ev.detail["actual"])
+    assert "ValueError" in ev.detail["error"]
+
+
+def test_passing_candidate_still_reports_its_real_output(tmp_path):
+    ev = V.differential(PY, BUG, [V.Case((20, 1), 21, "small")], "diff_small",
+                        workdir=str(tmp_path / "d"), timeout_s=10)
+    assert not ev.passed and ev.detail["actual"] == 22   # wrong, but it ran: show the real answer
