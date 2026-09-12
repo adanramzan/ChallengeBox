@@ -1,4 +1,4 @@
-import os, sys, time, textwrap, pytest
+import os, sys, time, pytest
 import sandbox
 from sandbox import run_cmd, run_python_cases, python_static, Problem
 
@@ -20,10 +20,21 @@ def test_run_cmd_caps_output(tmp_path):
     r = run_cmd([sys.executable, "-c", "print('x'*5_000_000)"], timeout_s=10, cwd=str(tmp_path), max_output=1000)
     assert len(r.stdout) <= 1000
 
+def test_run_cmd_caps_output_both_streams(tmp_path):
+    code = "import sys; sys.stdout.write('o'*50_000_000); sys.stderr.write('e'*50_000_000)"
+    r = run_cmd([sys.executable, "-c", code], timeout_s=10, cwd=str(tmp_path), max_output=10_000)
+    assert len(r.stdout) <= 10_000 and len(r.stderr) <= 10_000
+
 def test_run_cmd_env_is_clean(tmp_path, monkeypatch):
     monkeypatch.setenv("SECRET_KEY", "leak")
-    r = run_cmd([sys.executable, "-c", "import os; print(os.environ.get('SECRET_KEY','none'))"], timeout_s=5, cwd=str(tmp_path))
-    assert r.stdout.strip() == b"none"
+    r = run_cmd([sys.executable, "-c", "import os; print(os.environ.get('SECRET_KEY','none')); import json; print(json.dumps(sorted(os.environ)))"], timeout_s=5, cwd=str(tmp_path))
+    lines = r.stdout.strip().split(b'\n')
+    assert lines[0] == b"none"
+    import json
+    env_keys = json.loads(lines[1].decode())
+    # Check that required keys are present and SECRET_KEY is not leaked
+    assert set(env_keys) >= {"HOME", "LANG", "PATH"}
+    assert "SECRET_KEY" not in env_keys
 
 def test_run_python_cases_basic(tmp_path):
     src = "def add(a, b):\n    return a + b\n"
@@ -48,6 +59,14 @@ def test_run_python_cases_preserves_tuples_and_none(tmp_path):
     res = run_python_cases(src, "f", [(("a", 1),)], timeout_s=10, workdir=str(tmp_path))
     assert res[0].output == (("a", 1), None, {"k": (1, 2)})
 
+def test_run_python_cases_unrepresentable_result(tmp_path):
+    src = "def f(x):\n    return (i for i in range(x))\n"
+    res = run_python_cases(src, "f", [(2,), (3,)], timeout_s=10, workdir=str(tmp_path))
+    # Both results should have ok=False due to unrepresentable output (generator)
+    assert not res[0].ok and "unrepresentable" in res[0].error
+    assert not res[1].ok and ("unrepresentable" in res[1].error or "unparseable" in res[1].error)
+    assert len(res) == 2
+
 def test_python_static_rules():
     assert python_static("def solve(x):\n    return x\n", "solve") == []
     assert any("entrypoint" in v for v in python_static("def other(x):\n    return x\n", "solve"))
@@ -55,6 +74,12 @@ def test_python_static_rules():
     assert any("open" in v for v in python_static("def solve(x):\n    return open('f')\n", "solve"))
     assert any("print" in v for v in python_static("def solve(x):\n    print(x)\n", "solve"))
     assert any("syntax" in v for v in python_static("def solve(x:\n", "solve"))
+
+def test_python_static_sys_bypass():
+    assert any("sys" in v for v in python_static("from sys import exit\ndef solve(x):\n    exit(1)\n", "solve"))
+    assert any("sys" in v for v in python_static("import sys as s\ndef solve(x):\n    return s.maxsize\n", "solve"))
+    assert python_static("import sys\nsys.setrecursionlimit(10**6)\ndef solve(x):\n    return x\n", "solve") == []
+    assert any("forbidden import" in v for v in python_static("import os\ndef solve(x):\n    return x\n", "solve"))
 
 def test_problem_load_validates(tmp_path):
     p = tmp_path / "p.json"

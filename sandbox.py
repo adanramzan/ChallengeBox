@@ -1,7 +1,7 @@
 """Untrusted-code execution: process isolation, harnesses, static contract checks."""
 from __future__ import annotations
-import ast, json, os, resource, signal, subprocess, sys, time
-from dataclasses import dataclass, field
+import ast, json, os, resource, signal, subprocess, sys, threading, time
+from dataclasses import dataclass
 
 PYTHON = sys.executable
 
@@ -46,23 +46,43 @@ def _limits(mem_mb: int):
             pass
     return fn
 
+def _reader(stream, cap: int, sink: list):
+    kept = 0
+    while True:
+        chunk = stream.read(65536)
+        if not chunk:
+            break
+        if kept < cap:
+            take = chunk[: cap - kept]; sink.append(take); kept += len(take)
+    stream.close()
+
 def run_cmd(argv: list[str], *, stdin: bytes = b"", timeout_s: float, cwd: str | None = None,
             mem_mb: int = 4096, max_output: int = 1_000_000) -> RunResult:
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": cwd or "/tmp", "LANG": "C.UTF-8"}
+    # HOME must be the real home for rustup/rustc toolchain discovery, not cwd
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/tmp"), "LANG": "C.UTF-8"}
     t0 = time.monotonic()
     p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          cwd=cwd, env=env, start_new_session=True, preexec_fn=_limits(mem_mb))
+    out_parts, err_parts = [], []
+    out_thread = threading.Thread(target=_reader, args=(p.stdout, max_output, out_parts), daemon=True)
+    err_thread = threading.Thread(target=_reader, args=(p.stderr, max_output, err_parts), daemon=True)
+    out_thread.start(); err_thread.start()
+    try:
+        p.stdin.write(stdin); p.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
     timed_out = False
     try:
-        out, err = p.communicate(stdin, timeout=max(0.05, timeout_s))
+        p.wait(timeout=max(0.05, timeout_s))
     except subprocess.TimeoutExpired:
         timed_out = True
         try:
             os.killpg(p.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        out, err = p.communicate()
-    return RunResult(p.returncode, out[:max_output], err[:max_output], time.monotonic() - t0, timed_out)
+        p.wait()
+    out_thread.join(timeout=5); err_thread.join(timeout=5)
+    return RunResult(p.returncode, b"".join(out_parts), b"".join(err_parts), time.monotonic() - t0, timed_out)
 
 @dataclass
 class CaseResult:
@@ -95,7 +115,15 @@ for line in open(sys.argv[3], encoding="utf-8"):
         mutated = args != before
     except Exception:
         mutated = True
-    print(repr({"ok": ok, "output": out, "error": err, "duration_s": dt, "mutated": mutated}), flush=True)
+    try:
+        line = repr({"ok": ok, "output": out, "error": err, "duration_s": dt, "mutated": mutated})
+        ast.literal_eval(line)  # Verify it's a valid literal
+    except Exception:
+        try:
+            line = repr({"ok": False, "output": None, "error": "unrepresentable result: " + type(out).__name__, "duration_s": dt, "mutated": mutated})
+        except Exception:
+            line = repr({"ok": False, "output": None, "error": "unrepresentable result: unknown", "duration_s": dt, "mutated": mutated})
+    print(line, flush=True)
 '''
 
 def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, timeout_s: float, workdir: str) -> list[CaseResult]:
@@ -111,6 +139,7 @@ def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, ti
         try:
             d = ast.literal_eval(line)
         except Exception:
+            results.append(CaseResult(False, error="unparseable harness line"))
             continue
         if d.get("error", "").startswith("IMPORT:"):
             return [CaseResult(False, error=d["error"]) for _ in args_list]
@@ -132,14 +161,26 @@ def python_static(source: str, entrypoint: str) -> list[str]:
     if entrypoint not in names:
         problems.append(f"entrypoint {entrypoint} not defined at top level")
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            mods = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
-            for m in mods:
-                root = m.split(".")[0]
-                if root not in sys.stdlib_module_names:
-                    problems.append(f"non-stdlib import {m}")
+        if isinstance(node, ast.ImportFrom):
+            # from sys import ... is always forbidden
+            if node.module == "sys":
+                problems.append(f"forbidden import sys")
+            elif node.module and node.module not in sys.stdlib_module_names:
+                problems.append(f"non-stdlib import {node.module}")
+            # Check for aliased names (import sys as s)
+            for alias in node.names:
+                if alias.asname is not None and alias.name == "sys":
+                    problems.append(f"forbidden import sys as {alias.asname}")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                # import sys as name is always forbidden
+                if alias.asname is not None and alias.name == "sys":
+                    problems.append(f"forbidden import sys as {alias.asname}")
+                elif root not in sys.stdlib_module_names:
+                    problems.append(f"non-stdlib import {alias.name}")
                 elif root in _PY_FORBIDDEN_MODULES and not (root == "sys" and _only_setrecursionlimit(tree)):
-                    problems.append(f"forbidden import {m}")
+                    problems.append(f"forbidden import {alias.name}")
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _PY_FORBIDDEN_CALLS:
             problems.append(f"forbidden call {node.func.id}")
     return problems
