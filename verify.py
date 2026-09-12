@@ -394,7 +394,12 @@ def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, 
         detail["input"], detail["expected"] = case.input, case.expected
         gi.regressions.append(case)
     pv_repair = {**pv, "statement": _fmt(pv["statement"], 12000)}
-    r = run.chat("strong", "repair", 0.25 * run.budget.usable_s, kind=failed.kind, input=_fmt_typed(detail.get("input")), expected=_fmt_typed(detail.get("expected")),
+    # Derived from config.toml's [phases].repair_call_share, not a literal fraction -- see
+    # regenerate_oracle's identical use of generate_call_share, and BENCHMARK-FINDINGS.md F6 for
+    # what goes wrong when a phase cap is hardcoded instead (raising the config knob then does
+    # nothing because the hardcoded fraction still wins the min() in Run.chat/step_timeout).
+    repair_cap = run.cfg["phases"]["repair_call_share"] * run.budget.usable_s
+    r = run.chat("strong", "repair", repair_cap, kind=failed.kind, input=_fmt_typed(detail.get("input")), expected=_fmt_typed(detail.get("expected")),
                  actual=_fmt_typed(detail.get("actual")), details=_fmt({k: v for k, v in detail.items() if k not in ("input", "expected", "actual")}),
                  code=_fmt(cand.source), previous_attempt=previous_attempt, **pv_repair)
     blocks = parse_blocks(r.text)

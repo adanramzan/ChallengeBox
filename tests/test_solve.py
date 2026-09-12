@@ -7,8 +7,8 @@ def prob(tmp_path, lang="python"):
     return Problem("pid", lang, "Return a+b for ints a,b. At most 10^18.", "add" if lang == "python" else "main", [], 300.0)
 
 def cfg():
-    return {"limits": {"safety_margin_s": 15.0, "cases_small": 5, "cases_medium": 2, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0, "max_repairs": 2, "max_syntax_repairs": 2, "mem_mb": 2048, "shrink_budget_s": 1.0, "max_cost_usd_per_problem": 0.10},
-            "phases": {"generate_until": 0.32, "gate_until": 0.39, "repair_until": 0.81, "settle_until": 0.93, "generate_call_share": 0.45}, "profile": "fake"}
+    return {"limits": {"safety_margin_s": 15.0, "cases_small": 5, "cases_medium": 2, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0, "max_repairs": 2, "max_syntax_repairs": 2, "mem_mb": 2048, "shrink_budget_s": 1.0, "max_cost_usd_per_problem": 0.10, "oracle_retry_afford_s": 130.0, "repair_afford_s": 60.0},
+            "phases": {"generate_until": 0.32, "gate_until": 0.39, "repair_until": 0.81, "settle_until": 0.93, "generate_call_share": 0.45, "repair_call_share": 0.25}, "profile": "fake"}
 
 SOLVE_OK = "===RULES===\nr\n===END===\n===TRAPS===\nt\n===END===\n===ALGORITHM===\na\n===END===\n===CODE===\n```python\ndef add(a, b):\n    return a + b\n```\n===END===\n"
 ORACLE_OK = "===ORACLE===\nimport random\ndef reference(a, b):\n    return a + b\ndef gen(seed, mode):\n    r = random.Random(seed)\n    return (r.randint(0, 20), r.randint(0, 20))\n===END===\n"
@@ -357,6 +357,44 @@ def test_oracle_regen_timeout_derived_from_generate_call_share(tmp_path):
     assert t2 == pytest.approx(0.50 * usable, abs=1.5)
     assert t2 > t1
     assert "repairs" in rep1 and "syntax_repairs" in rep1   # both repair counters must appear in the report
+
+def test_repair_call_share_is_read_from_config_not_hardcoded(tmp_path):
+    # verify.repair() used to hardcode 0.25 * usable_s for its own call cap, the same class of bug
+    # F6 found in the generate phase: raising a config knob would do nothing because a literal
+    # fraction still won the min() in Run.chat/step_timeout. It must come from
+    # config.toml's [phases].repair_call_share.
+    still_buggy = "===VERDICT===\ncandidate\n===END===\n===CODE===\ndef add(a, b):\n    return a + b if a < 15 else a + b + 2\n===END===\n"
+    llm1 = FakeLLM({"solve": [BUGGY], "repair": [still_buggy], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    c1 = cfg(); c1["phases"]["repair_call_share"] = 0.05
+    c1["limits"]["max_repairs"] = 1
+    rep1 = S.solve(prob(tmp_path), llm1, c1, out_path=str(tmp_path / "s1.py"), run_dir=str(tmp_path / "run1"))
+    llm2 = FakeLLM({"solve": [BUGGY], "repair": [still_buggy], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    c2 = cfg(); c2["phases"]["repair_call_share"] = 0.40
+    c2["limits"]["max_repairs"] = 1
+    rep2 = S.solve(prob(tmp_path), llm2, c2, out_path=str(tmp_path / "s2.py"), run_dir=str(tmp_path / "run2"))
+    t1, t2 = _sent_timeout(rep1["events"], "repair"), _sent_timeout(rep2["events"], "repair")
+    assert t2 > t1
+    assert t1 == pytest.approx(0.05 * 285.0, abs=1.5)
+
+def test_oracle_retry_afford_threshold_is_read_from_config(tmp_path):
+    # limits.oracle_retry_afford_s used to be a bare 130.0 literal tuned to one specific model's
+    # measured worst-case latency. Raising it past the usable budget must suppress the retry that
+    # otherwise fires by default (see test_oracle_timeout_is_retried_once_and_retry_result_is_used).
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [""], "stress": [STRESS_OK]})
+    c = cfg(); c["limits"]["oracle_retry_afford_s"] = 10_000.0
+    rep = S.solve(prob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert not any("oracle.retry" in l for l in rep["events"])
+    assert len([call for call in rep["calls"] if call["tag"] == "oracle"]) == 1
+
+def test_repair_afford_threshold_is_read_from_config(tmp_path):
+    # limits.repair_afford_s used to be a bare `60` literal gating whether the repair loop may start
+    # another iteration. Raising it past the usable budget must suppress every repair attempt even
+    # though max_repairs would otherwise allow one.
+    llm = FakeLLM({"solve": [BUGGY], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    c = cfg(); c["limits"]["repair_afford_s"] = 10_000.0
+    rep = S.solve(prob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["repairs"] == 0 and rep["syntax_repairs"] == 0
+    assert rep["status"] == "emitted_with_failures"
 
 def test_static_failure_consumes_syntax_budget_not_semantic(tmp_path):
     # A wrong entrypoint name is a mechanical "static" failure. It must spend the small, separate

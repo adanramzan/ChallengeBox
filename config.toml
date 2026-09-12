@@ -11,6 +11,17 @@ mem_mb = 4096
 shrink_budget_s = 3.0
 max_cost_usd_per_problem = 0.10
 
+# Minimum remaining budget (seconds) required before starting another ORACLE call after the first
+# one produced no ===ORACLE=== block (timeout or empty reply). Tuned to the measured worst-case
+# oracle latency against the current [profiles] models (observed max 128s, +2s margin) -- if a
+# different/slower model is configured for the "fast" role, raise this to match its measured max.
+oracle_retry_afford_s = 130.0
+# Minimum remaining budget (seconds) required to start another repair-loop iteration (a syntax or
+# semantic repair call plus re-gating). Generous headroom over the measured repair-call latency
+# (~20s max against current models) so a repair attempt is never started only to be starved by
+# step_timeout's reserve; raise if a slower model is configured for the "strong" role.
+repair_afford_s = 60.0
+
 # Phase boundaries as fractions of usable time (deadline*scale - margin)
 [phases]
 generate_until = 0.32
@@ -20,6 +31,9 @@ settle_until = 0.93
 # Cap on the concurrent solve/oracle/stress calls, as a fraction of usable_s. The three run
 # concurrently, so this phase costs max() of them, not sum() -- see solve.py's solve().
 generate_call_share = 0.55   # effective oracle timeout = min(share*usable, fast.timeout_cap_s); measured oracle max 128s needs headroom
+# Cap on a single repair call, as a fraction of usable_s -- same knob shape as generate_call_share,
+# so raising/lowering it does not silently get overridden by a hardcoded fraction (see F6).
+repair_call_share = 0.25
 
 # Any OpenAI-compatible endpoint can be added as another [profiles.<name>.<role>] table.
 [profiles.openrouter.strong]

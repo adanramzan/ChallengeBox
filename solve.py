@@ -158,8 +158,10 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     # The oracle is the single source of ground truth for every gate step, so a timeout here
     # (roughly half of them clip at a 60s median-tuned cap; see BENCHMARK-FINDINGS.md F4) costs
     # the entire run its verification, not just one call. One retry, only when the budget can
-    # still afford a call as slow as the measured worst case (128s observed max, +2s margin).
-    if not oracle_src.strip() and run.budget.can_afford(130.0):
+    # still afford a call as slow as the measured worst case -- config.toml's
+    # limits.oracle_retry_afford_s, not a literal, since that worst case is a function of whatever
+    # model is configured for the "fast" role.
+    if not oracle_src.strip() and run.budget.can_afford(cfg["limits"]["oracle_retry_afford_s"]):
         run.log("oracle.retry no ===ORACLE=== block in first reply, retrying once")
         r_oracle = run.chat("fast", "oracle", gen_cap, **pv)
         oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
@@ -196,7 +198,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             is_syntax = failed.kind in ("static", "compile")
             cap = cfg["limits"]["max_syntax_repairs"] if is_syntax else cfg["limits"]["max_repairs"]
             count = syntax_repairs if is_syntax else repairs
-            if count >= cap or run.budget.phase() not in ("generate", "gate", "repair") or not run.budget.can_afford(60):
+            if count >= cap or run.budget.phase() not in ("generate", "gate", "repair") or not run.budget.can_afford(cfg["limits"]["repair_afford_s"]):
                 break
             if run.cost_usd() >= cfg["limits"]["max_cost_usd_per_problem"]:
                 run.log(f"cost.cap reached usd={run.cost_usd():.4f}"); break
