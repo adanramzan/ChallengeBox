@@ -196,7 +196,11 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     best = best_candidate(run.cands)
     status = "no_candidate"
     if best is not None:
-        skipped = any(e.skipped for e in best.evidence)
+        # Python's "overflow" evidence is always skipped -- Python ints are arbitrary precision, so
+        # the check is definitionally not applicable, not a coverage gap -- and must not by itself
+        # demote a fully-passing Python run out of "passed_all_gates". A skipped overflow check on a
+        # Rust candidate (no stress input / no budget) is a real gap and still counts.
+        skipped = any(e.skipped for e in best.evidence if not (e.kind == "overflow" and problem.language == "python"))
         status = ("passed_all_gates" if best.all_passed() and not skipped
                   else "emitted_unverified" if best.all_passed() else "emitted_with_failures")
         run.log(f"emit candidate={best.id} status={status}")
@@ -229,14 +233,14 @@ def bench(sample_dir: str, out_dir: str, cfg: dict, llm, deadline_scale: float) 
                 ev = {e["kind"]: e for e in rep["evidence"].get(rep["final_candidate"] or "", [])}
                 mark = lambda k: "n/a" if k not in ev else "skip" if ev[k].get("skipped") else ("pass" if ev[k]["passed"] else "FAIL")
                 rows.append({"id": pid, "lang": p.language, "compiles": mark("compile"), "edge": mark("diff_edge"), "small": mark("diff_small"),
-                             "medium": mark("diff_medium"), "behavior": mark("behavior"), "stress": mark("stress"), "repairs": rep["repairs"], "calls": len(rep["calls"]),
+                             "medium": mark("diff_medium"), "behavior": mark("behavior"), "stress": mark("stress"), "overflow": mark("overflow"), "repairs": rep["repairs"], "calls": len(rep["calls"]),
                              "tokens": f"{rep['token_usage']['prompt']}/{rep['token_usage']['completion']}", "elapsed": rep["elapsed_s"], "cost": rep["cost_usd"], "status": rep["status"]})
             except Exception as e:
-                rows.append({"id": pid, "lang": "?", "compiles": "n/a", "edge": "n/a", "small": "n/a", "medium": "n/a", "behavior": "n/a", "stress": "n/a",
+                rows.append({"id": pid, "lang": "?", "compiles": "n/a", "edge": "n/a", "small": "n/a", "medium": "n/a", "behavior": "n/a", "stress": "n/a", "overflow": "n/a",
                              "repairs": 0, "calls": 0, "tokens": "0/0", "elapsed": 0.0, "cost": None, "status": f"error: {type(e).__name__}: {str(e)[:200]}"})
     finally:
-        hdr = "| Problem | Lang | Compiles | Edge | Small | Medium | Behavior | Stress | Repairs | Calls | Tokens in/out | Elapsed s | Cost USD | Status | Hidden tests |\n|---|---|---|---|---|---|---|---|---:|---:|---|---:|---:|---|---|\n"
-        body = "".join(f"| {r['id']} | {r['lang']} | {r['compiles']} | {r['edge']} | {r['small']} | {r['medium']} | {r['behavior']} | {r['stress']} | {r['repairs']} | {r['calls']} | {r['tokens']} | {r['elapsed']} | {r['cost'] if r['cost'] is not None else 'n/a'} | {r['status']} | unknown |\n" for r in rows)
+        hdr = "| Problem | Lang | Compiles | Edge | Small | Medium | Behavior | Stress | Overflow | Repairs | Calls | Tokens in/out | Elapsed s | Cost USD | Status | Hidden tests |\n|---|---|---|---|---|---|---|---|---|---:|---:|---|---:|---:|---|---|\n"
+        body = "".join(f"| {r['id']} | {r['lang']} | {r['compiles']} | {r['edge']} | {r['small']} | {r['medium']} | {r['behavior']} | {r['stress']} | {r['overflow']} | {r['repairs']} | {r['calls']} | {r['tokens']} | {r['elapsed']} | {r['cost'] if r['cost'] is not None else 'n/a'} | {r['status']} | unknown |\n" for r in rows)
         costs = [r["cost"] for r in rows if r["cost"] is not None]
         total_cost = f"{sum(costs):.4f}" if costs else "unknown"
         note = f"\nprofile={cfg.get('profile')} deadline_scale={deadline_scale} total_cost_usd={total_cost}. 'pass' = passed local gates; hidden-test status is unknown.\n"

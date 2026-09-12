@@ -1,6 +1,8 @@
-import os, time, pytest
+import os, time, shutil, pytest
 from sandbox import Problem
 import verify as V
+
+needs_rustc = pytest.mark.skipif(shutil.which("rustc") is None, reason="rustc not installed")
 
 PY = Problem("p", "python", "s", "add", [], 300.0)
 ORACLE = "import random\ndef reference(a, b):\n    return a + b\ndef gen(seed, mode):\n    r = random.Random(seed)\n    hi = 20 if mode == 'small' else 10**5\n    return (r.randint(0, hi), r.randint(0, hi))\n"
@@ -74,7 +76,8 @@ def test_run_gate_includes_behavior_and_stress(tmp_path):
     stress = "def gen_max(seed):\n    return (10**18, 10**18)\nEDGES = [(0, 0)]\n"
     gi = V.prepare_gate_inputs(PY, ORACLE, stress, limits, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None)
     ev = V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lambda m: None)
-    assert [e.kind for e in ev] == ["compile", "diff_edge", "diff_small", "diff_medium", "behavior", "stress"] and all(e.passed for e in ev)
+    assert [e.kind for e in ev] == ["compile", "diff_edge", "diff_small", "diff_medium", "behavior", "stress", "overflow"] and all(e.passed for e in ev)
+    assert ev[-1].skipped and "arbitrary precision" in ev[-1].detail["skipped"]
 
 # --- fix round 1 ---
 
@@ -91,7 +94,8 @@ def test_run_gate_skips_stress_when_budget_exhausted(tmp_path):
     t0 = time.monotonic()
     ev = V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "g"), budget=NoStressBudget(), limits=limits, log=lambda m: None)
     dt = time.monotonic() - t0
-    assert ev[-1].kind == "stress" and ev[-1].skipped is True and ev[-1].passed is True
+    assert ev[-2].kind == "stress" and ev[-2].skipped is True and ev[-2].passed is True
+    assert ev[-1].kind == "overflow" and ev[-1].skipped is True and ev[-1].passed is True
     assert dt < 5.0
 
 def test_run_gate_all_skipped_reports_passed_but_flags_skipped(tmp_path):
@@ -190,3 +194,46 @@ def test_run_gate_reserves_stress_limit_plus_20_for_python(tmp_path):
     gi = V.GateInputs(oracle_src="x")
     V.run_gate(PY, GOOD, gi, workdir=str(tmp_path), budget=SpyBudget(), limits=limits, log=lambda m: None)
     assert seen.get("reserve") == 25.0
+
+# --- overflow gate: max-scale i64 wrap is invisible to timing-only stress, caught by a checked rerun ---
+
+RUST = Problem("p", "rust", "s", "main", [], 300.0)
+
+RUST_SUM_I64 = ('use std::io::*;\n'
+                'fn main(){let mut s=String::new();stdin().read_to_string(&mut s).unwrap();'
+                'let v:Vec<i64>=s.split_whitespace().skip(1).map(|x| x.parse().unwrap()).collect();'
+                'let sum:i64=v.iter().sum();println!("{}",sum);}\n')
+
+RUST_SUM_I128 = ('use std::io::*;\n'
+                 'fn main(){let mut s=String::new();stdin().read_to_string(&mut s).unwrap();'
+                 'let v:Vec<i128>=s.split_whitespace().skip(1).map(|x| x.parse().unwrap()).collect();'
+                 'let sum:i128=v.iter().sum();println!("{}",sum);}\n')
+
+BIG_STRESS_INPUT = "2\n9000000000000000000 9000000000000000000\n"   # two values that fit i64 alone; their sum (1.8e19) overflows i64::MAX (~9.22e18)
+
+@needs_rustc
+def test_overflow_step_catches_i64_wrap_invisible_to_timing_only_stress(tmp_path):
+    # The gap: an i64 sum that wraps silently at max scale passes compile (small/medium inputs are too
+    # small to overflow) and passes stress (overflow-checks=off, timing only) -- only the new dedicated
+    # overflow step, rerunning the checked build against the max-size input, catches it.
+    limits = {"stress_limit_rust_s": 5.0, "mem_mb": 2048}
+    small = [V.Case("3\n1 2 3\n", "6")]
+    medium = [V.Case("3\n100000 200000 300000\n", "600000")]
+    gi = V.GateInputs(cases_small=small, cases_medium=medium, stress_input=BIG_STRESS_INPUT)
+    ev = V.run_gate(RUST, RUST_SUM_I64, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lambda m: None)
+    by_kind = {e.kind: e for e in ev}
+    assert by_kind["diff_small"].passed and by_kind["diff_medium"].passed   # same binary is fine at realistic scale
+    assert by_kind["stress"].passed   # unchecked build wraps silently and looks fine on timing alone -- the gap
+    assert not by_kind["overflow"].passed
+    assert "overflow" in str(by_kind["overflow"].detail).lower()
+
+@needs_rustc
+def test_overflow_step_passes_when_candidate_uses_i128(tmp_path):
+    binary, err = V.compile_rust(RUST_SUM_I128, overflow_checks=True, workdir=str(tmp_path))
+    assert binary is not None, err
+    ev = V.overflow_check(RUST, binary, BIG_STRESS_INPUT, limit_s=5.0, mem_mb=2048)
+    assert ev.passed and not ev.skipped
+
+def test_overflow_step_skips_python_with_arbitrary_precision_reason():
+    ev = V.overflow_check(PY, None, (10**18, 10**18), limit_s=1.0, mem_mb=64)
+    assert ev.skipped and "arbitrary precision" in ev.detail["skipped"]

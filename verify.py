@@ -169,6 +169,39 @@ def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, 
     passed = r.ok and not r.timed_out and dur <= limit_s
     return Evidence("stress", passed, 1, time.monotonic() - t0, {"duration_s": round(dur, 3), "limit_s": limit_s, "timed_out": r.timed_out, "error": r.error[-400:]})
 
+def overflow_check(problem, binary: str | None, stress_input, *, limit_s: float, mem_mb: int) -> Evidence:
+    """Reruns the max-size stress input on the OVERFLOW-CHECKED build (the one already compiled and
+    cached by run_gate's compile step -- reused here, not recompiled) purely to catch a silent i64
+    wrap at maximum scale that stress() cannot see (stress deliberately compiles with
+    overflow-checks=off, for a realistic timing measurement).
+
+    This does NOT verify the output is correct at this scale: the oracle is a literal, slow Python
+    reference and cannot produce an expected answer for a maximum-size input in any reasonable time.
+    All this step proves is the absence of an overflow panic; it says nothing about whether the
+    arithmetic result itself is right.
+    """
+    if problem.language != "rust":
+        return Evidence("overflow", True, 0, 0.0, {"skipped": "python integers are arbitrary precision; nothing to overflow"}, skipped=True)
+    if stress_input is None:
+        return Evidence("overflow", True, 0, 0.0, {"skipped": "no stress input"}, skipped=True)
+    if binary is None:
+        return Evidence("overflow", True, 0, 0.0, {"skipped": "no overflow-checked binary"}, skipped=True)
+    t0 = time.monotonic()
+    r = run_rust_cases(binary, [stress_input], timeout_s=limit_s, mem_mb=mem_mb)[0]
+    dur = time.monotonic() - t0
+    if r.ok:
+        return Evidence("overflow", True, 1, dur, {"duration_s": round(r.duration_s, 3)})
+    # Rust panics on overflow print things like "attempt to add with overflow" to stderr and exit
+    # non-zero, but so does any other panic or crash -- a non-zero exit is not proof of overflow.
+    # Only label it an overflow finding when stderr actually says so; otherwise report the failure
+    # honestly as unexplained rather than overclaiming what was detected.
+    stderr = r.error[-800:]
+    is_overflow = "overflow" in stderr.lower()
+    detail = {"stderr": stderr, "timed_out": r.timed_out}
+    if not is_overflow:
+        detail["note"] = "non-zero exit without a recognizable overflow-panic message; failure cause not confirmed as overflow"
+    return Evidence("overflow", False, 1, dur, detail)
+
 def behavior(problem, source: str, cases: list[Case], *, workdir: str, timeout_s: float, binary: str | None = None) -> Evidence:
     t0 = time.monotonic()
     if not cases:
@@ -238,6 +271,17 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
     else:
         e = stress(problem, source, gi.stress_input, workdir=os.path.join(workdir, "stress"), limit_s=min(limit, avail), mem_mb=limits["mem_mb"])
     ev.append(e); log(f"gate.stress passed={e.passed} duration={e.detail.get('duration_s')}")
+    # Placed after stress (not before) so stress's timing measurement runs first, on a warm cache,
+    # unaffected by this step; and so this step's own subprocess never masks a stress timeout.
+    if problem.language == "rust":
+        ov_avail = budget.step_timeout(limits["stress_limit_rust_s"], reserve_s=15.0)
+        if ov_avail <= 0:
+            eo = Evidence("overflow", True, 0, 0.0, {"skipped": "no budget"}, skipped=True)
+        else:
+            eo = overflow_check(problem, binary, gi.stress_input, limit_s=min(limits["stress_limit_rust_s"], ov_avail), mem_mb=limits["mem_mb"])
+    else:
+        eo = overflow_check(problem, binary, gi.stress_input, limit_s=0.0, mem_mb=limits["mem_mb"])
+    ev.append(eo); log(f"gate.overflow passed={eo.passed} skipped={eo.skipped}")
     return ev
 
 _BLOCKS_RE = re.compile(r"===[A-Z_]+===.*?(===END===|\Z)", re.S)
