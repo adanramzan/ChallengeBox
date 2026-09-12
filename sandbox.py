@@ -1,6 +1,6 @@
 """Untrusted-code execution: process isolation, harnesses, static contract checks."""
 from __future__ import annotations
-import ast, json, os, resource, signal, subprocess, sys, threading, time
+import ast, hashlib, json, os, re, resource, signal, subprocess, sys, threading, time
 from dataclasses import dataclass
 
 PYTHON = sys.executable
@@ -202,3 +202,44 @@ def _only_setrecursionlimit(tree: ast.AST) -> bool:
             if node.attr not in ("setrecursionlimit", "getrecursionlimit", "maxsize"):
                 return False
     return True
+
+_RS_FORBIDDEN = [(r"\bunsafe\b", "unsafe block"), (r"\bextern\s+crate\b", "extern crate"),
+                 (r"std::fs\b", "std::fs"), (r"std::net\b", "std::net"), (r"std::process::Command", "process::Command"),
+                 (r"std::env::args", "env::args")]
+
+def rust_static(source: str) -> list[str]:
+    problems = []
+    if not re.search(r"\bfn\s+main\s*\(", source):
+        problems.append("no fn main()")
+    for pat, label in _RS_FORBIDDEN:
+        if re.search(pat, source):
+            problems.append(f"forbidden: {label}")
+    return problems
+
+def compile_rust(source: str, *, overflow_checks: bool, workdir: str, timeout_s: float = 90.0) -> tuple[str | None, str]:
+    os.makedirs(workdir, exist_ok=True)
+    tag = "gate" if overflow_checks else "stress"
+    h = hashlib.sha256((tag + source).encode()).hexdigest()[:16]
+    binp = os.path.join(workdir, f"bin_{tag}_{h}")
+    if os.path.exists(binp):
+        return binp, ""
+    src = os.path.join(workdir, f"cand_{h}.rs")
+    with open(src, "w", encoding="utf-8") as f: f.write(source)
+    argv = ["rustc", "--edition", "2021", "-O", "-C", f"overflow-checks={'on' if overflow_checks else 'off'}",
+            "-A", "warnings", "-o", binp, src]
+    r = run_cmd(argv, timeout_s=timeout_s, cwd=workdir)
+    err = r.stderr.decode("utf-8", "replace")
+    if r.returncode != 0 or not os.path.exists(binp):
+        return None, err if not r.timed_out else "rustc timed out"
+    return binp, err
+
+def run_rust_cases(binary: str, stdins: list[str], *, timeout_s: float, mem_mb: int = 4096) -> list[CaseResult]:
+    out = []
+    for s in stdins:
+        r = run_cmd([binary], stdin=s.encode("utf-8"), timeout_s=timeout_s, cwd=os.path.dirname(binary), mem_mb=mem_mb, max_output=50_000_000)
+        ok = r.returncode == 0 and not r.timed_out
+        out.append(CaseResult(ok, r.stdout.decode("utf-8", "replace"), "" if ok else r.stderr.decode("utf-8", "replace")[-1500:], r.duration_s, False, r.timed_out))
+    return out
+
+def tokens(s: str) -> list[str]:
+    return s.split()

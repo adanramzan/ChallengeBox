@@ -1,6 +1,6 @@
-import os, sys, time, ast, pytest
+import os, sys, time, ast, pytest, shutil
 import sandbox
-from sandbox import run_cmd, run_python_cases, python_static, Problem
+from sandbox import run_cmd, run_python_cases, python_static, Problem, rust_static, compile_rust, run_rust_cases, tokens
 
 ALLOWED_OS_INJECTED = {"__CF_USER_TEXT_ENCODING"}  # macOS injects this into every child; not inherited from our env dict
 
@@ -108,3 +108,42 @@ def test_problem_load_validates(tmp_path):
     p.write_text('{"problem_id":"a","language":"go","statement":"s","entrypoint":"f","public_examples":[],"deadline_s":300.0}')
     with pytest.raises(ValueError):
         Problem.load(str(p))
+
+needs_rustc = pytest.mark.skipif(shutil.which("rustc") is None, reason="rustc not installed")
+
+RS_OK = 'use std::io::*;\nfn main(){let mut s=String::new();stdin().read_to_string(&mut s).unwrap();let n:i64=s.trim().parse().unwrap();println!("{}",n*2);}\n'
+
+@needs_rustc
+def test_compile_and_run_rust(tmp_path):
+    binp, err = compile_rust(RS_OK, overflow_checks=True, workdir=str(tmp_path))
+    assert binp and os.path.exists(binp), err
+    res = run_rust_cases(binp, ["21\n", "5\n"], timeout_s=5)
+    assert [tokens(r.output) for r in res] == [["42"], ["10"]]
+    binp2, _ = compile_rust(RS_OK, overflow_checks=True, workdir=str(tmp_path))
+    assert binp2 == binp  # cached
+
+@needs_rustc
+def test_compile_error_reported(tmp_path):
+    binp, err = compile_rust("fn main(){ let x: i32 = \"s\"; }", overflow_checks=True, workdir=str(tmp_path))
+    assert binp is None and "mismatched types" in err
+
+@needs_rustc
+def test_overflow_checks_panic_only_in_gate_build(tmp_path):
+    src = 'fn main(){let mut x: i64 = i64::MAX; let y = std::hint::black_box(1i64); x += y; println!("{}", x);}'
+    gate, _ = compile_rust(src, overflow_checks=True, workdir=str(tmp_path))
+    stress, _ = compile_rust(src, overflow_checks=False, workdir=str(tmp_path))
+    assert not run_rust_cases(gate, [""], timeout_s=5)[0].ok
+    assert run_rust_cases(stress, [""], timeout_s=5)[0].ok
+
+@needs_rustc
+def test_rust_timeout(tmp_path):
+    binp, _ = compile_rust("fn main(){loop{}}", overflow_checks=False, workdir=str(tmp_path))
+    r = run_rust_cases(binp, [""], timeout_s=0.5)[0]
+    assert r.timed_out and not r.ok
+
+def test_rust_static_rules():
+    assert rust_static("fn main(){}") == []
+    assert any("main" in v for v in rust_static("fn helper(){}"))
+    assert any("unsafe" in v for v in rust_static("fn main(){ unsafe { } }"))
+    assert any("fs" in v for v in rust_static("use std::fs; fn main(){}"))
+    assert any("extern" in v for v in rust_static("extern crate rand; fn main(){}"))
