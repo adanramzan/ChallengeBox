@@ -5,6 +5,8 @@ cases_medium = 20
 stress_limit_python_s = 5.0
 stress_limit_rust_s = 2.0
 max_repairs = 2
+max_syntax_repairs = 2   # separate, smaller-scope budget for a static/compile failure -- a mechanical
+                         # fix (missing import, missing mut) must not consume a semantic repair attempt
 mem_mb = 4096
 shrink_budget_s = 3.0
 max_cost_usd_per_problem = 0.10

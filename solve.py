@@ -172,6 +172,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             run.cands[-1].evidence.append(V.Evidence("gate_error", False, detail={"error": f"{type(e).__name__}: {e}"}))
         gi = V.GateInputs(oracle_src=oracle_src)
     repairs = 0
+    syntax_repairs = 0
     while run.cands:
         cand = run.cands[-1]
         try:
@@ -189,11 +190,20 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
                 break
             failed = next(e for e in cand.evidence if not e.passed)
             run.log(f"gate.failed kind={failed.kind} detail={json.dumps(failed.detail)[:300]}")
-            if repairs >= cfg["limits"]["max_repairs"] or run.budget.phase() not in ("generate", "gate", "repair") or not run.budget.can_afford(60):
+            # A static/compile failure is mechanical (missing import, missing mut), not a semantic
+            # defect -- it gets its own small budget so it can't eat the attempts meant for an actual
+            # behavioral bug (diff_*, behavior, stress, overflow).
+            is_syntax = failed.kind in ("static", "compile")
+            cap = cfg["limits"]["max_syntax_repairs"] if is_syntax else cfg["limits"]["max_repairs"]
+            count = syntax_repairs if is_syntax else repairs
+            if count >= cap or run.budget.phase() not in ("generate", "gate", "repair") or not run.budget.can_afford(60):
                 break
             if run.cost_usd() >= cfg["limits"]["max_cost_usd_per_problem"]:
                 run.log(f"cost.cap reached usd={run.cost_usd():.4f}"); break
-            repairs += 1
+            if is_syntax:
+                syntax_repairs += 1
+            else:
+                repairs += 1
             new_source, verdict = V.repair(run, cand, failed, gi, pv)
             if verdict == "oracle" and gi.oracle_regens == 0:
                 gi = V.regenerate_oracle(run, gi, failed, pv)
@@ -225,7 +235,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         run.log(f"emit candidate={best.id} status={status}")
     report = {"problem_id": problem.problem_id, "language": problem.language, "profile": cfg.get("profile"), "deadline_s": problem.deadline_s,
               "deadline_scale": deadline_scale, "elapsed_s": round(run.budget.elapsed(), 1), "status": status,
-              "final_candidate": best.id if best else None, "repairs": repairs, "oracle_regenerated": gi.oracle_regens,
+              "final_candidate": best.id if best else None, "repairs": repairs, "syntax_repairs": syntax_repairs, "oracle_regenerated": gi.oracle_regens,
               "evidence": {c.id: [asdict(e) for e in c.evidence] for c in run.cands}, "parents": {c.id: c.parent for c in run.cands},
               "calls": list(llm.calls),
               "token_usage": {"prompt": sum((c["usage"] or {}).get("prompt_tokens", 0) for c in llm.calls),
@@ -252,14 +262,14 @@ def bench(sample_dir: str, out_dir: str, cfg: dict, llm, deadline_scale: float) 
                 ev = {e["kind"]: e for e in rep["evidence"].get(rep["final_candidate"] or "", [])}
                 mark = lambda k: "n/a" if k not in ev else "skip" if ev[k].get("skipped") else ("pass" if ev[k]["passed"] else "FAIL")
                 rows.append({"id": pid, "lang": p.language, "compiles": mark("compile"), "edge": mark("diff_edge"), "small": mark("diff_small"),
-                             "medium": mark("diff_medium"), "behavior": mark("behavior"), "stress": mark("stress"), "overflow": mark("overflow"), "repairs": rep["repairs"], "calls": len(rep["calls"]),
+                             "medium": mark("diff_medium"), "behavior": mark("behavior"), "stress": mark("stress"), "overflow": mark("overflow"), "repairs": rep["repairs"], "syntax_repairs": rep["syntax_repairs"], "calls": len(rep["calls"]),
                              "tokens": f"{rep['token_usage']['prompt']}/{rep['token_usage']['completion']}", "elapsed": rep["elapsed_s"], "cost": rep["cost_usd"], "status": rep["status"]})
             except Exception as e:
                 rows.append({"id": pid, "lang": "?", "compiles": "n/a", "edge": "n/a", "small": "n/a", "medium": "n/a", "behavior": "n/a", "stress": "n/a", "overflow": "n/a",
-                             "repairs": 0, "calls": 0, "tokens": "0/0", "elapsed": 0.0, "cost": None, "status": f"error: {type(e).__name__}: {str(e)[:200]}"})
+                             "repairs": 0, "syntax_repairs": 0, "calls": 0, "tokens": "0/0", "elapsed": 0.0, "cost": None, "status": f"error: {type(e).__name__}: {str(e)[:200]}"})
     finally:
-        hdr = "| Problem | Lang | Compiles | Edge | Small | Medium | Behavior | Stress | Overflow | Repairs | Calls | Tokens in/out | Elapsed s | Cost USD | Status | Hidden tests |\n|---|---|---|---|---|---|---|---|---|---:|---:|---|---:|---:|---|---|\n"
-        body = "".join(f"| {r['id']} | {r['lang']} | {r['compiles']} | {r['edge']} | {r['small']} | {r['medium']} | {r['behavior']} | {r['stress']} | {r['overflow']} | {r['repairs']} | {r['calls']} | {r['tokens']} | {r['elapsed']} | {r['cost'] if r['cost'] is not None else 'n/a'} | {r['status']} | unknown |\n" for r in rows)
+        hdr = "| Problem | Lang | Compiles | Edge | Small | Medium | Behavior | Stress | Overflow | Repairs | Syntax Repairs | Calls | Tokens in/out | Elapsed s | Cost USD | Status | Hidden tests |\n|---|---|---|---|---|---|---|---|---|---:|---:|---:|---|---:|---:|---|---|\n"
+        body = "".join(f"| {r['id']} | {r['lang']} | {r['compiles']} | {r['edge']} | {r['small']} | {r['medium']} | {r['behavior']} | {r['stress']} | {r['overflow']} | {r['repairs']} | {r['syntax_repairs']} | {r['calls']} | {r['tokens']} | {r['elapsed']} | {r['cost'] if r['cost'] is not None else 'n/a'} | {r['status']} | unknown |\n" for r in rows)
         costs = [r["cost"] for r in rows if r["cost"] is not None]
         total_cost = f"{sum(costs):.4f}" if costs else "unknown"
         note = f"\nprofile={cfg.get('profile')} deadline_scale={deadline_scale} total_cost_usd={total_cost}. 'pass' = passed local gates; hidden-test status is unknown.\n"

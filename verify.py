@@ -1,6 +1,6 @@
 """Verification: cases from the oracle, differential, behavior, stress, shrink, repair glue."""
 from __future__ import annotations
-import os, re, time
+import difflib, os, re, time
 from dataclasses import dataclass, field
 from sandbox import CaseResult, run_python_cases, compile_rust, run_rust_cases, tokens
 from llm import parse_blocks
@@ -358,8 +358,33 @@ def _fmt(v, limit: int = 4000) -> str:
     s = repr(v) if not isinstance(v, str) else v
     return s if len(s) <= limit else s[:limit] + " ...[truncated]"
 
+def _fmt_typed(v, limit: int = 4000) -> str:
+    # repr() alone can look identical for two differently-shaped failures once truncated or eyeballed
+    # (an empty tuple candidate vs an empty list oracle both read short); naming the type explicitly
+    # next to the value removes any doubt for the repair model. Display only -- same() is untouched.
+    return f"{_fmt(v, limit)}  (type: {type(v).__name__})"
+
+def _previous_attempt_note(run, cand, failed: Evidence) -> str:
+    """If `cand` is itself the result of an earlier repair, describe that attempt: the input it was
+    given, what it changed, and that the candidate above still fails -- so the model doesn't repeat a
+    change that already didn't work. Empty string when there is no earlier repair (first attempt)."""
+    if not cand.parent:
+        return ""
+    parent = next((c for c in run.cands if c.id == cand.parent), None)
+    if parent is None:
+        return ""
+    prev_failed = next((e for e in parent.evidence if not e.passed), None)
+    if prev_failed is None:
+        return ""
+    diff = "\n".join(difflib.unified_diff(parent.source.splitlines(), cand.source.splitlines(), lineterm="", n=1))
+    return ("\nA previous repair already ran on this candidate. It was given failure kind="
+            f"{prev_failed.kind} on input {_fmt_typed(prev_failed.detail.get('input'))}, and made this change:\n"
+            f"{_fmt(diff, 1500)}\n"
+            "That change did NOT fix the case: the candidate shown below still fails. Do not repeat it.\n")
+
 def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, str]:
     problem = run.p
+    previous_attempt = _previous_attempt_note(run, cand, failed)
     detail = dict(failed.detail)
     if failed.kind.startswith("diff_") and "input" in detail:
         case = Case(detail["input"], detail["expected"], failed.kind)
@@ -369,9 +394,9 @@ def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, 
         detail["input"], detail["expected"] = case.input, case.expected
         gi.regressions.append(case)
     pv_repair = {**pv, "statement": _fmt(pv["statement"], 12000)}
-    r = run.chat("strong", "repair", 0.25 * run.budget.usable_s, kind=failed.kind, input=_fmt(detail.get("input")), expected=_fmt(detail.get("expected")),
-                 actual=_fmt(detail.get("actual")), details=_fmt({k: v for k, v in detail.items() if k not in ("input", "expected", "actual")}),
-                 code=_fmt(cand.source), **pv_repair)
+    r = run.chat("strong", "repair", 0.25 * run.budget.usable_s, kind=failed.kind, input=_fmt_typed(detail.get("input")), expected=_fmt_typed(detail.get("expected")),
+                 actual=_fmt_typed(detail.get("actual")), details=_fmt({k: v for k, v in detail.items() if k not in ("input", "expected", "actual")}),
+                 code=_fmt(cand.source), previous_attempt=previous_attempt, **pv_repair)
     blocks = parse_blocks(r.text)
     trace = _BLOCKS_RE.sub("", r.text).strip()
     gi.dispute_trace = _fmt(trace)
@@ -384,7 +409,12 @@ def regenerate_oracle(run, gi: GateInputs, failed: Evidence, pv: dict) -> GateIn
              f"Input: {_fmt(failed.detail.get('input'))}\nPrevious (wrong) expected: {_fmt(failed.detail.get('expected'))}\n")
     if gi.dispute_trace:
         extra += f"A solver hand-traced the statement on this input and concluded the previous reference was wrong. Its trace:\n{gi.dispute_trace}\n"
-    r = run.chat("fast", "oracle", 0.2 * run.budget.usable_s, **{**pv, "statement": pv["statement"] + extra})
+    # Regeneration writes the same reference+gen+validate functions as the original ORACLE call, so it
+    # needs the same generous cap -- derived from the same config knob solve() uses -- not a separate,
+    # smaller hardcoded fraction that clips before the oracle's measured latency (min 38s / median 73s
+    # / max 128s). step_timeout (inside run.chat) still caps this to whatever budget remains.
+    gen_cap = run.cfg["phases"]["generate_call_share"] * run.budget.usable_s
+    r = run.chat("fast", "oracle", gen_cap, **{**pv, "statement": pv["statement"] + extra})
     src = parse_blocks(r.text).get("ORACLE", "")
     if not src.strip():
         run.log("oracle.regen failed: empty")

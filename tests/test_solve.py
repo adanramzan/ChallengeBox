@@ -7,7 +7,7 @@ def prob(tmp_path, lang="python"):
     return Problem("pid", lang, "Return a+b for ints a,b. At most 10^18.", "add" if lang == "python" else "main", [], 300.0)
 
 def cfg():
-    return {"limits": {"safety_margin_s": 15.0, "cases_small": 5, "cases_medium": 2, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0, "max_repairs": 2, "mem_mb": 2048, "shrink_budget_s": 1.0, "max_cost_usd_per_problem": 0.10},
+    return {"limits": {"safety_margin_s": 15.0, "cases_small": 5, "cases_medium": 2, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0, "max_repairs": 2, "max_syntax_repairs": 2, "mem_mb": 2048, "shrink_budget_s": 1.0, "max_cost_usd_per_problem": 0.10},
             "phases": {"generate_until": 0.32, "gate_until": 0.39, "repair_until": 0.81, "settle_until": 0.93, "generate_call_share": 0.45}, "profile": "fake"}
 
 SOLVE_OK = "===RULES===\nr\n===END===\n===TRAPS===\nt\n===END===\n===ALGORITHM===\na\n===END===\n===CODE===\n```python\ndef add(a, b):\n    return a + b\n```\n===END===\n"
@@ -49,7 +49,9 @@ def test_static_failure_repair_reaches_cap_and_emits_best(tmp_path):
     llm = FakeLLM({"solve": [bad], "repair": [repair1, repair2], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
     rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert rep["status"] == "emitted_with_failures"
-    assert rep["repairs"] == 2
+    # a "static" failure (wrong entrypoint name) is mechanical, not semantic -- it must spend the
+    # separate syntax-repair budget, leaving the semantic `repairs` counter untouched.
+    assert rep["syntax_repairs"] == 2 and rep["repairs"] == 0
     assert (tmp_path / "s.py").exists()
     assert any(e["kind"] == "static" and not e["passed"] for e in rep["evidence"]["c1"])
 
@@ -60,7 +62,7 @@ def test_repair_no_progress_breaks_early(tmp_path):
     llm = FakeLLM({"solve": [bad], "repair": [bad, bad], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
     rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert rep["status"] == "emitted_with_failures"
-    assert rep["repairs"] == 1
+    assert rep["syntax_repairs"] == 1 and rep["repairs"] == 0   # "static" failure -> syntax budget
     assert len(llm.script["repair"]) == 1
 
 def test_invalid_problem_exit_code(tmp_path):
@@ -331,3 +333,67 @@ def test_gate_passed_still_logged_when_something_was_actually_checked(tmp_path):
     llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
     rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert any(l.endswith("gate.passed") for l in rep["events"])
+
+# --- repairfix: oracle-regen timeout, syntax/semantic repair budgets, typed repair prompts ---
+
+def _sent_timeouts(events, tag):
+    return [float(re.search(r"timeout=(\d+)", l).group(1)) for l in events if l.split("] ", 1)[1].startswith(f"{tag}.sent")]
+
+def test_oracle_regen_timeout_derived_from_generate_call_share(tmp_path):
+    # regenerate_oracle used to hardcode 0.2 * usable_s (57s against a 285s usable budget) regardless
+    # of config -- well below the oracle's measured worst-case latency (128s), so a correct "blame the
+    # oracle" verdict could still lose its regeneration to a timeout. It must scale with
+    # [phases].generate_call_share exactly like the initial ORACLE call does.
+    llm1 = FakeLLM({"solve": [SOLVE_OK], "repair": [REPAIR_BLAME_ORACLE], "oracle": [ORACLE_WRONG, ORACLE_OK], "stress": [STRESS_OK]})
+    c1 = cfg(); c1["phases"]["generate_call_share"] = 0.10
+    rep1 = S.solve(prob(tmp_path), llm1, c1, out_path=str(tmp_path / "s1.py"), run_dir=str(tmp_path / "run1"))
+    llm2 = FakeLLM({"solve": [SOLVE_OK], "repair": [REPAIR_BLAME_ORACLE], "oracle": [ORACLE_WRONG, ORACLE_OK], "stress": [STRESS_OK]})
+    c2 = cfg(); c2["phases"]["generate_call_share"] = 0.50
+    rep2 = S.solve(prob(tmp_path), llm2, c2, out_path=str(tmp_path / "s2.py"), run_dir=str(tmp_path / "run2"))
+    usable = 285.0
+    t1 = _sent_timeouts(rep1["events"], "oracle")[1]   # index 1: the regeneration call, not the initial one
+    t2 = _sent_timeouts(rep2["events"], "oracle")[1]
+    assert t1 == pytest.approx(0.10 * usable, abs=1.5)
+    assert t2 == pytest.approx(0.50 * usable, abs=1.5)
+    assert t2 > t1
+    assert "repairs" in rep1 and "syntax_repairs" in rep1   # both repair counters must appear in the report
+
+def test_static_failure_consumes_syntax_budget_not_semantic(tmp_path):
+    # A wrong entrypoint name is a mechanical "static" failure. It must spend the small, separate
+    # max_syntax_repairs budget and never touch the semantic max_repairs counter.
+    bad = SOLVE_OK.replace("def add(a, b):", "def wrong(a, b):")
+    c = cfg(); c["limits"]["max_syntax_repairs"] = 1
+    repair1 = "===VERDICT===\ncandidate\n===END===\n===CODE===\ndef wrong1(a, b):\n    return a + b\n===END===\n"
+    llm = FakeLLM({"solve": [bad], "repair": [repair1], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["syntax_repairs"] == 1   # stopped by max_syntax_repairs=1, not max_repairs=2
+    assert rep["repairs"] == 0
+
+def test_behavioral_failure_consumes_semantic_budget_not_syntax(tmp_path):
+    # A genuine algorithmic bug (diff_edge) must spend max_repairs, and never the syntax budget.
+    still_buggy = "===VERDICT===\ncandidate\n===END===\n===CODE===\ndef add(a, b):\n    return a + b if a < 15 else a + b + 2\n===END===\n"
+    llm = FakeLLM({"solve": [BUGGY], "repair": [still_buggy, still_buggy, still_buggy], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["repairs"] == 2
+    assert rep["syntax_repairs"] == 0
+
+def test_repair_prompt_distinguishes_tuple_from_list_via_repr_and_type(tmp_path):
+    # A candidate returning a tuple where the oracle returns a list renders identically once eyeballed
+    # ("both look like []" at the empty case); the repair prompt must make the type explicit so the
+    # model can actually see the difference instead of rewriting unrelated code.
+    ORACLE_LIST = "===ORACLE===\nimport random\ndef reference(a, b):\n    return [a, b]\ndef gen(seed, mode):\n    r = random.Random(seed)\n    return (r.randint(0, 20), r.randint(0, 20))\n===END===\n"
+    SOLVE_TUPLE = SOLVE_OK.replace("return a + b", "return (a, b)")
+    fix = "===VERDICT===\ncandidate\n===END===\n===CODE===\ndef add(a, b):\n    return [a, b]\n===END===\n"
+    llm = FakeLLM({"solve": [SOLVE_TUPLE], "repair": [fix], "oracle": [ORACLE_LIST], "stress": [STRESS_OK]})
+    S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    repair_prompt = next(u for r, s, u in llm.prompts if "Failure kind" in u)
+    assert "(type: list)" in repair_prompt and "(type: tuple)" in repair_prompt
+
+def test_second_repair_prompt_notes_previous_change_did_not_fix_the_case(tmp_path):
+    still_buggy = "===VERDICT===\ncandidate\n===END===\n===CODE===\ndef add(a, b):\n    return a + b if a < 15 else a + b + 2\n===END===\n"
+    llm = FakeLLM({"solve": [BUGGY], "repair": [still_buggy, still_buggy], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    repair_prompts = [u for r, s, u in llm.prompts if "Failure kind" in u]
+    assert len(repair_prompts) == 2
+    assert "did not fix" not in repair_prompts[0].lower()   # first attempt: no history to report yet
+    assert "did not fix" in repair_prompts[1].lower()       # second attempt: must say the prior change failed

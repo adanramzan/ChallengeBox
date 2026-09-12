@@ -2,10 +2,11 @@ You write a generator for one MAXIMUM-SIZE input, plus a list of small hand-pick
 
 Define `gen_max(seed: int)` returning {{gen_returns}}. Its purpose is to separate a solution of the intended complexity from a slower one, so it needs scale and the operation mix that is worst for a plausible implementation — not literally the largest legal input.
 
-**`gen_max` must finish in about five seconds.** This is a hard requirement and it outranks size: a generator that never returns contributes nothing, and the whole timing check is then skipped. Two rules follow.
+**`gen_max` must finish in about five seconds.** This is a hard requirement and it outranks size: a generator that never returns contributes nothing, and the whole timing check is then skipped. Measure, don't guess: build the input incrementally, checking elapsed time as you go, and stop growing it once you approach the budget — return what you have. A smaller input that actually comes back beats a larger one computed from a guessed fixed size that never returns. Two rules follow.
 
 * Push every *value* to its stated maximum immediately — maximum integers, deepest nesting, longest individual paths — because large values cost nothing to produce and are where overflow and precision bugs live.
-* Size the *counts* to whatever you can build in that budget. Prefer bulk construction (comprehensions and slicing over whole ranges) to a per-element loop. If honoring the statement's preconditions requires stepping through a state model one operation at a time, that loop is your real constraint: pick a count it can finish, in the tens of thousands rather than the stated maximum. Tens of thousands already separates a linear solution from a quadratic one.
+* Size the *counts* to whatever you can build in that budget, checked against a clock, not assumed from the statement's stated limit. Prefer bulk construction (comprehensions and slicing over whole ranges) to a per-element loop. If honoring the statement's preconditions requires stepping through a state model one operation at a time, that loop is your real constraint: pick a count it can finish, in the tens of thousands rather than the stated maximum. Tens of thousands already separates a linear solution from a quadratic one.
+* Never build a nested, linked, or tree-shaped input with recursion: its depth can be proportional to the input's size, and Python's recursion limit is small. Build it iteratively instead — an explicit stack, or linking nodes in a loop.
 
 Allocate memory proportional to the input you return, never to a quantity the statement merely describes, such as a repetition count or capacity that can reach 10^18.
 
@@ -24,7 +25,7 @@ An invalid input makes every later comparison meaningless, and it is the most co
 ## Python pitfalls that have broken this exact task
 
 * Never assign to a name you also read inside the same function, and never to an imported module name. `random = random.Random(seed)` raises `UnboundLocalError`. Bind the generator to a fresh name such as `rng`.
-* Never draw from a possibly-empty range. Guard every `randrange`, `randint`, `choice` and `sample` so the range or sequence is non-empty, and skip that step when it is not.
+* Never draw from a possibly-empty range. Guard **every** `randrange`, `randint`, `choice` and `sample` call site — not just the obvious first one — so the range or sequence is non-empty at that exact point, and skip that step when it is not. An `IndexError` or `ValueError` from one unguarded draw buried deep in a loop is just as fatal as one in the first line.
 * `EDGES` must hold literal values, not calls that build them.
 * Never indent the contents of a multi-line string literal (e.g. a `"""..."""` block spanning several lines) to match the surrounding code. Every line after the first becomes part of the value verbatim, so indenting it adds leading whitespace the real input never has. Start continuation lines at column 0, or build the string with `"\n".join([...])` instead.
 
