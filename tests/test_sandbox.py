@@ -134,6 +134,19 @@ def test_overflow_checks_panic_only_in_gate_build(tmp_path):
     stress, _ = compile_rust(src, overflow_checks=False, workdir=str(tmp_path))
     assert not run_rust_cases(gate, [""], timeout_s=5)[0].ok
     assert run_rust_cases(stress, [""], timeout_s=5)[0].ok
+    # Verify they have different binary paths (different hashes due to overflow flag)
+    assert gate != stress
+
+@needs_rustc
+def test_compile_cache_key_includes_flags(tmp_path):
+    # Compile same source with different flags, verify different cache entries
+    src = 'fn main(){println!("ok");}'
+    binp1, _ = compile_rust(src, overflow_checks=True, workdir=str(tmp_path))
+    binp2, _ = compile_rust(src, overflow_checks=False, workdir=str(tmp_path))
+    # Different flags should produce different paths (because hash includes flags)
+    assert binp1 != binp2
+    # Both should exist
+    assert os.path.exists(binp1) and os.path.exists(binp2)
 
 @needs_rustc
 def test_rust_timeout(tmp_path):
@@ -147,3 +160,86 @@ def test_rust_static_rules():
     assert any("unsafe" in v for v in rust_static("fn main(){ unsafe { } }"))
     assert any("fs" in v for v in rust_static("use std::fs; fn main(){}"))
     assert any("extern" in v for v in rust_static("extern crate rand; fn main(){}"))
+
+def test_rust_static_defeats_import_grouping():
+    # use std::{fs} should be flagged
+    assert any("fs" in v for v in rust_static("use std::{fs}; fn main(){}"))
+    # use std::env should be flagged
+    assert any("env" in v for v in rust_static("use std::env; fn main(){}"))
+    # use std::process should be flagged
+    assert any("process" in v for v in rust_static("use std::process; fn main(){}"))
+
+def test_rust_static_defeats_spaced_paths():
+    # std :: fs with spaces should be flagged
+    assert any("fs" in v for v in rust_static("fn main(){ std :: fs :: write(\"x\",\"y\"); }"))
+
+def test_rust_static_ignores_comments():
+    # Comment containing "unsafe" should not be flagged
+    assert rust_static("// this is unsafe? no.\nfn main(){}") == []
+
+def test_rust_static_ignores_string_contents():
+    # String containing "unsafe" should not be flagged
+    assert rust_static('fn main(){ println!("unsafe"); }') == []
+
+def test_rust_static_flags_std_alias():
+    # use std as should be flagged
+    assert any("std as" in v for v in rust_static("use std as s; fn main(){}"))
+
+def test_rust_static_allows_standard_io():
+    # Standard I/O for stdin/stdout should be allowed
+    result = rust_static("use std::io::{self, Read, Write};\nfn main(){}")
+    assert result == []
+
+def test_rust_static_lifetimes_with_forbidden_paths():
+    # Lifetime scanner bug: this should flag std::fs::write, not eat it
+    src = "fn f<'a>(x: &'a str) -> &'a str { x } fn main(){ std::fs::write(\"x\",\"y\"); }"
+    result = rust_static(src)
+    assert any("fs" in v for v in result), f"Expected fs forbidden but got {result}"
+
+def test_rust_static_lifetimes_clean():
+    # Multiple lifetimes should not cause issues
+    src = "fn f<'a, 'b>(x: &'a str, y: &'b str) -> &'a str { x } fn main(){}"
+    result = rust_static(src)
+    assert result == [], f"Expected clean but got {result}"
+
+def test_rust_static_char_literal_escaped():
+    # Escaped quotes in char literals should not break
+    src = "fn main(){ let c = '\\''; let _ = c; }"
+    result = rust_static(src)
+    assert result == [], f"Expected clean but got {result}"
+
+def test_rust_static_char_literal_simple():
+    # Simple char literals should be handled
+    src = "fn main(){ let c = 'x'; let _ = c; }"
+    result = rust_static(src)
+    assert result == [], f"Expected clean but got {result}"
+
+def test_rust_static_nested_use_groups_with_fs():
+    # Nested use groups: fs should be flagged even though it's nested
+    src = "use std::{io::{self, Read}, fs}; fn main(){}"
+    result = rust_static(src)
+    assert any("fs" in v for v in result), f"Expected fs forbidden but got {result}"
+
+def test_rust_static_nested_use_groups_flat():
+    # Nested use groups without forbidden modules should be clean
+    src = "use std::{io::{self, Read}, collections::BTreeMap}; fn main(){}"
+    result = rust_static(src)
+    assert result == [], f"Expected clean but got {result}"
+
+def test_rust_static_multiple_use_statements():
+    # Multiple use statements, should detect forbidden in any of them
+    src = "use std::collections::{BTreeMap, HashMap};\nuse std::io::Read;\nfn main(){}"
+    result = rust_static(src)
+    assert result == [], f"Expected clean but got {result}"
+
+def test_rust_static_use_with_similar_name():
+    # Token "environment" contains "env" but is not the token "env"
+    src = "use std::io::Read; fn main(){ let environment = 1; let _ = environment; }"
+    result = rust_static(src)
+    assert result == [], f"Expected clean but got {result}"
+
+def test_rust_static_fn_main_in_comment_only():
+    # fn main() hidden in comment should be flagged
+    src = "// fn main(){}\nfn helper(){}"
+    result = rust_static(src)
+    assert any("main" in v for v in result), f"Expected no fn main but got {result}"

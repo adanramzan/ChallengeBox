@@ -203,31 +203,139 @@ def _only_setrecursionlimit(tree: ast.AST) -> bool:
                 return False
     return True
 
-_RS_FORBIDDEN = [(r"\bunsafe\b", "unsafe block"), (r"\bextern\s+crate\b", "extern crate"),
-                 (r"std::fs\b", "std::fs"), (r"std::net\b", "std::net"), (r"std::process::Command", "process::Command"),
-                 (r"std::env::args", "env::args")]
+def _normalize_rust(source: str) -> str:
+    """Strip comments and literals, collapse whitespace around ::"""
+    result = []
+    i = 0
+    while i < len(source):
+        # Line comment
+        if i + 1 < len(source) and source[i:i+2] == '//':
+            while i < len(source) and source[i] != '\n':
+                i += 1
+            if i < len(source):
+                result.append('\n')
+                i += 1
+            continue
+        # Block comment
+        if i + 1 < len(source) and source[i:i+2] == '/*':
+            i += 2
+            while i + 1 < len(source) and source[i:i+2] != '*/':
+                if source[i] == '\n':
+                    result.append('\n')
+                i += 1
+            if i + 1 < len(source) and source[i:i+2] == '*/':
+                i += 2
+            continue
+        # String literal
+        if source[i] == '"':
+            result.append('"')
+            i += 1
+            while i < len(source) and source[i] != '"':
+                if source[i] == '\\' and i + 1 < len(source):
+                    i += 2
+                else:
+                    i += 1
+            if i < len(source):
+                result.append('"')
+                i += 1
+            continue
+        # Char literal vs lifetime: only treat ' as char literal if followed by valid char pattern
+        if source[i] == "'":
+            # Check if this looks like a char literal: '\...' or 'X' where X is not quote/backslash
+            is_char_lit = False
+            if i + 1 < len(source):
+                if source[i+1] == '\\':
+                    # Escape form: '\x' where x is any char
+                    if i + 3 < len(source) and source[i+3] == "'":
+                        is_char_lit = True
+                elif source[i+1] != "'" and source[i+1] != '\\':
+                    # Single char form: 'X'
+                    if i + 2 < len(source) and source[i+2] == "'":
+                        is_char_lit = True
+
+            if is_char_lit:
+                # This is a char literal, strip its contents
+                result.append("'")
+                i += 1
+                while i < len(source) and source[i] != "'":
+                    if source[i] == '\\' and i + 1 < len(source):
+                        i += 2
+                    else:
+                        i += 1
+                if i < len(source):
+                    result.append("'")
+                    i += 1
+            else:
+                # This is a lifetime, just emit it
+                result.append(source[i])
+                i += 1
+            continue
+        result.append(source[i])
+        i += 1
+    normalized = ''.join(result)
+    normalized = re.sub(r'\s*::\s*', '::', normalized)
+    return normalized
 
 def rust_static(source: str) -> list[str]:
     problems = []
-    if not re.search(r"\bfn\s+main\s*\(", source):
+    normalized = _normalize_rust(source)
+    # Check for fn main() on normalized text so hidden main() in comments is caught
+    if not re.search(r"\bfn\s+main\s*\(", normalized):
         problems.append("no fn main()")
-    for pat, label in _RS_FORBIDDEN:
-        if re.search(pat, source):
-            problems.append(f"forbidden: {label}")
+    # Check for fully-qualified forbidden paths
+    if re.search(r"\bunsafe\b", normalized):
+        problems.append("forbidden: unsafe block")
+    if re.search(r"\bextern\s+crate\b", normalized):
+        problems.append("forbidden: extern crate")
+    if re.search(r"std::fs\b", normalized):
+        problems.append("forbidden: std::fs")
+    if re.search(r"std::net\b", normalized):
+        problems.append("forbidden: std::net")
+    if re.search(r"std::process\b", normalized):
+        problems.append("forbidden: std::process")
+    if re.search(r"std::env\b", normalized):
+        problems.append("forbidden: std::env")
+    if re.search(r"use\s+std\s+as\b", normalized):
+        problems.append("forbidden: use std as")
+
+    # Check use statements: for each "use std...;" extract tokens and check if any is fs/net/process/env
+    for use_match in re.finditer(r"use\s+std[^;]*;", normalized):
+        use_stmt = use_match.group(0)
+        # Split on non-identifier characters to get tokens
+        tokens = re.split(r'[^a-zA-Z0-9_]+', use_stmt)
+        for token in tokens:
+            if token in ('fs', 'net', 'process', 'env'):
+                if token == 'fs':
+                    problems.append("forbidden: std::fs")
+                elif token == 'net':
+                    problems.append("forbidden: std::net")
+                elif token == 'process':
+                    problems.append("forbidden: std::process")
+                elif token == 'env':
+                    problems.append("forbidden: std::env")
+                break  # Report only once per use statement
+
     return problems
 
 def compile_rust(source: str, *, overflow_checks: bool, workdir: str, timeout_s: float = 90.0) -> tuple[str | None, str]:
     os.makedirs(workdir, exist_ok=True)
     tag = "gate" if overflow_checks else "stress"
-    h = hashlib.sha256((tag + source).encode()).hexdigest()[:16]
+    # Build argv first to include in cache key
+    overflow_flag = f"overflow-checks={'on' if overflow_checks else 'off'}"
+    argv = ["rustc", "--edition", "2021", "-O", "-C", overflow_flag, "-A", "warnings"]
+    # Hash includes full argv (minus output file) plus source
+    argv_key = "\x00".join(argv) + "\x00" + overflow_flag
+    h = hashlib.sha256((argv_key + source).encode()).hexdigest()[:16]
     binp = os.path.join(workdir, f"bin_{tag}_{h}")
     if os.path.exists(binp):
         return binp, ""
     src = os.path.join(workdir, f"cand_{h}.rs")
     with open(src, "w", encoding="utf-8") as f: f.write(source)
-    argv = ["rustc", "--edition", "2021", "-O", "-C", f"overflow-checks={'on' if overflow_checks else 'off'}",
-            "-A", "warnings", "-o", binp, src]
-    r = run_cmd(argv, timeout_s=timeout_s, cwd=workdir)
+    argv_full = argv + ["-o", binp, src]
+    try:
+        r = run_cmd(argv_full, timeout_s=timeout_s, cwd=workdir)
+    except FileNotFoundError:
+        return None, "rustc not found on PATH"
     err = r.stderr.decode("utf-8", "replace")
     if r.returncode != 0 or not os.path.exists(binp):
         return None, err if not r.timed_out else "rustc timed out"
