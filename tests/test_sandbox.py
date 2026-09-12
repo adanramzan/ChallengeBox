@@ -287,3 +287,22 @@ def test_run_python_cases_forwards_mem_mb_to_run_cmd(tmp_path, monkeypatch):
     res = run_python_cases("def add(a, b):\n    return a + b\n", "add", [(2, 3)], timeout_s=10, workdir=str(tmp_path), mem_mb=256)
     assert res[0].ok and res[0].output == 5
     assert captured["mem_mb"] == 256   # not run_cmd's default of 4096
+
+
+def test_per_case_limit_bounds_one_case_not_the_whole_batch(tmp_path):
+    # Without a per-case bound a single hanging input eats the entire batch grant and every case
+    # after it is reported as a timeout it never got to run. Measured on 6e43a08ec05a: diff_edge
+    # failed at case 0 in milliseconds yet took 60.9s, three candidates running.
+    src = "import time\ndef f(x):\n    if x == 1: time.sleep(30)\n    return x\n"
+    t0 = time.monotonic()
+    res = run_python_cases(src, "f", [(0,), (1,), (2,)], timeout_s=60, workdir=str(tmp_path), per_case_s=2.0)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 20, f"one hung case consumed the batch grant ({elapsed:.1f}s of 60s)"
+    assert res[0].ok and res[0].output == 0
+    assert not res[1].ok and "per-case limit" in res[1].error
+    assert res[2].ok and res[2].output == 2, "cases after the hung one must still run"
+
+
+def test_per_case_limit_off_by_default(tmp_path):
+    res = run_python_cases("def f(x):\n    return x\n", "f", [(1,)], timeout_s=10, workdir=str(tmp_path))
+    assert res[0].ok and res[0].output == 1

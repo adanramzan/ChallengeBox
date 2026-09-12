@@ -16,6 +16,12 @@ solve_attempts = 2
 max_syntax_repairs = 2   # separate, smaller-scope budget for a static/compile failure -- a mechanical
                          # fix (missing import, missing mut) must not consume a semantic repair attempt
 mem_mb = 4096
+# Wall limit for ONE case inside the python harness, enforced per call rather than per batch.
+# Without it a single pathological input consumes the whole batch grant: measured on 6e43a08ec05a,
+# where diff_edge failed at case 0 in milliseconds but still took 60.9s because a later case in the
+# same batch hung -- three times over, 159s of a 265s run. Keep it well above a legitimate case
+# (tiny edge/small fixtures finish in milliseconds) and well below the batch grant.
+per_case_limit_s = 10.0
 shrink_budget_s = 3.0
 max_cost_usd_per_problem = 0.10
 

@@ -102,21 +102,35 @@ class CaseResult:
 
 # Trusted harness. Reads one repr(args_tuple) per line from cases.txt, prints one repr(dict) per line.
 _PY_HARNESS = r'''
-import ast, copy, importlib.util, sys, time, traceback
+import ast, copy, importlib.util, signal, sys, time, traceback
 spec = importlib.util.spec_from_file_location("cand", sys.argv[1]); mod = importlib.util.module_from_spec(spec)
 try:
     spec.loader.exec_module(mod); fn = getattr(mod, sys.argv[2])
 except Exception:
     print(repr({"ok": False, "error": "IMPORT: " + traceback.format_exc()[-1500:]}), flush=True); sys.exit(2)
+
+# Per-case wall limit. Without it one pathological case consumes the WHOLE batch's timeout and
+# every later case is reported as a timeout it never got to run -- and the caller waits the full
+# grant to learn a verdict the first case already settled. 0 disables.
+PER_CASE = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
+class _CaseTimeout(Exception): pass
+def _on_alarm(sig, frame): raise _CaseTimeout()
+if PER_CASE > 0: signal.signal(signal.SIGALRM, _on_alarm)
+
 for line in open(sys.argv[3], encoding="utf-8"):
     line = line.rstrip("\n")
     if not line: continue
     t0 = time.perf_counter()
     try:
         args = ast.literal_eval(line); before = copy.deepcopy(args)
+        if PER_CASE > 0: signal.setitimer(signal.ITIMER_REAL, PER_CASE)
         out = fn(*args); ok = True; err = ""
+    except _CaseTimeout:
+        args = before = None; out = None; ok = False; err = "case exceeded per-case limit of %gs" % PER_CASE
     except BaseException:
         args = before = None; out = None; ok = False; err = traceback.format_exc()[-1500:]
+    finally:
+        if PER_CASE > 0: signal.setitimer(signal.ITIMER_REAL, 0)
     dt = time.perf_counter() - t0
     try:
         mutated = args != before
@@ -133,7 +147,7 @@ for line in open(sys.argv[3], encoding="utf-8"):
     print(line, flush=True)
 '''
 
-def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, timeout_s: float, workdir: str, mem_mb: int = 4096) -> list[CaseResult]:
+def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, timeout_s: float, workdir: str, mem_mb: int = 4096, per_case_s: float = 0.0) -> list[CaseResult]:
     # run_cmd sets cwd=workdir, so every path handed to the child must be absolute: a relative
     # workdir would otherwise be resolved a second time against itself and double the path.
     workdir = os.path.abspath(workdir)
@@ -143,7 +157,7 @@ def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, ti
     with open(harness, "w", encoding="utf-8") as f: f.write(_PY_HARNESS)
     with open(cases, "w", encoding="utf-8") as f:
         for a in args_list: f.write(repr(tuple(a)) + "\n")
-    r = run_cmd([PYTHON, harness, cand, entrypoint, cases], timeout_s=timeout_s, cwd=workdir, max_output=50_000_000, mem_mb=mem_mb)
+    r = run_cmd([PYTHON, harness, cand, entrypoint, cases, repr(float(per_case_s))], timeout_s=timeout_s, cwd=workdir, max_output=50_000_000, mem_mb=mem_mb)
     results: list[CaseResult] = []
     for line in r.stdout.decode("utf-8", "replace").splitlines():
         try:

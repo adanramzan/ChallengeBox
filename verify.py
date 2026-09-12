@@ -55,14 +55,14 @@ def _ref_args(problem, inp) -> tuple:
         return (inp,)
     return tuple(inp) if isinstance(inp, (tuple, list)) else (inp,)
 
-def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str, timeout_s: float) -> tuple[list[Case], Evidence]:
+def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str, timeout_s: float, per_case_s: float = 0.0) -> tuple[list[Case], Evidence]:
     t0 = time.monotonic()
     valid_inputs = inputs
     checked = invalid_dropped = 0
     validation_skipped = ""
     if inputs:
         val_res = run_python_cases(oracle_src, "validate", [_ref_args(problem, i) for i in inputs],
-                                    workdir=os.path.join(workdir, "validate"), timeout_s=timeout_s)
+                                    workdir=os.path.join(workdir, "validate"), timeout_s=timeout_s, per_case_s=per_case_s)
         if val_res[0].error.startswith("IMPORT:"):
             validation_skipped = "no validate() defined in oracle"
         else:
@@ -72,7 +72,7 @@ def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str
                 valid_inputs, invalid_dropped = kept, checked - len(kept)
             else:
                 validation_skipped = "validate() rejected every input; distrusted, kept all"
-    res = run_python_cases(oracle_src, "reference", [_ref_args(problem, i) for i in valid_inputs], workdir=workdir, timeout_s=timeout_s)
+    res = run_python_cases(oracle_src, "reference", [_ref_args(problem, i) for i in valid_inputs], workdir=workdir, timeout_s=timeout_s, per_case_s=per_case_s)
     cases = [Case(i, r.output, tag) for i, r in zip(valid_inputs, res) if r.ok]
     dropped = [r.error[-200:] for r in res if not r.ok]
     detail = {"dropped": len(dropped), "errors": dropped[:3], "checked": checked, "invalid_dropped": invalid_dropped}
@@ -80,9 +80,9 @@ def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str
         detail["validation_skipped"] = validation_skipped
     return cases, Evidence(f"oracle_{tag}", bool(cases), len(cases), time.monotonic() - t0, detail)
 
-def run_candidate(problem, source: str, inputs: list, *, workdir: str, timeout_s: float, binary: str | None = None, overflow_checks: bool = True, mem_mb: int = 4096) -> list[CaseResult]:
+def run_candidate(problem, source: str, inputs: list, *, workdir: str, timeout_s: float, binary: str | None = None, overflow_checks: bool = True, mem_mb: int = 4096, per_case_s: float = 0.0) -> list[CaseResult]:
     if problem.language == "python":
-        return run_python_cases(source, problem.entrypoint, [tuple(i) if isinstance(i, (tuple, list)) else (i,) for i in inputs], timeout_s=timeout_s, workdir=workdir, mem_mb=mem_mb)
+        return run_python_cases(source, problem.entrypoint, [tuple(i) if isinstance(i, (tuple, list)) else (i,) for i in inputs], timeout_s=timeout_s, workdir=workdir, mem_mb=mem_mb, per_case_s=per_case_s)
     if binary is None:
         binary, err = compile_rust(source, overflow_checks=overflow_checks, workdir=workdir)
         if binary is None:
@@ -107,7 +107,7 @@ def _actual_for_report(r: CaseResult):
     last = [l for l in (r.error or "").strip().splitlines() if l.strip()][-2:]
     return "(no answer: crashed before completing) " + " | ".join(last) if last else "(no answer: crashed before completing)"
 
-def differential(problem, source: str, cases: list[Case], kind: str, *, workdir: str, timeout_s: float, binary: str | None = None, mem_mb: int = 4096) -> Evidence:
+def differential(problem, source: str, cases: list[Case], kind: str, *, workdir: str, timeout_s: float, binary: str | None = None, mem_mb: int = 4096, per_case_s: float = 0.0) -> Evidence:
     t0 = time.monotonic()
     if not cases:
         return Evidence(kind, True, 0, 0.0, {"skipped": "no cases"}, skipped=True)
@@ -117,7 +117,7 @@ def differential(problem, source: str, cases: list[Case], kind: str, *, workdir:
     # divided across cases or the ceiling is timeout_s * len(cases); Python runs the whole batch
     # inside one subprocess call, so the full timeout_s already bounds the batch.
     case_timeout = timeout_s if problem.language == "python" else max(0.25, timeout_s / max(1, len(cases)))
-    res = run_candidate(problem, source, [c.input for c in cases], workdir=workdir, timeout_s=case_timeout, binary=binary, mem_mb=mem_mb)
+    res = run_candidate(problem, source, [c.input for c in cases], workdir=workdir, timeout_s=case_timeout, binary=binary, mem_mb=mem_mb, per_case_s=per_case_s)
     for i, (c, r) in enumerate(zip(cases, res)):
         if not same(problem, r, c.expected):
             return Evidence(kind, False, len(cases), time.monotonic() - t0,
@@ -284,7 +284,7 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
         inputs = [r.output for r in gen if r.ok]
         if not inputs:
             gi.notes.append(f"gen({mode}) produced nothing: {(gen[0].error if gen else '')[-200:]}"); continue
-        cases, ev = make_cases(problem, oracle_src, inputs, mode, workdir=os.path.join(workdir, f"ref_{mode}"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
+        cases, ev = make_cases(problem, oracle_src, inputs, mode, workdir=os.path.join(workdir, f"ref_{mode}"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), per_case_s=limits.get("per_case_limit_s", 0.0))
         if not cases: gi.notes.append(f"reference failed on all {mode} inputs: {ev.detail['errors']}")
         setattr(gi, f"cases_{mode}", cases); _log_and_note_validation(gi, ev, mode, log)
     if stress_src.strip():
@@ -292,7 +292,7 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
         edges = run_python_cases(stress_src + "\ndef _edges():\n    return list(EDGES)\n", "_edges", [()], workdir=os.path.join(workdir, "edges"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         if edges and edges[0].ok and isinstance(edges[0].output, list):
             cleaned_edges = [_clean_stdin(problem, s) for s in edges[0].output]
-            gi.cases_edge, ev = make_cases(problem, oracle_src, cleaned_edges, "edge", workdir=os.path.join(workdir, "ref_edge"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
+            gi.cases_edge, ev = make_cases(problem, oracle_src, cleaned_edges, "edge", workdir=os.path.join(workdir, "ref_edge"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), per_case_s=limits.get("per_case_limit_s", 0.0))
             _log_and_note_validation(gi, ev, "edge", log)
         mx = run_python_cases(stress_src, "gen_max", [(1,)], workdir=os.path.join(workdir, "genmax"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         if mx and mx[0].ok:
@@ -369,7 +369,7 @@ def overflow_check(problem, binary: str | None, stress_input, *, limit_s: float,
         detail["note"] = "non-zero exit without a recognizable overflow-panic message; failure cause not confirmed as overflow"
     return Evidence("overflow", False, 1, dur, detail)
 
-def behavior(problem, source: str, cases: list[Case], *, workdir: str, timeout_s: float, binary: str | None = None, mem_mb: int = 4096) -> Evidence:
+def behavior(problem, source: str, cases: list[Case], *, workdir: str, timeout_s: float, binary: str | None = None, mem_mb: int = 4096, per_case_s: float = 0.0) -> Evidence:
     t0 = time.monotonic()
     if not cases:
         return Evidence("behavior", True, 0, 0.0, {"skipped": "no cases"}, skipped=True)
@@ -380,13 +380,13 @@ def behavior(problem, source: str, cases: list[Case], *, workdir: str, timeout_s
     # Python handles a whole batch inside one subprocess call, so it keeps the full timeout_s.
     case_timeout = timeout_s if problem.language == "python" else max(0.25, timeout_s / max(1, len(inputs)))
     if problem.language == "python":
-        aba = run_candidate(problem, source, [inputs[0], inputs[-1], inputs[0]], workdir=os.path.join(workdir, "aba"), timeout_s=case_timeout, mem_mb=mem_mb)
+        aba = run_candidate(problem, source, [inputs[0], inputs[-1], inputs[0]], workdir=os.path.join(workdir, "aba"), timeout_s=case_timeout, mem_mb=mem_mb, per_case_s=per_case_s)
         if any(r.mutated for r in aba):
             return Evidence("behavior", False, 3, time.monotonic() - t0, {"check": "mutation", "input": inputs[0]})
         if aba[0].ok and aba[2].ok and aba[0].output != aba[2].output:
             return Evidence("behavior", False, 3, time.monotonic() - t0, {"check": "global_state", "input": inputs[0], "first": aba[0].output, "again": aba[2].output})
-    r1 = run_candidate(problem, source, inputs, workdir=os.path.join(workdir, "p1"), timeout_s=case_timeout, binary=binary, mem_mb=mem_mb)
-    r2 = run_candidate(problem, source, inputs, workdir=os.path.join(workdir, "p2"), timeout_s=case_timeout, binary=binary, mem_mb=mem_mb)
+    r1 = run_candidate(problem, source, inputs, workdir=os.path.join(workdir, "p1"), timeout_s=case_timeout, binary=binary, mem_mb=mem_mb, per_case_s=per_case_s)
+    r2 = run_candidate(problem, source, inputs, workdir=os.path.join(workdir, "p2"), timeout_s=case_timeout, binary=binary, mem_mb=mem_mb, per_case_s=per_case_s)
     for i, (a, b) in enumerate(zip(r1, r2)):
         if a.ok and b.ok and (a.output if problem.language == "python" else tokens(a.output)) != (b.output if problem.language == "python" else tokens(b.output)):
             return Evidence("behavior", False, len(inputs), time.monotonic() - t0, {"check": "nondeterminism", "input": inputs[i], "run1": a.output, "run2": b.output})
@@ -426,16 +426,16 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
     # trustworthy evidence available. Absent entirely (the common case), this step is not added at
     # all, so behavior is exactly what it was before this existed.
     if gi.cases_public:
-        e = differential(problem, source, gi.cases_public, "diff_public", workdir=os.path.join(workdir, "diff_public"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"])
+        e = differential(problem, source, gi.cases_public, "diff_public", workdir=os.path.join(workdir, "diff_public"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"], per_case_s=limits.get("per_case_limit_s", 0.0))
         if gi.public_disagreements:
             e.detail = {**e.detail, "oracle_disagreements": gi.public_disagreements}
         ev.append(e); log(f"gate.diff_public passed={e.passed} cases={e.cases}")
         if not e.passed: return ev
     for kind, cases in (("diff_edge", gi.regressions + gi.cases_edge), ("diff_small", gi.cases_small), ("diff_medium", gi.cases_medium)):
-        e = differential(problem, source, cases, kind, workdir=os.path.join(workdir, kind), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"])
+        e = differential(problem, source, cases, kind, workdir=os.path.join(workdir, kind), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"], per_case_s=limits.get("per_case_limit_s", 0.0))
         ev.append(e); log(f"gate.{kind} passed={e.passed} cases={e.cases}")
         if not e.passed: return ev
-    e = behavior(problem, source, gi.cases_small or gi.cases_edge, workdir=os.path.join(workdir, "behavior"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"])
+    e = behavior(problem, source, gi.cases_small or gi.cases_edge, workdir=os.path.join(workdir, "behavior"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"], per_case_s=limits.get("per_case_limit_s", 0.0))
     ev.append(e); log(f"gate.behavior passed={e.passed} detail={e.detail.get('check','')}")
     if not e.passed: return ev
     limit = limits["stress_limit_python_s"] if problem.language == "python" else limits["stress_limit_rust_s"]
