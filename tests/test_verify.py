@@ -237,3 +237,58 @@ def test_overflow_step_passes_when_candidate_uses_i128(tmp_path):
 def test_overflow_step_skips_python_with_arbitrary_precision_reason():
     ev = V.overflow_check(PY, None, (10**18, 10**18), limit_s=1.0, mem_mb=64)
     assert ev.skipped and "arbitrary precision" in ev.detail["skipped"]
+
+# --- validate(): reject inputs the statement's preconditions rule out before differential ever runs ---
+
+ORACLE_REJECTS_2 = ("def reference(a, b):\n    return a + b\n"
+                    "def gen(seed, mode):\n    return (seed, seed)\n"
+                    "def validate(a, b):\n    return a != 2\n")
+
+ORACLE_RAISES_ON_2 = ("def reference(a, b):\n    return a + b\n"
+                      "def gen(seed, mode):\n    return (seed, seed)\n"
+                      "def validate(a, b):\n    if a == 2: raise ValueError('malformed')\n    return True\n")
+
+ORACLE_REJECTS_ALL = ("def reference(a, b):\n    return a + b\n"
+                      "def gen(seed, mode):\n    return (seed, seed)\n"
+                      "def validate(a, b):\n    return False\n")
+
+def test_make_cases_validate_drops_only_the_input_it_rejects(tmp_path):
+    inputs = [(1, 1), (2, 2), (3, 3)]
+    cases, ev = V.make_cases(PY, ORACLE_REJECTS_2, inputs, "small", workdir=str(tmp_path), timeout_s=20)
+    assert {c.input for c in cases} == {(1, 1), (3, 3)}
+    assert ev.detail["checked"] == 3 and ev.detail["invalid_dropped"] == 1
+    assert "validation_skipped" not in ev.detail
+
+def test_make_cases_validate_raising_drops_only_that_input(tmp_path):
+    inputs = [(1, 1), (2, 2), (3, 3)]
+    cases, ev = V.make_cases(PY, ORACLE_RAISES_ON_2, inputs, "small", workdir=str(tmp_path), timeout_s=20)
+    assert {c.input for c in cases} == {(1, 1), (3, 3)}
+    assert ev.detail["checked"] == 3 and ev.detail["invalid_dropped"] == 1
+
+def test_make_cases_distrusts_validator_that_rejects_everything(tmp_path):
+    inputs = [(1, 1), (2, 2)]
+    cases, ev = V.make_cases(PY, ORACLE_REJECTS_ALL, inputs, "small", workdir=str(tmp_path), timeout_s=20)
+    assert {c.input for c in cases} == {(1, 1), (2, 2)}   # safety valve: nothing actually dropped
+    assert ev.detail["invalid_dropped"] == 0
+    assert "rejected every input" in ev.detail["validation_skipped"]
+
+def test_make_cases_with_no_validate_behaves_as_before(tmp_path):
+    inputs = [(1, 1), (2, 2)]
+    cases, ev = V.make_cases(PY, ORACLE, inputs, "small", workdir=str(tmp_path), timeout_s=20)
+    assert {c.input for c in cases} == {(1, 1), (2, 2)}
+    assert ev.detail["checked"] == 0   # never counted: skipped before any validate() call could run
+    assert ev.detail["invalid_dropped"] == 0
+    assert ev.detail["validation_skipped"] == "no validate() defined in oracle"
+
+RUST = Problem("p", "rust", "s", "main", [], 300.0)
+RUST_ORACLE_VALIDATE = ("def reference(stdin):\n    return stdin.strip()\n"
+                        "def gen(seed, mode):\n    return str(seed)\n"
+                        "def validate(stdin):\n    assert isinstance(stdin, str), 'validate got a non-string arg'\n    return stdin != '2'\n")
+
+def test_make_cases_validate_gets_raw_stdin_string_for_rust(tmp_path):
+    # validate must be called via _ref_args like reference: for rust that's (stdin_text,), a single
+    # string argument -- not a splatted tuple of characters or anything else.
+    inputs = ["0", "1", "2"]
+    cases, ev = V.make_cases(RUST, RUST_ORACLE_VALIDATE, inputs, "small", workdir=str(tmp_path), timeout_s=20)
+    assert {c.input for c in cases} == {"0", "1"}
+    assert ev.detail["invalid_dropped"] == 1

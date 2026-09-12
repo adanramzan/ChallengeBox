@@ -42,10 +42,28 @@ def _ref_args(problem, inp) -> tuple:
 
 def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str, timeout_s: float) -> tuple[list[Case], Evidence]:
     t0 = time.monotonic()
-    res = run_python_cases(oracle_src, "reference", [_ref_args(problem, i) for i in inputs], workdir=workdir, timeout_s=timeout_s)
-    cases = [Case(i, r.output, tag) for i, r in zip(inputs, res) if r.ok]
+    valid_inputs = inputs
+    checked = invalid_dropped = 0
+    validation_skipped = ""
+    if inputs:
+        val_res = run_python_cases(oracle_src, "validate", [_ref_args(problem, i) for i in inputs],
+                                    workdir=os.path.join(workdir, "validate"), timeout_s=timeout_s)
+        if val_res[0].error.startswith("IMPORT:"):
+            validation_skipped = "no validate() defined in oracle"
+        else:
+            checked = len(inputs)
+            kept = [i for i, r in zip(inputs, val_res) if r.ok and r.output is True]
+            if kept:
+                valid_inputs, invalid_dropped = kept, checked - len(kept)
+            else:
+                validation_skipped = "validate() rejected every input; distrusted, kept all"
+    res = run_python_cases(oracle_src, "reference", [_ref_args(problem, i) for i in valid_inputs], workdir=workdir, timeout_s=timeout_s)
+    cases = [Case(i, r.output, tag) for i, r in zip(valid_inputs, res) if r.ok]
     dropped = [r.error[-200:] for r in res if not r.ok]
-    return cases, Evidence(f"oracle_{tag}", bool(cases), len(cases), time.monotonic() - t0, {"dropped": len(dropped), "errors": dropped[:3]})
+    detail = {"dropped": len(dropped), "errors": dropped[:3], "checked": checked, "invalid_dropped": invalid_dropped}
+    if validation_skipped:
+        detail["validation_skipped"] = validation_skipped
+    return cases, Evidence(f"oracle_{tag}", bool(cases), len(cases), time.monotonic() - t0, detail)
 
 def run_candidate(problem, source: str, inputs: list, *, workdir: str, timeout_s: float, binary: str | None = None, overflow_checks: bool = True) -> list[CaseResult]:
     if problem.language == "python":
@@ -128,6 +146,13 @@ def shrink(problem, source: str, oracle_src: str, case: Case, *, workdir: str, b
             if improved: break
     return Case(cur, exp, case.tag + "+shrunk")
 
+def _log_and_note_validation(gi: GateInputs, ev: Evidence, mode: str, log) -> None:
+    invalid = ev.detail.get("invalid_dropped", 0)
+    skip = ev.detail.get("validation_skipped", "")
+    log(f"oracle.{mode} cases={ev.cases} dropped={ev.detail['dropped']} invalid={invalid}" + (f" skip={skip}" if skip else ""))
+    if invalid:
+        gi.notes.append(f"{mode}: dropped {invalid} of {ev.detail.get('checked', 0)} generated inputs as invalid (failed validate())")
+
 def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict, *, workdir: str, budget, log) -> GateInputs:
     gi = GateInputs(oracle_src=oracle_src)
     if not oracle_src.strip():
@@ -139,12 +164,12 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
             gi.notes.append(f"gen({mode}) produced nothing: {(gen[0].error if gen else '')[-200:]}"); continue
         cases, ev = make_cases(problem, oracle_src, inputs, mode, workdir=os.path.join(workdir, f"ref_{mode}"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         if not cases: gi.notes.append(f"reference failed on all {mode} inputs: {ev.detail['errors']}")
-        setattr(gi, f"cases_{mode}", cases); log(f"oracle.{mode} cases={len(cases)} dropped={ev.detail['dropped']}")
+        setattr(gi, f"cases_{mode}", cases); _log_and_note_validation(gi, ev, mode, log)
     if stress_src.strip():
         edges = run_python_cases(stress_src + "\ndef _edges():\n    return list(EDGES)\n", "_edges", [()], workdir=os.path.join(workdir, "edges"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         if edges and edges[0].ok and isinstance(edges[0].output, list):
             gi.cases_edge, ev = make_cases(problem, oracle_src, edges[0].output, "edge", workdir=os.path.join(workdir, "ref_edge"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
-            log(f"oracle.edge cases={len(gi.cases_edge)} dropped={ev.detail['dropped']}")
+            _log_and_note_validation(gi, ev, "edge", log)
         mx = run_python_cases(stress_src, "gen_max", [(1,)], workdir=os.path.join(workdir, "genmax"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         if mx and mx[0].ok: gi.stress_input = mx[0].output
         else: gi.notes.append("gen_max failed: " + (mx[0].error[-200:] if mx else ""))

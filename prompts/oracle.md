@@ -7,6 +7,8 @@ Also define `gen(seed: int, mode: str)` using only `random.Random(seed)` for ran
 * `mode == "small"`: sizes at most 6, values at most 20. Include boundary shapes — the empty case where the statement allows one, a single element, repeated or tied values, and first, last and adjacent positions.
 * `mode == "medium"`: sizes at most 12, but push any count, repetition, capacity, demand or multiplier that the statement bounds by a huge number up to roughly 10^4–10^5, so closed-form arithmetic gets exercised while your literal loops still finish in seconds.
 
+Also define `validate(...)`, taking exactly the same arguments as `reference` above, returning `True` if this input satisfies every precondition the statement states and `False` otherwise. This is what protects the whole test suite from meaningless comparisons — every generated input is checked against it before anything is compared, so a `validate` that says `True` to something the statement forbids defeats the entire point. Check the same precondition list you enumerate below: ranges, distinctness, must-currently-exist, never-appeared-before, ordering, and any limit expressed against the current size or state. It must be a pure predicate — never print, never mutate its arguments, never raise on ordinary invalid input, just return `False`. If it genuinely cannot decide, return `True` rather than guess; a `validate` that rejects too eagerly is worse than one that lets a few bad inputs through.
+
 ## Generate only inputs the statement calls valid
 
 This is the most common way this task is failed, and an invalid input makes every later comparison meaningless. Before writing `gen`, list the preconditions the statement states — value ranges, distinctness, "must currently exist", "never appeared before", ordering, and any limit expressed against the current size or state — and honor every one.
@@ -24,7 +26,7 @@ This is the most common way this task is failed, and an invalid input makes ever
 Respond with exactly one block:
 
 ===ORACLE===
-python source defining reference and gen
+python source defining reference, gen, and validate
 ===END===
 
 Problem statement:

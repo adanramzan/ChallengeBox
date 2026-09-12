@@ -141,9 +141,12 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     run.log(f"intake lang={problem.language} deadline={problem.deadline_s} scale={deadline_scale} usable={run.budget.usable_s:.0f}")
     pv = prompt_vars(problem)
     with ThreadPoolExecutor(max_workers=3) as ex:
-        f_solve = ex.submit(run.chat, "strong", "solve", 0.30 * run.budget.usable_s, **pv)
-        f_oracle = ex.submit(run.chat, "fast", "oracle", 0.30 * run.budget.usable_s, **pv)
-        f_stress = ex.submit(run.chat, "fast", "stress", 0.30 * run.budget.usable_s, **pv)
+        # These three run concurrently, so the generate phase costs max(), not sum() —
+        # each call can therefore have the whole generate budget rather than a third of it.
+        gen_cap = 0.45 * run.budget.usable_s
+        f_solve = ex.submit(run.chat, "strong", "solve", gen_cap, **pv)
+        f_oracle = ex.submit(run.chat, "fast", "oracle", gen_cap, **pv)
+        f_stress = ex.submit(run.chat, "fast", "stress", gen_cap, **pv)
         r_solve, r_oracle, r_stress = f_solve.result(), f_oracle.result(), f_stress.result()
     code = parse_blocks(r_solve.text).get("CODE", "")
     if not code.strip() and r_solve.text.strip():
