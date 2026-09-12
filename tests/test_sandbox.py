@@ -1,6 +1,8 @@
-import os, sys, time, pytest
+import os, sys, time, ast, pytest
 import sandbox
 from sandbox import run_cmd, run_python_cases, python_static, Problem
+
+ALLOWED_OS_INJECTED = {"__CF_USER_TEXT_ENCODING"}  # macOS injects this into every child; not inherited from our env dict
 
 def test_run_cmd_captures_output_and_exit(tmp_path):
     r = run_cmd([sys.executable, "-c", "import sys; print('hi'); sys.stderr.write('e'); sys.exit(3)"], timeout_s=5, cwd=str(tmp_path))
@@ -40,20 +42,9 @@ def test_run_cmd_delivers_stdin(tmp_path):
 
 def test_run_cmd_env_is_clean(tmp_path, monkeypatch):
     monkeypatch.setenv("SECRET_KEY", "leak")
-    r = run_cmd([sys.executable, "-c", "import os; print(os.environ.get('SECRET_KEY','none')); print(sorted(os.environ))"], timeout_s=5, cwd=str(tmp_path))
-    lines = r.stdout.strip().split(b'\n')
-    assert lines[0] == b"none"
-    # Parse subprocess environment
-    env_str = lines[1].decode()
-    env_list = eval(env_str)  # Safe here since we control the subprocess
-    # Verify required keys are present and SECRET_KEY is not leaked
-    assert set(env_list) >= {"HOME", "LANG", "PATH"}
-    assert "SECRET_KEY" not in env_list
-    # On most systems (non-macOS), should be exactly these three
-    # macOS adds __CF_USER_TEXT_ENCODING and other vars at OS level
-    if "__CF_USER_TEXT_ENCODING" not in os.environ:
-        # Not on macOS, should be exactly these three
-        assert env_list == ["HOME", "LANG", "PATH"]
+    r = run_cmd([sys.executable, "-c", "import os; print(sorted(os.environ))"], timeout_s=5, cwd=str(tmp_path))
+    env_list = ast.literal_eval(r.stdout.decode())
+    assert sorted(set(env_list) - ALLOWED_OS_INJECTED) == ["HOME", "LANG", "PATH"]
 
 def test_run_python_cases_basic(tmp_path):
     src = "def add(a, b):\n    return a + b\n"
