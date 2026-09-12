@@ -1,8 +1,25 @@
-You write a SLOW, LITERAL reference implementation and a small random input generator for testing. You never see any other solution. Follow the statement sentence by sentence; loop where it loops; build what it describes. Inputs will be tiny. Efficiency is irrelevant. Python 3.11, standard library only.
+You write a SLOW, LITERAL reference implementation and a random input generator, for testing a solution you will never see. Follow the statement sentence by sentence: loop where it loops, build what it describes, and take the obvious reading over the clever one. Inputs are tiny and efficiency is irrelevant — only faithfulness to the text matters. Python 3.11, standard library only.
 
 {{oracle_signature}}
 
-Also define `gen(seed: int, mode: str)` using `random.Random(seed)` only. `mode == "small"`: sizes at most 6, values at most 20, every validity constraint of the statement honored, include boundary shapes (empty where allowed, single element, equal values, adjacent positions). `mode == "medium"`: sizes at most 12 but numeric counts/repetitions/demands around 10^4 to 10^5 so that closed-form arithmetic in a fast solution is exercised while your literal loops still finish in a few seconds. {{gen_returns}}
+Also define `gen(seed: int, mode: str)` using only `random.Random(seed)` for randomness. {{gen_returns}}
+
+* `mode == "small"`: sizes at most 6, values at most 20. Include boundary shapes — the empty case where the statement allows one, a single element, repeated or tied values, and first, last and adjacent positions.
+* `mode == "medium"`: sizes at most 12, but push any count, repetition, capacity, demand or multiplier that the statement bounds by a huge number up to roughly 10^4–10^5, so closed-form arithmetic gets exercised while your literal loops still finish in seconds.
+
+## Generate only inputs the statement calls valid
+
+This is the most common way this task is failed, and an invalid input makes every later comparison meaningless. Before writing `gen`, list the preconditions the statement states — value ranges, distinctness, "must currently exist", "never appeared before", ordering, and any limit expressed against the current size or state — and honor every one.
+
+* Build operation sequences from a running model of the state, never by sampling blindly. At each step choose only from the operations that are legal in the state at that moment, apply the chosen one to your model, then choose the next. If nothing is legal, stop early and return a shorter input.
+* Get distinctness by construction: draw from a pool without replacement, rather than sampling and hoping for no collision.
+* Assert the invariants you relied on just before returning. A generator that raises is far better than one that quietly returns something invalid.
+
+## Python pitfalls that have broken this exact task
+
+* Never assign to a name you also read inside the same function, and never to an imported module name. Both `random = random.Random(seed)` and `tabs = [t for t in tabs if ...]` raise `UnboundLocalError`. Bind the generator to a fresh name such as `rng`.
+* Never draw from a possibly-empty range. Guard every `randrange`, `randint`, `choice` and `sample` so the range or sequence is non-empty, and skip that step when it is not.
+* Return exactly the shape described above and nothing else.
 
 Respond with exactly one block:
 
