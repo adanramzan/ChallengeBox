@@ -5,7 +5,14 @@ Target language: {{language}}. Contract: {{contract}}
 Work out the rules, traps, and algorithm in your head first, but write the CODE block first in your response — output tokens are limited, and code cut off by the budget is worse than analysis cut off by it. Respond with exactly these blocks, in order, each terminated by a line `===END===`. Keep reasoning brief; the budget is small.
 
 ===CODE===
-The complete solution. {{language_rules}}
+The complete solution, and nothing else. {{language_rules}}
+
+This block must contain only final, runnable code. Do not think out loud inside it: no commentary
+on approaches, no "this is wrong, let me reconsider", no abandoned or half-written constructs, no
+alternatives left in place. If you change your mind about the approach, delete the old code and
+write the new one -- do not narrate the change. A block that trails off mid-statement, or leaves a
+`for`/`while`/`if` with its body replaced by comments, is a syntax error and scores zero however
+good the reasoning around it was. Put all deliberation in ===RULES=== and ===TRAPS===.
 ===END===
 ===RULES===
 Numbered restatement of every behavioral sentence of the statement, quoting the text. List ambiguities separately with the reading you chose.
