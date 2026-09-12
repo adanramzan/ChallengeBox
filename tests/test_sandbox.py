@@ -255,3 +255,21 @@ def test_rust_static_fn_main_in_comment_only():
     src = "// fn main(){}\nfn helper(){}"
     result = rust_static(src)
     assert any("main" in v for v in result), f"Expected no fn main but got {result}"
+
+def test_relative_workdir_does_not_double_the_path(tmp_path, monkeypatch):
+    # A relative workdir used to break every sandbox call: run_cmd sets cwd=workdir, so a relative
+    # harness path was resolved a second time against itself ("a/b/a/b/harness.py"). Passing a
+    # relative --run-dir therefore silently disabled all verification.
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("rel/work", exist_ok=True)
+    res = run_python_cases("def add(a, b):\n    return a + b\n", "add", [(2, 3)],
+                           timeout_s=20, workdir="rel/work")
+    assert res[0].ok and res[0].output == 5, res[0].error
+
+@needs_rustc
+def test_relative_workdir_works_for_rust(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("rel/rust", exist_ok=True)
+    binp, err = compile_rust(RS_OK, overflow_checks=True, workdir="rel/rust")
+    assert binp, err
+    assert tokens(run_rust_cases(binp, ["21\n"], timeout_s=10)[0].output) == ["42"]

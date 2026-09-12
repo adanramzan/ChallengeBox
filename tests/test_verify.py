@@ -292,3 +292,52 @@ def test_make_cases_validate_gets_raw_stdin_string_for_rust(tmp_path):
     cases, ev = V.make_cases(RUST, RUST_ORACLE_VALIDATE, inputs, "small", workdir=str(tmp_path), timeout_s=20)
     assert {c.input for c in cases} == {"0", "1"}
     assert ev.detail["invalid_dropped"] == 1
+
+# --- benchfix: stdlib preamble, rust stdin dedent, degraded stress fallback ---
+
+def test_oracle_with_no_imports_still_runs_gen_via_preamble(tmp_path):
+    # F5: the oracle prompt tells the model to *use* random.Random(seed) but never tells it to
+    # import anything -- a live run produced a module with no import statements at all, and gen()
+    # died with NameError. The preamble prepended in prepare_gate_inputs must cover it.
+    NO_IMPORT_ORACLE = ("def reference(a, b):\n    return a + b\n"
+                         "def gen(seed, mode):\n    rng = random.Random(seed)\n"
+                         "    hi = 20 if mode == 'small' else 10**5\n"
+                         "    return (rng.randint(0, hi), rng.randint(0, hi))\n")
+    limits = {"cases_small": 5, "cases_medium": 2, "mem_mb": 2048}
+    gi = V.prepare_gate_inputs(PY, NO_IMPORT_ORACLE, "", limits, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+    assert len(gi.cases_small) == 5 and len(gi.cases_medium) == 2
+    assert not any("produced nothing" in n for n in gi.notes)
+
+def test_rust_stdin_fixtures_are_dedented_before_reaching_the_gate(tmp_path):
+    # F1: model-written EDGES are indented Python triple-quoted literals; every continuation line
+    # inherits the surrounding indentation, which a line-oriented Rust stdin parser can't survive.
+    rust_oracle = "def reference(stdin):\n    return stdin\ndef gen(seed, mode):\n    return str(seed)\n"
+    stress = ('def gen_max(seed):\n    return "1\\n41\\n1"\n'
+              'EDGES = [\n    """1\n    41\n    1""",\n]\n')
+    limits = {"cases_small": 0, "cases_medium": 0, "mem_mb": 2048}
+    gi = V.prepare_gate_inputs(RUST, rust_oracle, stress, limits, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+    assert gi.cases_edge and gi.cases_edge[0].input == "1\n41\n1"   # not "1\n    41\n    1"
+    assert gi.stress_input == "1\n41\n1"
+
+def test_gen_max_failure_falls_back_to_largest_medium_case(tmp_path):
+    # F2: gen_max failing must not silently disable the stress gate when a medium case exists --
+    # fall back to the biggest one, degraded rather than skipped.
+    stress_bad_genmax = "def gen_max(seed):\n    raise RuntimeError('boom')\nEDGES = [(0, 0)]\n"
+    limits = {"cases_small": 3, "cases_medium": 3, "mem_mb": 2048}
+    gi = V.prepare_gate_inputs(PY, ORACLE, stress_bad_genmax, limits, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+    assert gi.cases_medium   # sanity: the fallback pool actually exists
+    biggest = max(gi.cases_medium, key=lambda c: len(str(c.input)))
+    assert gi.stress_input == biggest.input
+    assert gi.stress_degraded is True
+    assert any("degraded" in n for n in gi.notes)
+    ev = V.stress(PY, GOOD, gi.stress_input, workdir=str(tmp_path / "s"), limit_s=5.0, mem_mb=2048, degraded=gi.stress_degraded)
+    assert "degraded" in ev.detail
+
+def test_gen_max_failure_with_no_medium_cases_still_skips(tmp_path):
+    # The old behavior (skip, not degrade) must be preserved when there's no fallback pool at all.
+    stress_bad_genmax = "def gen_max(seed):\n    raise RuntimeError('boom')\nEDGES = [(0, 0)]\n"
+    limits = {"cases_small": 0, "cases_medium": 0, "mem_mb": 2048}
+    gi = V.prepare_gate_inputs(PY, ORACLE, stress_bad_genmax, limits, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+    assert gi.stress_input is None and gi.stress_degraded is False
+    ev = V.stress(PY, GOOD, gi.stress_input, workdir=str(tmp_path / "s"), limit_s=5.0, mem_mb=2048, degraded=gi.stress_degraded)
+    assert ev.skipped

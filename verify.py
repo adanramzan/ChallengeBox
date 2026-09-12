@@ -5,6 +5,16 @@ from dataclasses import dataclass, field
 from sandbox import CaseResult, run_python_cases, compile_rust, run_rust_cases, tokens
 from llm import parse_blocks
 
+# Prepended to every generated oracle/stress source before it runs. The oracle prompt tells the
+# model to *use* random.Random(seed) but never tells it to import anything, and one live run wrote
+# a reference/gen module with no imports at all, dying with NameError on the first gen() call. A
+# duplicate import is harmless if the model already wrote its own; the module list is exactly what
+# the oracle/stress prompts assume is available. This adds exactly one line, and it is prepended to
+# the same string that gets written to disk as cand.py (see sandbox.run_python_cases), so any
+# traceback line number always matches that persisted file -- it never lies relative to the artifact
+# a person would actually open, only relative to the raw text the model returned.
+_STDLIB_PREAMBLE = "import random, math, itertools, collections, string, heapq, bisect\n"
+
 @dataclass
 class Evidence:
     kind: str
@@ -20,6 +30,7 @@ class GateInputs:
     cases_medium: list = field(default_factory=list)
     cases_edge: list = field(default_factory=list)
     stress_input: object = None
+    stress_degraded: bool = False
     oracle_src: str = ""
     oracle_regens: int = 0
     notes: list = field(default_factory=list)
@@ -153,10 +164,22 @@ def _log_and_note_validation(gi: GateInputs, ev: Evidence, mode: str, log) -> No
     if invalid:
         gi.notes.append(f"{mode}: dropped {invalid} of {ev.detail.get('checked', 0)} generated inputs as invalid (failed validate())")
 
+def _clean_stdin(problem, s):
+    # Model-written Rust stdin fixtures (EDGES entries, gen_max's output) are Python triple-quoted
+    # literals indented to match the surrounding source, so every line after the first inherits that
+    # indentation. Fed verbatim, a line-oriented Rust parser chokes on "    41".parse::<u64>(). The
+    # judge never sends indented input -- the README defines Rust I/O as whitespace-separated tokens
+    # -- so strip each line before it reaches the candidate. No-op for Python (args, not stdin text).
+    if problem.language != "rust" or not isinstance(s, str):
+        return s
+    return "\n".join(line.strip() for line in s.split("\n"))
+
 def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict, *, workdir: str, budget, log) -> GateInputs:
     gi = GateInputs(oracle_src=oracle_src)
     if not oracle_src.strip():
         gi.notes.append("no oracle source"); return gi
+    oracle_src = _STDLIB_PREAMBLE + oracle_src
+    gi.oracle_src = oracle_src
     for mode, n in (("small", limits["cases_small"]), ("medium", limits["cases_medium"])):
         gen = run_python_cases(oracle_src, "gen", [(s, mode) for s in range(n)], workdir=os.path.join(workdir, f"gen_{mode}"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         inputs = [r.output for r in gen if r.ok]
@@ -166,18 +189,35 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
         if not cases: gi.notes.append(f"reference failed on all {mode} inputs: {ev.detail['errors']}")
         setattr(gi, f"cases_{mode}", cases); _log_and_note_validation(gi, ev, mode, log)
     if stress_src.strip():
+        stress_src = _STDLIB_PREAMBLE + stress_src
         edges = run_python_cases(stress_src + "\ndef _edges():\n    return list(EDGES)\n", "_edges", [()], workdir=os.path.join(workdir, "edges"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         if edges and edges[0].ok and isinstance(edges[0].output, list):
-            gi.cases_edge, ev = make_cases(problem, oracle_src, edges[0].output, "edge", workdir=os.path.join(workdir, "ref_edge"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
+            cleaned_edges = [_clean_stdin(problem, s) for s in edges[0].output]
+            gi.cases_edge, ev = make_cases(problem, oracle_src, cleaned_edges, "edge", workdir=os.path.join(workdir, "ref_edge"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
             _log_and_note_validation(gi, ev, "edge", log)
         mx = run_python_cases(stress_src, "gen_max", [(1,)], workdir=os.path.join(workdir, "genmax"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
-        if mx and mx[0].ok: gi.stress_input = mx[0].output
-        else: gi.notes.append("gen_max failed: " + (mx[0].error[-200:] if mx else ""))
+        if mx and mx[0].ok:
+            gi.stress_input = _clean_stdin(problem, mx[0].output)
+        else:
+            gi.notes.append("gen_max failed: " + (mx[0].error[-200:] if mx else ""))
+            # gen_max is the only source of a stress input; rather than ship a correct-but-slow
+            # solution with the timing check silently skipped, fall back to the largest medium case.
+            # "Largest" by len(str(...)): generic across a Python argument tuple (str() of the tuple
+            # scales with its total content) and a Rust stdin string (str() is the string itself), so
+            # the same one-line measure works for both without knowing the problem's shape. This is
+            # NOT a true maximum-size input -- medium is capped far below gen_max's target scale -- so
+            # it's marked degraded and stress()'s evidence records that, so the timing it produces is
+            # never mistaken for a real max-size check.
+            if gi.cases_medium:
+                biggest = max(gi.cases_medium, key=lambda c: len(str(c.input)))
+                gi.stress_input = _clean_stdin(problem, biggest.input)
+                gi.stress_degraded = True
+                gi.notes.append("stress input degraded: gen_max failed, using largest medium case instead (not a true max-size input)")
     else:
         gi.notes.append("no stress source")
     return gi
 
-def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, mem_mb: int) -> Evidence:
+def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, mem_mb: int, degraded: bool = False) -> Evidence:
     if stress_input is None:
         return Evidence("stress", True, 0, 0.0, {"skipped": "no stress input"}, skipped=True)
     t0 = time.monotonic()
@@ -192,7 +232,10 @@ def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, 
         r = run_rust_cases(binary, [stress_input], timeout_s=limit_s, mem_mb=mem_mb)[0]
         dur = r.duration_s
     passed = r.ok and not r.timed_out and dur <= limit_s
-    return Evidence("stress", passed, 1, time.monotonic() - t0, {"duration_s": round(dur, 3), "limit_s": limit_s, "timed_out": r.timed_out, "error": r.error[-400:]})
+    detail = {"duration_s": round(dur, 3), "limit_s": limit_s, "timed_out": r.timed_out, "error": r.error[-400:]}
+    if degraded:
+        detail["degraded"] = "gen_max failed; this is the largest medium case, not a true max-size input -- this timing is not a real max-size stress check"
+    return Evidence("stress", passed, 1, time.monotonic() - t0, detail)
 
 def overflow_check(problem, binary: str | None, stress_input, *, limit_s: float, mem_mb: int) -> Evidence:
     """Reruns the max-size stress input on the OVERFLOW-CHECKED build (the one already compiled and
@@ -294,7 +337,7 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
     if avail <= 0:
         e = Evidence("stress", True, 0, 0.0, {"skipped": "no budget"}, skipped=True)
     else:
-        e = stress(problem, source, gi.stress_input, workdir=os.path.join(workdir, "stress"), limit_s=min(limit, avail), mem_mb=limits["mem_mb"])
+        e = stress(problem, source, gi.stress_input, workdir=os.path.join(workdir, "stress"), limit_s=min(limit, avail), mem_mb=limits["mem_mb"], degraded=gi.stress_degraded)
     ev.append(e); log(f"gate.stress passed={e.passed} duration={e.detail.get('duration_s')}")
     # Placed after stress (not before) so stress's timing measurement runs first, on a warm cache,
     # unaffected by this step; and so this step's own subprocess never masks a stress timeout.
@@ -354,6 +397,6 @@ def regenerate_oracle(run, gi: GateInputs, failed: Evidence, pv: dict) -> GateIn
     new.dispute_trace, new.regen_failed = "", False
     # re-derive edge expectations with the new reference
     if gi.cases_edge:
-        new.cases_edge, _ = make_cases(run.p, src, [c.input for c in gi.cases_edge], "edge", workdir=os.path.join(run.dir, "oracle2", "edge"), timeout_s=run.budget.step_timeout(30.0))
+        new.cases_edge, _ = make_cases(run.p, new.oracle_src, [c.input for c in gi.cases_edge], "edge", workdir=os.path.join(run.dir, "oracle2", "edge"), timeout_s=run.budget.step_timeout(30.0))
     run.log(f"oracle.regen small={len(new.cases_small)} medium={len(new.cases_medium)}")
     return new

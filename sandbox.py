@@ -134,6 +134,9 @@ for line in open(sys.argv[3], encoding="utf-8"):
 '''
 
 def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, timeout_s: float, workdir: str) -> list[CaseResult]:
+    # run_cmd sets cwd=workdir, so every path handed to the child must be absolute: a relative
+    # workdir would otherwise be resolved a second time against itself and double the path.
+    workdir = os.path.abspath(workdir)
     os.makedirs(workdir, exist_ok=True)
     cand = os.path.join(workdir, "cand.py"); harness = os.path.join(workdir, "harness.py"); cases = os.path.join(workdir, "cases.txt")
     with open(cand, "w", encoding="utf-8") as f: f.write(source)
@@ -318,6 +321,7 @@ def rust_static(source: str) -> list[str]:
     return problems
 
 def compile_rust(source: str, *, overflow_checks: bool, workdir: str, timeout_s: float = 90.0) -> tuple[str | None, str]:
+    workdir = os.path.abspath(workdir)   # see run_python_cases: cwd=workdir makes relative paths double
     os.makedirs(workdir, exist_ok=True)
     tag = "gate" if overflow_checks else "stress"
     # Build argv first to include in cache key
@@ -342,6 +346,7 @@ def compile_rust(source: str, *, overflow_checks: bool, workdir: str, timeout_s:
     return binp, err
 
 def run_rust_cases(binary: str, stdins: list[str], *, timeout_s: float, mem_mb: int = 4096) -> list[CaseResult]:
+    binary = os.path.abspath(binary)   # cwd is derived from it below; a relative path would double
     out = []
     for s in stdins:
         r = run_cmd([binary], stdin=s.encode("utf-8"), timeout_s=timeout_s, cwd=os.path.dirname(binary), mem_mb=mem_mb, max_output=50_000_000)

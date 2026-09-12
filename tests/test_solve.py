@@ -1,4 +1,4 @@
-import json, os, pathlib, pytest
+import json, os, pathlib, re, pytest
 from llm import FakeLLM
 from sandbox import Problem
 import solve as S
@@ -8,7 +8,7 @@ def prob(tmp_path, lang="python"):
 
 def cfg():
     return {"limits": {"safety_margin_s": 15.0, "cases_small": 5, "cases_medium": 2, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0, "max_repairs": 2, "mem_mb": 2048, "shrink_budget_s": 1.0, "max_cost_usd_per_problem": 0.10},
-            "phases": {"generate_until": 0.32, "gate_until": 0.39, "repair_until": 0.81, "settle_until": 0.93}, "profile": "fake"}
+            "phases": {"generate_until": 0.32, "gate_until": 0.39, "repair_until": 0.81, "settle_until": 0.93, "generate_call_share": 0.45}, "profile": "fake"}
 
 SOLVE_OK = "===RULES===\nr\n===END===\n===TRAPS===\nt\n===END===\n===ALGORITHM===\na\n===END===\n===CODE===\n```python\ndef add(a, b):\n    return a + b\n```\n===END===\n"
 ORACLE_OK = "===ORACLE===\nimport random\ndef reference(a, b):\n    return a + b\ndef gen(seed, mode):\n    r = random.Random(seed)\n    return (r.randint(0, 20), r.randint(0, 20))\n===END===\n"
@@ -274,3 +274,60 @@ def test_report_records_candidate_parent(tmp_path):
     llm = FakeLLM({"solve": [BUGGY], "repair": [REPAIR_FIX], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
     rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert rep["parents"]["c1"] is None and rep["parents"]["c2"] == "c1"
+
+# --- benchfix: config-driven generate share, oracle retry, honest "nothing verified" log ---
+
+def _sent_timeout(events, tag):
+    line = next(l for l in events if l.split("] ", 1)[1].startswith(f"{tag}.sent"))
+    return float(re.search(r"timeout=(\d+)", line).group(1))
+
+def test_generate_call_share_is_read_from_config_not_hardcoded(tmp_path):
+    # F6: solve() used to hardcode 0.45 * usable_s for the concurrent generate-phase cap. It must
+    # come from config.toml's [phases].generate_call_share, so changing the config changes the cap.
+    llm1 = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    c1 = cfg(); c1["phases"]["generate_call_share"] = 0.10
+    rep1 = S.solve(prob(tmp_path), llm1, c1, out_path=str(tmp_path / "s1.py"), run_dir=str(tmp_path / "run1"))
+    llm2 = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    c2 = cfg(); c2["phases"]["generate_call_share"] = 0.40
+    rep2 = S.solve(prob(tmp_path), llm2, c2, out_path=str(tmp_path / "s2.py"), run_dir=str(tmp_path / "run2"))
+    t1, t2 = _sent_timeout(rep1["events"], "oracle"), _sent_timeout(rep2["events"], "oracle")
+    assert t2 > t1
+    assert t1 == pytest.approx(0.10 * 285.0, abs=1.5)   # usable_s = 300 - 15 margin; well under the remaining-10 reserve, so the cap itself binds
+
+def test_oracle_timeout_is_retried_once_and_retry_result_is_used(tmp_path):
+    # F4.1: an empty first oracle reply (parses to no ===ORACLE=== block, as a timeout would produce)
+    # must trigger exactly one retry, and the retry's content -- not the empty first reply -- must be
+    # what actually drives gate_inputs.
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": ["", ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["gate_inputs"]["small"] == 5   # only possible if the retry's ORACLE_OK was used
+    assert any("oracle.retry" in l for l in rep["events"])
+    assert len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 2
+
+def test_oracle_retry_does_not_fire_when_budget_cannot_afford_it(tmp_path):
+    class TightClock:
+        t = 0.0
+        def __call__(self):
+            TightClock.t += 200.0   # burns past the 285s usable budget almost immediately
+            return TightClock.t
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [""], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"), clock=TightClock())
+    assert not any("oracle.retry" in l for l in rep["events"])
+    assert len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 1
+    assert "no oracle source" in rep["gate_inputs"]["notes"]
+
+def test_all_skipped_gate_does_not_log_gate_passed(tmp_path):
+    # F4.4: a run that verified nothing (broken oracle, no stress source) must not log "gate.passed" --
+    # that reads as success in the log even though every real check was skipped.
+    ORACLE_BROKEN = "===ORACLE===\ndef reference(a, b):\n    raise RuntimeError('broken')\ndef gen(seed, mode):\n    return (1, 2)\n===END===\n"
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_BROKEN], "stress": [""]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["status"] == "emitted_unverified"
+    assert not any(l.endswith("gate.passed") for l in rep["events"])
+    assert any("gate.unverifiable" in l for l in rep["events"])
+
+def test_gate_passed_still_logged_when_something_was_actually_checked(tmp_path):
+    # Regression guard for the fix above: a real, fully-passing run must still log "gate.passed".
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert any(l.endswith("gate.passed") for l in rep["events"])

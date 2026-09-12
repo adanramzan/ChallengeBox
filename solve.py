@@ -143,7 +143,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     with ThreadPoolExecutor(max_workers=3) as ex:
         # These three run concurrently, so the generate phase costs max(), not sum() —
         # each call can therefore have the whole generate budget rather than a third of it.
-        gen_cap = 0.45 * run.budget.usable_s
+        gen_cap = cfg["phases"]["generate_call_share"] * run.budget.usable_s
         f_solve = ex.submit(run.chat, "strong", "solve", gen_cap, **pv)
         f_oracle = ex.submit(run.chat, "fast", "oracle", gen_cap, **pv)
         f_stress = ex.submit(run.chat, "fast", "stress", gen_cap, **pv)
@@ -155,6 +155,14 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     if code.strip():
         cand = run.add_candidate(code, None); cand.evidence.append(static_evidence(problem, code))
     oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
+    # The oracle is the single source of ground truth for every gate step, so a timeout here
+    # (roughly half of them clip at a 60s median-tuned cap; see BENCHMARK-FINDINGS.md F4) costs
+    # the entire run its verification, not just one call. One retry, only when the budget can
+    # still afford a call as slow as the measured worst case (128s observed max, +2s margin).
+    if not oracle_src.strip() and run.budget.can_afford(130.0):
+        run.log("oracle.retry no ===ORACLE=== block in first reply, retrying once")
+        r_oracle = run.chat("fast", "oracle", gen_cap, **pv)
+        oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
     stress_src = parse_blocks(r_stress.text).get("STRESS", "")
     try:
         gi = V.prepare_gate_inputs(problem, oracle_src, stress_src, cfg["limits"], workdir=os.path.join(run_dir, "oracle"), budget=run.budget, log=run.log)
@@ -170,7 +178,15 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             if cand.evidence and cand.evidence[0].passed:
                 cand.evidence = [cand.evidence[0]] + V.run_gate(problem, cand.source, gi, workdir=os.path.join(run_dir, cand.id), budget=run.budget, limits=cfg["limits"], log=run.log)
             if cand.all_passed():
-                run.log("gate.passed"); break
+                # "static"/"compile" are pre-flight checks, not verification against the oracle; if
+                # everything past them was skipped, nothing was actually checked -- don't log this as
+                # a pass, or the log reads as success for a run that verified nothing (see gi.notes
+                # for why: usually "no oracle source" or "no stress source").
+                if all(e.skipped for e in cand.evidence if e.kind not in ("static", "compile")):
+                    run.log(f"gate.unverifiable nothing could be checked: {'; '.join(gi.notes) or 'no cases available'}")
+                else:
+                    run.log("gate.passed")
+                break
             failed = next(e for e in cand.evidence if not e.passed)
             run.log(f"gate.failed kind={failed.kind} detail={json.dumps(failed.detail)[:300]}")
             if repairs >= cfg["limits"]["max_repairs"] or run.budget.phase() not in ("generate", "gate", "repair") or not run.budget.can_afford(60):

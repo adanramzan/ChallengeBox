@@ -15,6 +15,9 @@ generate_until = 0.32
 gate_until = 0.39
 repair_until = 0.81
 settle_until = 0.93
+# Cap on the concurrent solve/oracle/stress calls, as a fraction of usable_s. The three run
+# concurrently, so this phase costs max() of them, not sum() -- see solve.py's solve().
+generate_call_share = 0.55   # effective oracle timeout = min(share*usable, fast.timeout_cap_s); measured oracle max 128s needs headroom
 
 # Any OpenAI-compatible endpoint can be added as another [profiles.<name>.<role>] table.
 [profiles.openrouter.strong]
@@ -32,5 +35,5 @@ model = "deepseek/deepseek-chat-v3-0324"
 api_key_env = "OPENROUTER_API_KEY"
 max_tokens = 8000
 max_concurrent = 3
-timeout_cap_s = 110.0   # oracle writes reference+gen+validate; 60s was cutting it off
+timeout_cap_s = 150.0   # oracle writes reference+gen+validate; measured max 128s, so raised above it
 extra = {}
