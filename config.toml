@@ -1,0 +1,36 @@
+[limits]
+safety_margin_s = 15.0
+cases_small = 200
+cases_medium = 20
+stress_limit_python_s = 5.0
+stress_limit_rust_s = 2.0
+max_repairs = 2
+mem_mb = 4096
+shrink_budget_s = 3.0
+max_cost_usd_per_problem = 0.10
+
+# Phase boundaries as fractions of usable time (deadline*scale - margin)
+[phases]
+generate_until = 0.32
+gate_until = 0.39
+repair_until = 0.81
+settle_until = 0.93
+
+# Any OpenAI-compatible endpoint can be added as another [profiles.<name>.<role>] table.
+[profiles.openrouter.strong]
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek/deepseek-v4.1-flash"
+api_key_env = "OPENROUTER_API_KEY"
+max_tokens = 16000
+max_concurrent = 3
+timeout_cap_s = 120.0
+extra = { reasoning = { effort = "medium" } }
+
+[profiles.openrouter.fast]
+base_url = "https://openrouter.ai/api/v1"
+model = "qwen/qwen3.7-flash"
+api_key_env = "OPENROUTER_API_KEY"
+max_tokens = 6000
+max_concurrent = 3
+timeout_cap_s = 60.0
+extra = { reasoning = { effort = "low" } }
