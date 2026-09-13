@@ -162,7 +162,7 @@ for line in open(sys.argv[3], encoding="utf-8"):
     print(line, flush=True)
 '''
 
-def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, timeout_s: float, workdir: str, mem_mb: int = 4096, per_case_s: float = 0.0, max_consec_timeouts: int = 0) -> list[CaseResult]:
+def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, timeout_s: float, workdir: str, mem_mb: int = 4096, per_case_s: float = 0.0, max_consec_timeouts: int = 0, max_output: int = 50_000_000) -> list[CaseResult]:
     # run_cmd sets cwd=workdir, so every path handed to the child must be absolute: a relative
     # workdir would otherwise be resolved a second time against itself and double the path.
     workdir = os.path.abspath(workdir)
@@ -172,13 +172,15 @@ def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, ti
     with open(harness, "w", encoding="utf-8") as f: f.write(_PY_HARNESS)
     with open(cases, "w", encoding="utf-8") as f:
         for a in args_list: f.write(repr(tuple(a)) + "\n")
-    r = run_cmd([PYTHON, harness, cand, entrypoint, cases, repr(float(per_case_s)), str(int(max_consec_timeouts))], timeout_s=timeout_s, cwd=workdir, max_output=50_000_000, mem_mb=mem_mb)
+    r = run_cmd([PYTHON, harness, cand, entrypoint, cases, repr(float(per_case_s)), str(int(max_consec_timeouts))], timeout_s=timeout_s, cwd=workdir, max_output=max_output, mem_mb=mem_mb)
     results: list[CaseResult] = []
     for line in r.stdout.decode("utf-8", "replace").splitlines():
         try:
             d = ast.literal_eval(line)
         except Exception:
-            results.append(CaseResult(False, error="unparseable harness line"))
+            # A result whose repr overran the output cap is cut mid-literal; say so, rather than
+            # "unparseable", so a gen_max that returned a 70 MB input is diagnosable from the note.
+            results.append(CaseResult(False, error=f"harness output exceeded the {max_output >> 20} MB cap (result too large)" if len(r.stdout) >= max_output else "unparseable harness line"))
             continue
         if d.get("error", "").startswith("IMPORT:"):
             return [CaseResult(False, error=d["error"]) for _ in args_list]

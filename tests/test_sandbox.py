@@ -364,3 +364,11 @@ def test_batch_abandonment_is_off_by_default_and_needs_consecutive_timeouts(tmp_
     res = run_python_cases(src, "f", [(i,) for i in range(6)], timeout_s=30, workdir=str(tmp_path),
                            per_case_s=0.2, max_consec_timeouts=2)
     assert [r.ok for r in res] == [True, False, True, False, True, False]
+
+
+def test_oversized_result_is_reported_as_exceeding_the_cap(tmp_path):
+    import sandbox
+    src = "def f(n):\n    return [7] * n\n"
+    small, big = sandbox.run_python_cases(src, "f", [(1,), (10_000,)], timeout_s=20, workdir=str(tmp_path), max_output=1000)
+    assert small.ok and small.output == [7]
+    assert not big.ok and "exceeded" in big.error and "cap" in big.error
