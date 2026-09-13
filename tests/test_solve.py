@@ -651,3 +651,16 @@ def test_stress_crash_repair_prompt_shows_the_head_of_the_max_size_input(tmp_pat
     assert "1000000000000000000" in repair_prompt          # the stress input itself, not just its size
     failed_line = next(e for e in rep["events"] if "gate.failed" in e)
     assert "{'" in failed_line and '{"' not in failed_line   # repr(detail): json renders () and [] alike
+
+
+def test_an_ungated_second_attempt_is_never_a_full_pass(tmp_path):
+    # No oracle and no stress at all: the first attempt is gated with every step skipped and the
+    # loop stops there, leaving the second attempt with only its static check. The finalizer's
+    # tie-break then prefers the later candidate -- which has nothing skipped because nothing was
+    # ever checked. That must read as unverified, not passed_all_gates (seen live on bench7).
+    SOLVE_2 = SOLVE_OK.replace("return a + b", "return b + a")
+    c = cfg(); c["limits"]["solve_attempts"] = 2
+    llm = FakeLLM({"solve": [SOLVE_OK, SOLVE_2], "oracle": ["", ""], "stress": [""]})
+    rep = S.solve(prob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert len(rep["evidence"]) == 2
+    assert rep["status"] == "emitted_unverified"

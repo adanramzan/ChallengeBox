@@ -316,7 +316,13 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         # with far too few cases) passed against weaker input than the gate claims to check, so it
         # is not full evidence either -- count it exactly like a skip.
         skipped = any(e.skipped or e.detail.get("degraded") for e in best.evidence if not (e.kind == "overflow" and problem.language == "python"))
-        status = ("passed_all_gates" if best.all_passed() and not skipped
+        # "static"/"compile" are pre-flight, not verification. A candidate that was never gated (a
+        # second attempt left ungated when the budget ran out) has only its static check -- nothing
+        # skipped, nothing failed, and nothing checked either. Measured on bench7/2beff58fa923: no
+        # oracle at all, and the finalizer's tie-break picked the ungated attempt and called it a
+        # full pass. A full pass needs at least one real check to have actually run.
+        checked = any(not e.skipped for e in best.evidence if e.kind not in ("static", "compile"))
+        status = ("passed_all_gates" if best.all_passed() and not skipped and checked
                   else "emitted_unverified" if best.all_passed() else "emitted_with_failures")
         run.log(f"emit candidate={best.id} status={status}")
     report = {"problem_id": problem.problem_id, "language": problem.language, "profile": cfg.get("profile"), "deadline_s": problem.deadline_s,
