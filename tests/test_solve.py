@@ -692,3 +692,9 @@ def test_oracle_prompt_ties_validate_and_gen_to_one_precondition_list(tmp_path):
     rendered = S.render("oracle", **S.prompt_vars(prob(tmp_path)))
     assert "`validate()` and `gen()` must agree" in rendered
     assert "trace one `gen()` output through `validate()` by hand" in rendered
+
+def test_stress_prompt_forbids_work_at_import_time(tmp_path):
+    # bench8/1ba0d34fae43: the STRESS module asserted its own EDGES at module level against rules the
+    # statement never stated; the import raised and both EDGES and gen_max were lost with it.
+    rendered = S.render("stress", **S.prompt_vars(prob(tmp_path)))
+    assert "import time" in rendered and "No module-level loops, asserts, or calls" in rendered

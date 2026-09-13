@@ -30,6 +30,7 @@ An invalid input makes every later comparison meaningless, and it is the most co
 * Never assign to a name you also read inside the same function, and never to an imported module name. `random = random.Random(seed)` raises `UnboundLocalError`. Bind the generator to a fresh name such as `rng`.
 * Never draw from a possibly-empty range. Guard **every** `randrange`, `randint`, `choice` and `sample` call site — not just the obvious first one — so the range or sequence is non-empty at that exact point, and skip that step when it is not. An `IndexError` or `ValueError` from one unguarded draw buried deep in a loop is just as fatal as one in the first line.
 * `EDGES` must hold literal values, not calls that build them.
+* Nothing runs at import time except `import` statements, `def`s, and the `EDGES = [...]` literal. No module-level loops, asserts, or calls — a single failing assert at import discards both `gen_max` and `EDGES`. If you want to check `EDGES`, do it by hand before answering, not in code.
 * Never indent the contents of a multi-line string literal (e.g. a `"""..."""` block spanning several lines) to match the surrounding code. Every line after the first becomes part of the value verbatim, so indenting it adds leading whitespace the real input never has. Start continuation lines at column 0, or build the string with `"\n".join([...])` instead.
 
 Respond with exactly one block:
