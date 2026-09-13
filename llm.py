@@ -20,6 +20,13 @@ class Role:
     # or timed out is NOT retried here; that is the orchestrator's decision.
     transport_retries: int = 2
     transport_backoff_s: float = 2.0
+    # Where OpenAI-compatible providers still differ. OpenAI's reasoning models reject max_tokens for
+    # max_completion_tokens. Only OpenRouter reports usage.cost; for any other provider the per-million
+    # prices fill it in, otherwise cost reads as $0 and max_cost_usd_per_problem never fires.
+    token_param: str = "max_tokens"
+    omit_temperature: bool = False   # Claude 5 and OpenAI reasoning models reject a sampling temperature
+    price_in_per_m: float = 0.0
+    price_out_per_m: float = 0.0
 
 
 @dataclass
@@ -42,9 +49,21 @@ def load_config(path: str, profile: str) -> dict:
     prof = cfg["profiles"][profile]  # KeyError on unknown profile is intended
     roles = {name: Role(name, r["base_url"].rstrip("/"), r["model"], r.get("api_key_env", ""), int(r["max_tokens"]),
                         int(r.get("max_concurrent", 1)), float(r.get("timeout_cap_s", 120.0)), dict(r.get("extra", {})),
-                        int(r.get("transport_retries", 2)), float(r.get("transport_backoff_s", 2.0)))
+                        int(r.get("transport_retries", 2)), float(r.get("transport_backoff_s", 2.0)),
+                        r.get("token_param", "max_tokens"), bool(r.get("omit_temperature", False)), float(r.get("price_in_per_m", 0.0)), float(r.get("price_out_per_m", 0.0)))
              for name, r in prof.items()}
     return {"roles": roles, "limits": cfg["limits"], "phases": cfg["phases"], "profile": profile}
+
+
+def pick_profile(path: str) -> str:
+    """The first profile whose every role has its API key set, so whichever supported key a user
+    exports just works without --profile. With none set, the first profile -- whose key the CLI names."""
+    with open(path, "rb") as f:
+        profiles = tomllib.load(f)["profiles"]
+    for name, prof in profiles.items():
+        if all(not r.get("api_key_env") or r["api_key_env"] in os.environ for r in prof.values()):
+            return name
+    return next(iter(profiles))
 
 
 class LLM:
@@ -61,12 +80,15 @@ class LLM:
 
     def chat(self, role: str, system: str, user: str, *, timeout_s: float, max_tokens: int | None = None, tag: str = "") -> Reply:
         r = self.roles[role]
+        limit = max_tokens or r.max_tokens
         body = {"model": r.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                "max_tokens": max_tokens or r.max_tokens, "temperature": 0.2, "stream": False, **r.extra}
+                r.token_param: limit, "temperature": 0.2, "stream": False, **r.extra}
+        if r.omit_temperature:
+            body.pop("temperature")
         if timeout_s <= 0:
             reply = Reply("", "", {}, 0.0, r.model, "timeout")
             self.calls.append({"role": role, "tag": tag, "model": reply.model, "latency_s": 0.0, "usage": {},
-                               "error": "timeout", "timed_out": True, "max_tokens": body["max_tokens"]})
+                               "error": "timeout", "timed_out": True, "max_tokens": limit})
             return reply
         headers = {"Content-Type": "application/json"}
         key = os.environ.get(r.api_key_env) if r.api_key_env else None
@@ -106,11 +128,13 @@ class LLM:
         elif "error" in result:
             reply = Reply("", "", {}, latency, r.model, result["error"])
         else:
-            d = result["data"]; msg = d["choices"][0]["message"]
+            d = result["data"]; msg = d["choices"][0]["message"]; usage = d.get("usage") or {}
+            if "cost" not in usage and (r.price_in_per_m or r.price_out_per_m):
+                usage["cost"] = (usage.get("prompt_tokens", 0) * r.price_in_per_m + usage.get("completion_tokens", 0) * r.price_out_per_m) / 1e6
             reply = Reply(msg.get("content") or "", msg.get("reasoning_content") or msg.get("reasoning") or "",
-                          d.get("usage") or {}, latency, d.get("model", r.model), None)
+                          usage, latency, d.get("model", r.model), None)
         self.calls.append({"role": role, "tag": tag, "model": reply.model, "latency_s": round(latency, 2), "usage": reply.usage,
-                           "error": reply.error, "timed_out": timed_out, "max_tokens": body["max_tokens"]})
+                           "error": reply.error, "timed_out": timed_out, "max_tokens": limit})
         return reply
 
 

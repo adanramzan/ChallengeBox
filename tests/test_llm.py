@@ -1,7 +1,7 @@
 import json, threading, time, pathlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
-from llm import LLM, Role, FakeLLM, parse_blocks, load_config
+from llm import LLM, Role, FakeLLM, parse_blocks, load_config, pick_profile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -19,11 +19,23 @@ def test_load_config_profiles():
     assert isinstance(cfg["roles"]["strong"].extra, dict)
     with pytest.raises(KeyError):
         load_config(str(ROOT / "config.toml"), "nope")
+    assert load_config(str(ROOT / "config.toml"), "openai")["roles"]["strong"].token_param == "max_completion_tokens"
+    assert load_config(str(ROOT / "config.toml"), "anthropic")["roles"]["strong"].omit_temperature
+
+def test_pick_profile_takes_first_profile_whose_keys_are_all_set(tmp_path, monkeypatch):
+    c = tmp_path / "c.toml"
+    c.write_text('[profiles.a.strong]\napi_key_env = "KEY_A"\n[profiles.b.strong]\napi_key_env = "KEY_B"\n[profiles.b.fast]\napi_key_env = "KEY_B"\n')
+    monkeypatch.delenv("KEY_A", raising=False); monkeypatch.delenv("KEY_B", raising=False)
+    assert pick_profile(str(c)) == "a"   # nothing set: the first, so the CLI names its key
+    monkeypatch.setenv("KEY_B", "x")
+    assert pick_profile(str(c)) == "b"
+    monkeypatch.setenv("KEY_A", "x")
+    assert pick_profile(str(c)) == "a"
 
 class _Handler(BaseHTTPRequestHandler):
-    active = 0; max_active = 0; requests = 0; lock = threading.Lock(); delay = 0.3; served_model = None
+    active = 0; max_active = 0; requests = 0; lock = threading.Lock(); delay = 0.3; served_model = None; last_body = None
     def do_POST(self):
-        n = int(self.headers["Content-Length"]); body = json.loads(self.rfile.read(n))
+        n = int(self.headers["Content-Length"]); body = json.loads(self.rfile.read(n)); _Handler.last_body = body
         with _Handler.lock:
             _Handler.active += 1; _Handler.max_active = max(_Handler.max_active, _Handler.active)
             _Handler.requests += 1
@@ -52,6 +64,22 @@ def test_chat_reply_text_falls_back_to_reasoning(server):
     llm = LLM({"strong": Role("strong", server, "m", "", 100, 1, 30.0, {})})
     r = llm.chat("strong", "s", "u", timeout_s=10)
     assert r.content == "" and "===CODE===" in r.text and r.usage["completion_tokens"] == 5 and r.error is None
+
+def test_chat_token_param_and_omit_temperature(server):
+    role = Role("strong", server, "m", "", 100, 1, 30.0, {}, token_param="max_completion_tokens", omit_temperature=True)
+    llm = LLM({"strong": role})
+    llm.chat("strong", "s", "u", timeout_s=10, max_tokens=42)
+    b = _Handler.last_body
+    assert b["max_completion_tokens"] == 42 and "max_tokens" not in b and "temperature" not in b
+    assert llm.calls[-1]["max_tokens"] == 42
+
+def test_chat_computes_cost_from_prices_when_provider_omits_it(server):
+    priced = Role("strong", server, "m", "", 100, 1, 30.0, {}, price_in_per_m=2.0, price_out_per_m=10.0)
+    r = LLM({"strong": priced}).chat("strong", "s", "u", timeout_s=10)
+    assert r.usage["cost"] == pytest.approx((10 * 2.0 + 5 * 10.0) / 1e6)
+    # No prices: cost stays absent, so the report says "unknown" rather than a false $0.
+    unpriced = Role("strong", server, "m", "", 100, 1, 30.0, {})
+    assert "cost" not in LLM({"strong": unpriced}).chat("strong", "s", "u", timeout_s=10).usage
 
 def test_chat_times_out(server):
     _Handler.delay = 2.0

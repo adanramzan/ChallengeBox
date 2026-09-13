@@ -7,7 +7,7 @@ Design rationale lives in `ChallengeBox-Agent-Architecture.md`. This file is the
 ```bash
 uv sync --group dev
 curl https://sh.rustup.rs -sSf | sh   # if rustc is not already on PATH; then: source ~/.cargo/env
-export OPENROUTER_API_KEY=sk-or-...
+export OPENROUTER_API_KEY=sk-or-...   # or ANTHROPIC_API_KEY, or OPENAI_API_KEY
 ```
 
 Always invoke Python through `uv run` (CPython 3.11). The system `python3` must never be used.
@@ -20,8 +20,8 @@ uv run python solve.py samples/<id>.json -o runs/out.py    # or out.rs for a Rus
 
 Exit codes: `0` passed all local gates, `1` emitted but with unverified or failing gates, `2` invalid
 problem input, `3` no candidate at all. Useful flags: `--deadline-scale 0.25` shrinks the usable budget
-for testing the emit-under-pressure path; `--profile <name>` and `--config <path>` select a different
-`config.toml` profile; `--run-dir` overrides where artifacts land (default `runs/<problem_id[:12]>-<YYYYmmdd-HHMMSS>/`,
+for testing the emit-under-pressure path; `--profile <name>` forces a `config.toml` profile (default: the
+first whose API key is set) and `--config <path>` a different config file; `--run-dir` overrides where artifacts land (default `runs/<problem_id[:12]>-<YYYYmmdd-HHMMSS>/`,
 timestamped so re-running a problem never overwrites the previous run).
 
 ## Where reports land, and how to read `report.json`
@@ -82,8 +82,8 @@ In `report.json`:
   self-inflicted oracle crash can't spend the budget a later real candidate/oracle dispute needs.
 - `calls` — every model call made (role, model, tag, latency, usage).
 - `token_usage` — summed prompt/completion tokens across all calls.
-- `cost_usd` — summed `usage.cost` as reported by OpenRouter, or `null` if the profile/provider
-  doesn't report cost (no local price table is maintained).
+- `cost_usd` — summed `usage.cost` as reported by OpenRouter, or computed from the role's
+  `price_in_per_m` / `price_out_per_m` when the provider doesn't report it; `null` when neither exists.
 - `events` — the same lines as `log.txt`, one per phase transition and gate step.
 
 The report never claims a solution is "verified" — only what was checked and whether it passed.
@@ -110,7 +110,8 @@ per second. Its measured oracle latency across the ten samples was 38 s minimum,
 128 s maximum, which is what sets `timeout_cap_s` below.
 
 Prices are whatever OpenRouter bills for these models at call time; the report reads them back from
-`usage.cost` on each response rather than keeping a local price table. OpenRouter includes `usage.cost`
+`usage.cost` on each response. Other providers don't report it, so their profiles carry `price_in_per_m` /
+`price_out_per_m` and the client computes it — without those, cost reads $0 and the cap never fires. OpenRouter includes `usage.cost`
 on every response by default now — the request body needs no extra parameter for this (the older
 `usage: {include: true}` flag is deprecated). The per-problem cost cap is
 `[limits] max_cost_usd_per_problem = 0.10` — every optional model call (the oracle retry, the
@@ -167,11 +168,22 @@ functions and is just as likely to need the full span.
 
 ## Swapping models or adding another endpoint
 
-Everything is config, not code. To change a model, edit its `model` key under
-`[profiles.openrouter.strong]` or `[profiles.openrouter.fast]` in `config.toml`. To point at a
-different OpenAI-compatible provider, add a new `[profiles.<name>.strong]` / `[profiles.<name>.fast]`
-pair with that provider's `base_url` and `api_key_env`, then pass `--profile <name>` on the command
-line. No source changes are needed for either case — `llm.py`'s client is provider-agnostic.
+Everything is config, not code. `config.toml` ships three profiles — `openrouter`, `anthropic`
+(Anthropic's OpenAI-compatible endpoint) and `openai` — and the CLI uses the first whose API key is
+exported, so a user sets one key and runs the command; `--profile <name>` forces one. To change a model,
+edit its `model` key (and prices) under that profile's `strong` / `fast` table.
+
+To add another OpenAI-compatible provider, add a `[profiles.<name>.strong]` / `[profiles.<name>.fast]`
+pair with its `base_url` and `api_key_env`, plus where the provider needs them: `token_param =
+"max_completion_tokens"` (OpenAI reasoning models), `omit_temperature = true` (models that reject
+sampling parameters), and `price_in_per_m` / `price_out_per_m` (any provider that doesn't return
+`usage.cost`). No source changes are needed.
+
+The `anthropic` and `openai` profiles have not been benchmarked. Their latency is unmeasured against
+the `[limits]` `*_afford_s` values, which were tuned to the OpenRouter models; a single-provider profile
+puts candidate and oracle in the same model family, weakening the independence the oracle relies on;
+and at Opus-tier prices `max_cost_usd_per_problem = 0.10` is spent by the first SOLVE calls, so optional
+repairs are skipped until it is raised.
 
 ## Benchmark mode
 

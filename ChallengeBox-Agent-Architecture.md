@@ -343,7 +343,7 @@ challengebox/
 ├── README.md              # setup, one command, assumptions, limitations
 ├── ARCHITECTURE.md        # this document
 ├── solve.py               # CLI, orchestrator, budget controller, finalizer
-├── llm.py                 # one provider client: structured output, timeout, usage capture
+├── llm.py                 # one OpenAI-compatible client, any provider by config: structured output, timeout, usage capture
 ├── sandbox.py             # python/rust runners, static contract checks
 ├── verify.py              # differential, medium tier, behavioral checks, stress, shrink
 ├── prompts/
@@ -370,7 +370,7 @@ python solve.py samples/<id>.json -o out/main.rs --deadline-scale 0.25 --run-dir
 python solve.py --bench samples/ -o out/          # runs all, writes a summary table
 ```
 
-Other flags: `--profile <name>` and `--config <path>` select a different `config.toml` profile;
+Other flags: `--profile <name>` forces a `config.toml` profile (default: the first whose API key is set) and `--config <path>` a different config file;
 `--run-dir` overrides where run artifacts land. There is no `--seed` flag — cases are generated with
 `range(n)`, not a configurable seed.
 

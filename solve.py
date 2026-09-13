@@ -37,7 +37,7 @@ class Budget:
         return self.remaining() >= seconds
 
 
-from llm import LLM, load_config, parse_blocks
+from llm import LLM, load_config, parse_blocks, pick_profile
 from sandbox import Problem, python_static, rust_static
 import verify as V
 
@@ -347,17 +347,18 @@ def missing_api_key(cfg: dict) -> str | None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="ChallengeBox AI solver")
     ap.add_argument("problem"); ap.add_argument("-o", "--output", required=True)
-    ap.add_argument("--profile", default="openrouter"); ap.add_argument("--config", default=str(ROOT / "config.toml"))
+    ap.add_argument("--profile", default=None, help="config.toml profile; default: the first whose API key is set"); ap.add_argument("--config", default=str(ROOT / "config.toml"))
     ap.add_argument("--deadline-scale", type=float, default=1.0); ap.add_argument("--run-dir", default=None)
     ap.add_argument("--bench", action="store_true", help="treat `problem` as a directory of *.json samples and `-o` as an output directory; writes out_dir/benchmark.md")
     a = ap.parse_args(argv)
+    a.profile = a.profile or pick_profile(a.config)
     if a.bench:
         if not os.path.isdir(a.problem):
             print(f"invalid sample directory: {a.problem}", file=sys.stderr); return 2
         cfg = load_config(a.config, a.profile)
         missing = missing_api_key(cfg)
         if missing:
-            print(f"missing API key: set {missing}", file=sys.stderr); return 2
+            print(f"missing API key: set {missing}, or the key of another profile in {a.config}", file=sys.stderr); return 2
         rows = bench(a.problem, a.output, cfg, LLM(cfg["roles"]), a.deadline_scale)
         print(f"wrote {len(rows)} rows to {os.path.join(a.output, 'benchmark.md')}")
         return 0
@@ -368,7 +369,7 @@ def main(argv=None) -> int:
     cfg = load_config(a.config, a.profile)
     missing = missing_api_key(cfg)
     if missing:
-        print(f"missing API key: set {missing}", file=sys.stderr); return 2
+        print(f"missing API key: set {missing}, or the key of another profile in {a.config}", file=sys.stderr); return 2
     # Timestamped so re-running the same problem never appends to the previous run's log.txt or
     # overwrites its report.json; an explicit --run-dir is used exactly as given.
     run_dir = a.run_dir or str(ROOT / "runs" / f"{problem.problem_id[:12]}-{time.strftime('%Y%m%d-%H%M%S')}")

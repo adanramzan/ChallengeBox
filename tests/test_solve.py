@@ -143,13 +143,18 @@ REPAIR_BLAME_ORACLE_WITH_TRACE = (
     "I traced through the statement by hand: when a=15, the spec says simple addition, so the reference must be wrong here.\n"
     "===VERDICT===\noracle\n===END===\n===CODE===\ndef add(a, b):\n    return a + b if a < 15 else a + b + 1\n===END===\n")
 
-def test_oracle_regen_prompt_includes_repair_trace(tmp_path):
+def test_oracle_regen_prompt_never_shows_the_candidate_or_the_repair_trace(tmp_path):
+    # The oracle is generated in its own context and must never see the candidate. The regeneration
+    # prompt used to carry the repair model's prose about the candidate, and the new oracle then
+    # inherited the candidate's exact bug (1dea32802072: 4000/4000 agreement with a wrong candidate).
     llm = FakeLLM({"solve": [SOLVE_OK], "repair": [REPAIR_BLAME_ORACLE_WITH_TRACE], "oracle": [ORACLE_WRONG, ORACLE_OK], "stress": [STRESS_OK]})
     rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert rep["oracle_regenerated"] == 1
     oracle_prompts = [u for c, (r, s, u) in zip(llm.calls, llm.prompts) if c["tag"] == "oracle"]
     assert len(oracle_prompts) == 2
-    assert "the spec says simple addition" in oracle_prompts[1]
+    assert "the spec says simple addition" not in oracle_prompts[1]   # the repair model's trace
+    assert "def add(" not in oracle_prompts[1]                        # the candidate's source
+    assert "An independent review believes" in oracle_prompts[1]      # the neutral sentence that replaces it
 
 def test_repair_prompt_truncates_large_statement_and_code(tmp_path):
     long_statement = "Return a+b for ints a,b. At most 10**18. " + ("x" * 50000)
