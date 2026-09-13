@@ -572,3 +572,22 @@ def test_gen_max_output_rejected_by_validate_is_not_stressed(tmp_path):
     assert any("gen_max output rejected by validate(); not used" in n for n in rep["gate_inputs"]["notes"])
     stress = next(e for e in rep["evidence"][rep["final_candidate"]] if e["kind"] == "stress")
     assert stress["passed"] and (stress["skipped"] or stress["detail"].get("degraded"))
+
+
+# --- round 6: a regenerated oracle is cross-checked against the one it replaces ---
+
+ORACLE_OFF_BY_1000 = "===ORACLE===\nimport random\ndef reference(a, b):\n    return a + b + 1000\ndef gen(seed, mode):\n    r = random.Random(seed)\n    return (r.randint(0, 20), r.randint(0, 20))\n===END===\n"
+
+def test_regenerated_oracle_disagreeing_everywhere_degrades_the_diff_evidence(tmp_path):
+    # Two references written from the same prose that disagree on every tiny input cannot both be
+    # near-correct: the run has no ground truth, so its differential evidence is not a full pass.
+    still_buggy = "===VERDICT===\ncandidate\n===END===\n===CODE===\ndef add(a, b):\n    return a + b + 7\n===END===\n"
+    llm = FakeLLM({"solve": [SOLVE_OK], "repair": [REPAIR_BLAME_ORACLE, still_buggy],
+                   "oracle": [ORACLE_WRONG, ORACLE_OFF_BY_1000], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_regenerated"] == 1
+    assert any("disagrees with the one it replaces" in n for n in rep["gate_inputs"]["notes"])
+    assert any("oracle.regen disagreement=" in e for e in rep["events"])
+    diffs = [e for evs in rep["evidence"].values() for e in evs if e["kind"].startswith("diff_")]
+    assert diffs and all(e["detail"].get("degraded") for e in diffs)
+    assert rep["status"] != "passed_all_gates"

@@ -34,6 +34,7 @@ class GateInputs:
     stress_input: object = None
     stress_degraded: bool = False
     validate_trusted: bool = False   # the oracle's validate() accepted at least one generated input and was not distrusted
+    diff_degraded: str = ""   # why every diff_* evidence against this oracle is weaker than it looks (set by regenerate_oracle)
     oracle_src: str = ""
     oracle_regens: int = 0        # adjudication: repair blamed the oracle for a wrong answer
     oracle_selfrepairs: int = 0   # this module noticed its own oracle crashed and produced zero usable cases
@@ -474,6 +475,8 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         e = differential(problem, source, gi.cases_public, "diff_public", workdir=os.path.join(workdir, "diff_public"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"], per_case_s=limits.get("per_case_limit_s", 0.0))
         if gi.public_disagreements:
             e.detail = {**e.detail, "oracle_disagreements": gi.public_disagreements}
+        if gi.diff_degraded:
+            e.detail["degraded"] = gi.diff_degraded
         ev.append(e); log(f"gate.diff_public passed={e.passed} cases={e.cases}")
         if not e.passed: return ev
     for kind, cases in (("diff_edge", gi.regressions + gi.cases_edge), ("diff_small", gi.cases_small), ("diff_medium", gi.cases_medium)):
@@ -484,6 +487,8 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         m = 0 if e.skipped else limits.get(f"min_cases_{kind[5:]}", 0)
         if e.passed and e.cases < m:
             e.detail["degraded"] = f"only {e.cases} {kind[5:]} cases (min {m})"
+        if gi.diff_degraded:
+            e.detail["degraded"] = gi.diff_degraded
         ev.append(e); log(f"gate.{kind} passed={e.passed} cases={e.cases}")
         if not e.passed: return ev
     e = behavior(problem, source, gi.cases_small or gi.cases_edge, workdir=os.path.join(workdir, "behavior"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"], per_case_s=limits.get("per_case_limit_s", 0.0))
@@ -605,5 +610,20 @@ def regenerate_oracle(run, gi: GateInputs, extra: str, pv: dict, *, counter: str
     # re-derive edge expectations with the new reference
     if gi.cases_edge:
         new.cases_edge, _ = make_cases(run.p, new.oracle_src, [c.input for c in gi.cases_edge], "edge", workdir=os.path.join(run.dir, workdir_tag, "edge"), timeout_s=run.budget.step_timeout(30.0))
+    # Cross-check the new reference against the one it replaces on the OLD small inputs. Two
+    # references written by the same model from the same prose that disagree on most tiny inputs
+    # cannot both be near-correct, so the run has no ground truth left: the differential evidence the
+    # new oracle produces is marked degraded (solve() then demotes the status out of
+    # passed_all_gates). Control flow is otherwise unchanged -- the new oracle is still used.
+    if gi.cases_small:
+        res = run_python_cases(new.oracle_src, "reference", [_ref_args(run.p, c.input) for c in gi.cases_small],
+                               workdir=os.path.join(run.dir, workdir_tag, "crosscheck"), timeout_s=run.budget.step_timeout(30.0, reserve_s=20.0))
+        n = len(gi.cases_small)
+        k = sum(1 for c, r in zip(gi.cases_small, res) if not same(run.p, r, c.expected))
+        run.log(f"oracle.{label} disagreement={k}/{n}")
+        new.notes.append(f"regenerated oracle disagrees with the one it replaces on {k}/{n} small inputs")
+        if k / n > run.cfg["limits"].get("oracle_regen_max_disagreement", 0.5):
+            new.diff_degraded = (f"the oracle was regenerated and disagrees with the one it replaces on {k}/{n} small inputs; "
+                                 "neither reference can be trusted as ground truth")
     run.log(f"oracle.{label} small={len(new.cases_small)} medium={len(new.cases_medium)} edge={len(new.cases_edge)}")
     return new

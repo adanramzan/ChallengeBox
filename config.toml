@@ -31,6 +31,11 @@ mem_mb = 4096
 per_case_limit_s = 10.0
 shrink_budget_s = 3.0
 max_cost_usd_per_problem = 0.10
+# Fraction of the old small inputs on which a REGENERATED oracle may disagree with the oracle it
+# replaces before its differential evidence is marked degraded. Two references written from the same
+# prose that disagree on more than half of tiny inputs cannot both be near-correct, so the run has no
+# ground truth; tuned against cases_small above (the cross-check reuses those inputs).
+oracle_regen_max_disagreement = 0.5
 
 # Minimum remaining budget (seconds) required before starting another ORACLE call after the first
 # one produced no ===ORACLE=== block (timeout or empty reply). Tuned to the measured worst-case
