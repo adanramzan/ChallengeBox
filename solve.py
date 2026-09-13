@@ -64,10 +64,19 @@ _LANG_RULES = {
 }
 
 
-# One stdin contract, given verbatim to SOLVE, ORACLE and STRESS, because they otherwise each invent
-# their own line layout for the same problem: in one bench6 run 7 of 10 edge cases were rejected as
-# invalid and in another the oracle answered "" to every edge, purely because its parser demanded two
-# values on the first line. Empty for Python, whose inputs are function arguments, not text.
+# One I/O contract per language, given verbatim to SOLVE, ORACLE and STRESS, because they otherwise
+# each invent their own reading of the same shape.
+#
+# Python: the outer container. Three rounds running, both of 2beff58fa923's attempts returned () where
+# the oracle returned [] on the empty input, and a repair was spent on a difference the statement is
+# silent about. The judge compares with ==, so the two sides have to pick the same convention rather
+# than each pick a defensible one.
+_IO_RULES_PY = ("Return exactly the container types the statement names — the judge compares with `==`, so `()` is not "
+                "`[]` and `(1,)` is not `[1]`. When the statement names no type for a container, use a `list` for the "
+                "outer/returned sequence and a `tuple` only where the statement says tuple or pair.")
+
+# Rust: the stdin layout. In one bench6 run 7 of 10 edge cases were rejected as invalid and in another
+# the oracle answered "" to every edge, purely because its parser demanded two values on the first line.
 _IO_RULES_RUST = ("Stdin is a whitespace-separated token stream. Read all of stdin, split on ASCII whitespace, and consume "
                   "tokens in exactly the order the statement lists them; never assume how tokens are split across lines, and "
                   "never require a value to be on its own line unless the statement explicitly says a value occupies a whole "
@@ -85,7 +94,7 @@ def render(name: str, **vars) -> str:
 
 def prompt_vars(p: Problem) -> dict:
     py = p.language == "python"
-    io_rules = "" if py else _IO_RULES_RUST
+    io_rules = _IO_RULES_PY if py else _IO_RULES_RUST
     return {"statement": p.statement, "language": p.language, "entrypoint": p.entrypoint, "io_rules": io_rules,
             "contract": f"Python function `{p.entrypoint}`" if py else "Rust program reading stdin, writing stdout",
             "language_rules": " ".join(filter(None, (_LANG_RULES[p.language].format(ep=p.entrypoint), io_rules))),

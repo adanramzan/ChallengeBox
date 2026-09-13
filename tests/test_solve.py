@@ -651,7 +651,7 @@ def test_rust_stdin_token_rule_reaches_all_three_prompts(tmp_path):
 
 def test_python_prompts_carry_no_stdin_rule_and_no_leftover_placeholder(tmp_path):
     pv = S.prompt_vars(prob(tmp_path))
-    assert pv["io_rules"] == "" and "token stream" not in pv["language_rules"]
+    assert "token stream" not in pv["io_rules"] and "token stream" not in pv["language_rules"]
     for name in ("solve", "oracle", "stress"):
         assert "{{io_rules}}" not in S.render(name, **pv)
 
@@ -698,3 +698,15 @@ def test_stress_prompt_forbids_work_at_import_time(tmp_path):
     # statement never stated; the import raised and both EDGES and gen_max were lost with it.
     rendered = S.render("stress", **S.prompt_vars(prob(tmp_path)))
     assert "import time" in rendered and "No module-level loops, asserts, or calls" in rendered
+
+def test_python_container_rule_reaches_solve_and_oracle(tmp_path):
+    # bench8/2beff58fa923, three rounds running: the candidate returned () where the oracle returned []
+    # on the empty input and a repair was spent on it. The statement names no outer container, so both
+    # sides need the same convention, not each their own.
+    pv = S.prompt_vars(prob(tmp_path))
+    sentence = "use a `list` for the outer/returned sequence"
+    assert sentence in pv["io_rules"] and sentence in pv["language_rules"]   # solve.md/repair.md see it here
+    for name in ("solve", "oracle"):
+        assert sentence in S.render(name, **pv)
+    rust = S.prompt_vars(prob(tmp_path, "rust"))
+    assert sentence not in rust["io_rules"] and "whitespace-separated token stream" in rust["io_rules"]
