@@ -64,6 +64,17 @@ _LANG_RULES = {
 }
 
 
+# One stdin contract, given verbatim to SOLVE, ORACLE and STRESS, because they otherwise each invent
+# their own line layout for the same problem: in one bench6 run 7 of 10 edge cases were rejected as
+# invalid and in another the oracle answered "" to every edge, purely because its parser demanded two
+# values on the first line. Empty for Python, whose inputs are function arguments, not text.
+_IO_RULES_RUST = ("Stdin is a whitespace-separated token stream. Read all of stdin, split on ASCII whitespace, and consume "
+                  "tokens in exactly the order the statement lists them; never assume how tokens are split across lines, and "
+                  "never require a value to be on its own line unless the statement explicitly says a value occupies a whole "
+                  "line. Generated inputs must follow the same rule: emit tokens in statement order, one or many per line, and "
+                  "the parser must accept both.")
+
+
 _PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
 
 
@@ -74,9 +85,10 @@ def render(name: str, **vars) -> str:
 
 def prompt_vars(p: Problem) -> dict:
     py = p.language == "python"
-    return {"statement": p.statement, "language": p.language, "entrypoint": p.entrypoint,
+    io_rules = "" if py else _IO_RULES_RUST
+    return {"statement": p.statement, "language": p.language, "entrypoint": p.entrypoint, "io_rules": io_rules,
             "contract": f"Python function `{p.entrypoint}`" if py else "Rust program reading stdin, writing stdout",
-            "language_rules": _LANG_RULES[p.language].format(ep=p.entrypoint),
+            "language_rules": " ".join(filter(None, (_LANG_RULES[p.language].format(ep=p.entrypoint), io_rules))),
             "oracle_signature": (f"Define reference(*args) with the same parameters as {p.entrypoint} and the same return value." if py
                                  else "Define reference(stdin_text: str) -> str that returns the exact expected stdout for that stdin."),
             "gen_returns": "a tuple of positional arguments" if py else "the stdin text as a str"}

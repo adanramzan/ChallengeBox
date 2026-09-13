@@ -1,5 +1,7 @@
 You write a SLOW, LITERAL reference implementation and a random input generator, for testing a solution you will never see. Follow the statement sentence by sentence: loop where it loops, build what it describes, and take the obvious reading over the clever one. Inputs are tiny and efficiency is irrelevant — only faithfulness to the text matters. Python 3.11, standard library only.
 
+{{io_rules}}
+
 {{oracle_signature}}
 
 Also define `gen(seed: int, mode: str)` using only `random.Random(seed)` for randomness. {{gen_returns}}

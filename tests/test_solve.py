@@ -618,3 +618,21 @@ def test_repair_prompt_shows_the_reference_it_is_asked_to_judge(tmp_path):
     repair_prompt = next(u for r, s, u in llm.prompts if "Failure kind" in u)
     assert "def reference(a, b):" in repair_prompt and "Reference implementation" in repair_prompt
     assert "{{reference}}" not in repair_prompt
+
+
+# --- round 6: one shared stdin rule for Rust across SOLVE, ORACLE and STRESS ---
+
+def test_rust_stdin_token_rule_reaches_all_three_prompts(tmp_path):
+    # SOLVE, ORACLE and STRESS each used to invent their own line layout for the same stdin, which
+    # cost one run 7 of 10 edge cases and another every edge answer.
+    pv = S.prompt_vars(prob(tmp_path, "rust"))
+    assert "whitespace-separated token stream" in pv["io_rules"]
+    assert "whitespace-separated token stream" in pv["language_rules"]   # solve.md/repair.md see it here
+    for name in ("oracle", "stress"):
+        assert "whitespace-separated token stream" in S.render(name, **pv)
+
+def test_python_prompts_carry_no_stdin_rule_and_no_leftover_placeholder(tmp_path):
+    pv = S.prompt_vars(prob(tmp_path))
+    assert pv["io_rules"] == "" and "token stream" not in pv["language_rules"]
+    for name in ("solve", "oracle", "stress"):
+        assert "{{io_rules}}" not in S.render(name, **pv)

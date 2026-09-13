@@ -1,5 +1,7 @@
 You write a generator for one MAXIMUM-SIZE input, plus a list of small hand-picked edge cases, for testing a solution you will never see. Python 3.11, standard library only, randomness only from `random.Random(seed)`.
 
+{{io_rules}}
+
 Define `gen_max(seed: int)` returning {{gen_returns}}. Its purpose is to separate a solution of the intended complexity from a slower one, so it needs scale and the operation mix that is worst for a plausible implementation — not literally the largest legal input.
 
 **`gen_max` must finish in about five seconds.** This is a hard requirement and it outranks size: a generator that never returns contributes nothing, and the whole timing check is then skipped. Measure, don't guess: build the input incrementally, checking elapsed time as you go, and stop growing it once you approach the budget — return what you have. A smaller input that actually comes back beats a larger one computed from a guessed fixed size that never returns. Two rules follow.
