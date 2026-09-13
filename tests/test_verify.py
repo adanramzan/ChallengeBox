@@ -462,3 +462,24 @@ def test_differential_failure_counts_every_mismatch_not_just_the_first(tmp_path)
     cases = [V.Case((a, 1), a + 1, "small") for a in range(30)]   # BUG is wrong for a >= 15
     ev = V.differential(PY, BUG, cases, "diff_small", workdir=str(tmp_path), timeout_s=20)
     assert not ev.passed and ev.detail["mismatches"] == 15 and ev.detail["cases"] == 30
+
+def test_tier_is_dropped_when_validate_rejects_all_and_reference_answers_the_same(tmp_path):
+    # 4e49a099fd84: the oracle's parser demanded two tokens on the first line, so validate() rejected
+    # all ten edges and reference() returned "" for every one of them -- and the gate then failed the
+    # candidate for printing the right answer. Two signals together mean the tier is unusable.
+    blind = ("def reference(a, b):\n    return 0\n"
+             "def gen(seed, mode):\n    return (seed + 1, seed + 2)\n"
+             "def validate(a, b):\n    return False\n")
+    limits = {"cases_small": 4, "cases_medium": 0, "mem_mb": 2048}
+    gi = V.prepare_gate_inputs(PY, blind, "", limits, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+    assert gi.cases_small == []
+    assert any("oracle cannot parse this format" in n for n in gi.notes)
+
+def test_a_genuinely_constant_answer_survives_when_validate_accepts(tmp_path):
+    # Only the two signals together are fatal: a constant reference with a working validate is fine.
+    const = ("def reference(a, b):\n    return 0\n"
+             "def gen(seed, mode):\n    return (seed + 1, seed + 2)\n"
+             "def validate(a, b):\n    return True\n")
+    limits = {"cases_small": 4, "cases_medium": 0, "mem_mb": 2048}
+    gi = V.prepare_gate_inputs(PY, const, "", limits, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+    assert len(gi.cases_small) == 4 and not any("cannot parse" in n for n in gi.notes)

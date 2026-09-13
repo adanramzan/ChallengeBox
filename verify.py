@@ -91,6 +91,17 @@ def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str
     detail = {"dropped": len(dropped), "errors": dropped[:3], "checked": checked, "invalid_dropped": invalid_dropped}
     if validation_skipped:
         detail["validation_skipped"] = validation_skipped
+    # Two independent signals that the oracle cannot parse this input format at all: its validate()
+    # rejected every input, AND its reference() gave the same answer to inputs that differ. On
+    # 4e49a099fd84 that answer was "" for all ten edges (the oracle's parser demanded two tokens on
+    # the first line) and the gate blamed the candidate for printing the right answer. One signal
+    # alone is weak -- a strict validator, or a problem whose answer really is constant -- but
+    # together they mean this tier can only produce meaningless comparisons.
+    if validation_skipped.startswith("validate() rejected every input") and len(cases) > 1 \
+            and len({repr(c.expected) for c in cases}) == 1 and len({repr(c.input) for c in cases}) > 1:
+        detail["unusable"] = (f"{tag}: validate rejected every input and reference gave one answer for all "
+                              "-- oracle cannot parse this format")
+        cases = []
     return cases, Evidence(f"oracle_{tag}", bool(cases), len(cases), time.monotonic() - t0, detail)
 
 def run_candidate(problem, source: str, inputs: list, *, workdir: str, timeout_s: float, binary: str | None = None, overflow_checks: bool = True, mem_mb: int = 4096, per_case_s: float = 0.0, deadline_s: float | None = None, max_consec_timeouts: int = 0) -> list[CaseResult]:
@@ -209,6 +220,8 @@ def _log_and_note_validation(gi: GateInputs, ev: Evidence, mode: str, log) -> No
     log(f"oracle.{mode} cases={ev.cases} dropped={ev.detail['dropped']} invalid={invalid}" + (f" skip={skip}" if skip else ""))
     if invalid:
         gi.notes.append(f"{mode}: dropped {invalid} of {ev.detail.get('checked', 0)} generated inputs as invalid (failed validate())")
+    if ev.detail.get("unusable"):
+        gi.notes.append(ev.detail["unusable"])
 
 def _clean_stdin(problem, s):
     # Model-written Rust stdin fixtures (EDGES entries, gen_max's output) are Python triple-quoted
