@@ -8,6 +8,7 @@ Define `gen_max(seed: int)` returning {{gen_returns}}. Its purpose is to separat
 
 * Push every *value* to its stated maximum immediately — maximum integers, deepest nesting, longest individual paths — because large values cost nothing to produce and are where overflow and precision bugs live.
 * Size the *counts* to whatever you can build in that budget, checked against a clock, not assumed from the statement's stated limit. Prefer bulk construction (comprehensions and slicing over whole ranges) to a per-element loop. If honoring the statement's preconditions requires stepping through a state model one operation at a time, that loop is your real constraint: pick a count it can finish, in the tens of thousands rather than the stated maximum. Tens of thousands already separates a linear solution from a quadratic one.
+* If the statement bounds a quantity that only grows through operations — a length, a depth, a count of live items — the worst case is where that quantity actually reaches its bound. Bias the operation mix so it does; a long sequence of operations that keeps the structure small tests nothing.
 * Never build a nested, linked, or tree-shaped input with recursion: its depth can be proportional to the input's size, and Python's recursion limit is small. Build it iteratively instead — an explicit stack, or linking nodes in a loop.
 
 Allocate memory proportional to the input you return, never to a quantity the statement merely describes, such as a repetition count or capacity that can reach 10^18.

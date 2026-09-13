@@ -251,7 +251,9 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
                     run.log("gate.passed")
                 break
             failed = next(e for e in cand.evidence if not e.passed)
-            run.log(f"gate.failed cand={cand.id} kind={failed.kind} detail={json.dumps(failed.detail)[:300]}")
+            # repr, not json.dumps: json renders a tuple and a list identically as [...], and the
+            # tuple/list distinction is exactly what several of these failures are about.
+            run.log(f"gate.failed cand={cand.id} kind={failed.kind} detail={repr(failed.detail)[:300]}")
             # Another independent attempt is still ungated: gate it before spending a repair call.
             # It costs no model call, and an attempt that already passes beats a repaired one.
             if len(ungated) > 1 and run.budget.can_afford(cfg["limits"]["repair_afford_s"]):

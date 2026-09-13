@@ -636,3 +636,18 @@ def test_python_prompts_carry_no_stdin_rule_and_no_leftover_placeholder(tmp_path
     assert pv["io_rules"] == "" and "token stream" not in pv["language_rules"]
     for name in ("solve", "oracle", "stress"):
         assert "{{io_rules}}" not in S.render(name, **pv)
+
+
+# --- round 6: small fixes ---
+
+def test_stress_crash_repair_prompt_shows_the_head_of_the_max_size_input(tmp_path):
+    # A stress crash is about the format and scale of an input the model has never seen; the repair
+    # prompt showed neither. (11b) It also covers 11a: the gate.failed log line must use repr.
+    CRASHES_ON_BIG = SOLVE_OK.replace("return a + b", "return a + b if a < 10**9 else 1 // 0")
+    STRESS_BIG = "===STRESS===\ndef gen_max(seed):\n    return (10**18, 10**18)\nEDGES = [(0, 0)]\n===END===\n"
+    llm = FakeLLM({"solve": [CRASHES_ON_BIG], "repair": [REPAIR_FIX], "oracle": [ORACLE_OK], "stress": [STRESS_BIG]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    repair_prompt = next(u for r, s, u in llm.prompts if "Failure kind: stress" in u)
+    assert "1000000000000000000" in repair_prompt          # the stress input itself, not just its size
+    failed_line = next(e for e in rep["events"] if "gate.failed" in e)
+    assert "{'" in failed_line and '{"' not in failed_line   # repr(detail): json renders () and [] alike

@@ -602,6 +602,12 @@ def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, 
             run.log(f"shrink input={_fmt(case.input)[:120]}")
         detail["input"], detail["expected"] = case.input, case.expected
         gi.regressions.append(case)
+    if failed.kind == "stress" and detail.get("error") and not detail.get("timed_out") and gi.stress_input is not None:
+        # A stress crash is about the input's format and scale, and the model sees neither: the
+        # stress input is never in the evidence (it is enormous). Show the head of it so the crash
+        # has a shape to be explained by. Timeouts are left alone -- they are about cost, not shape.
+        si = gi.stress_input if isinstance(gi.stress_input, str) else repr(gi.stress_input)
+        detail["input"] = si[:1500] + (f"\n(max-size input, {len(si)} characters total; truncated)" if len(si) > 1500 else "")
     agreement = _agreement_note(run, cand, failed, gi, detail)
     pv_repair = {**pv, "statement": _fmt(pv["statement"], 12000)}
     # Derived from config.toml's [phases].repair_call_share, not a literal fraction -- see
