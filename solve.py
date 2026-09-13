@@ -369,7 +369,9 @@ def main(argv=None) -> int:
     missing = missing_api_key(cfg)
     if missing:
         print(f"missing API key: set {missing}", file=sys.stderr); return 2
-    run_dir = a.run_dir or str(ROOT / "runs" / problem.problem_id[:12])
+    # Timestamped so re-running the same problem never appends to the previous run's log.txt or
+    # overwrites its report.json; an explicit --run-dir is used exactly as given.
+    run_dir = a.run_dir or str(ROOT / "runs" / f"{problem.problem_id[:12]}-{time.strftime('%Y%m%d-%H%M%S')}")
     rep = solve(problem, LLM(cfg["roles"]), cfg, out_path=a.output, run_dir=run_dir, deadline_scale=a.deadline_scale)
     print(json.dumps({k: rep[k] for k in ("status", "final_candidate", "elapsed_s", "repairs", "token_usage", "cost_usd")}))
     return {"passed_all_gates": 0, "emitted_unverified": 1, "emitted_with_failures": 1}.get(rep["status"], 3)
