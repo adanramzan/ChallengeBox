@@ -91,6 +91,7 @@ class Run:
         self.cands: list[Candidate] = []
         self.events: list[str] = []
         self._log_lock = threading.Lock()
+        self._cost_logged = False
         os.makedirs(os.path.join(run_dir, "candidates"), exist_ok=True)
 
     def log(self, msg: str):
@@ -104,6 +105,18 @@ class Run:
 
     def cost_usd(self) -> float:
         return sum(float((c.get("usage") or {}).get("cost") or 0.0) for c in self.llm.calls)
+
+    def over_cost(self) -> bool:
+        """True once this problem has spent its cap. Every OPTIONAL model call -- the oracle retry,
+        the oracle self-repair, a repair, an adjudication regeneration -- must consult this; only
+        the initial concurrent calls can't be pre-checked, since nothing has been spent yet."""
+        usd = self.cost_usd()
+        if usd < self.cfg["limits"]["max_cost_usd_per_problem"]:
+            return False
+        if not self._cost_logged:
+            self._cost_logged = True
+            self.log(f"cost.cap reached usd={usd:.4f}")
+        return True
 
     def add_candidate(self, source: str, parent: str | None) -> Candidate:
         c = Candidate(f"c{len(self.cands) + 1}", source, parent); self.cands.append(c)
@@ -170,7 +183,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     # still afford a call as slow as the measured worst case -- config.toml's
     # limits.oracle_retry_afford_s, not a literal, since that worst case is a function of whatever
     # model is configured for the "fast" role.
-    if not oracle_src.strip() and run.budget.can_afford(cfg["limits"]["oracle_retry_afford_s"]):
+    if not oracle_src.strip() and run.budget.can_afford(cfg["limits"]["oracle_retry_afford_s"]) and not run.over_cost():
         run.log("oracle.retry no ===ORACLE=== block in first reply, retrying once")
         r_oracle = run.chat("fast", "oracle", gen_cap, **pv)
         oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
@@ -190,7 +203,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     # through its OWN one-shot counter (gi.oracle_selfrepairs) so this can fire and the unrelated
     # adjudication regeneration (gi.oracle_regens, in the repair loop below) can still fire later in
     # the same run -- one broken-oracle recovery must never spend the other's budget.
-    if V.oracle_unusable(gi) and run.budget.can_afford(cfg["limits"]["oracle_selfrepair_afford_s"]):
+    if V.oracle_unusable(gi) and run.budget.can_afford(cfg["limits"]["oracle_selfrepair_afford_s"]) and not run.over_cost():
         run.log(f"oracle.selfrepair triggered: no usable case in any tier; notes={'; '.join(gi.notes)[:300]}")
         try:
             gi = V.regenerate_oracle(run, gi, V.selfrepair_extra(gi), pv, counter="oracle_selfrepairs", workdir_tag="oracle_selfrepair")
@@ -241,8 +254,8 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             count = syntax_repairs if is_syntax else repairs
             if count >= cap or run.budget.phase() not in ("generate", "gate", "repair") or not run.budget.can_afford(cfg["limits"]["repair_afford_s"]):
                 break
-            if run.cost_usd() >= cfg["limits"]["max_cost_usd_per_problem"]:
-                run.log(f"cost.cap reached usd={run.cost_usd():.4f}"); break
+            if run.over_cost():
+                break
             if is_syntax:
                 syntax_repairs += 1
             else:

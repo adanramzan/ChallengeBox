@@ -539,6 +539,13 @@ def regenerate_oracle(run, gi: GateInputs, extra: str, pv: dict, *, counter: str
     same run -- a run can recover from a broken oracle early on and still adjudicate a later dispute.
     """
     label = "selfrepair" if counter == "oracle_selfrepairs" else "regen"
+    if run.over_cost():
+        # This is an optional extra model call like any other; regen_failed is what makes the
+        # repair loop stop cleanly instead of re-gating against an oracle that was never rewritten.
+        run.log(f"oracle.{label} skipped: cost cap reached")
+        gi.notes.append(f"oracle {label} skipped: cost cap reached")
+        gi.regen_failed = True
+        return gi
     # Regeneration writes the same reference+gen+validate functions as the original ORACLE call, so it
     # needs the same generous cap -- derived from the same config knob solve() uses -- not a separate,
     # smaller hardcoded fraction that clips before the oracle's measured latency (min 38s / median 73s

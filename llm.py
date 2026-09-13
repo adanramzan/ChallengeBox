@@ -119,11 +119,14 @@ def parse_blocks(text: str) -> dict[str, str]:
 
 
 class FakeLLM:
-    def __init__(self, script: dict[str, list[str]]):
+    def __init__(self, script: dict[str, list[str]], cost: float | None = None):
         self.script = {k: list(v) for k, v in script.items()}
         self.calls: list[dict] = []
         self.prompts: list[tuple[str, str, str]] = []
         self._lock = threading.Lock()
+        self.usage = {"prompt_tokens": 1, "completion_tokens": 1}
+        if cost is not None:
+            self.usage["cost"] = cost   # lets a test drive Run.cost_usd() past the cap
 
     def chat(self, role: str, system: str, user: str, *, timeout_s: float, max_tokens: int | None = None, tag: str = "") -> Reply:
         with self._lock:
@@ -131,5 +134,5 @@ class FakeLLM:
             assert self.script.get(key), f"FakeLLM: no scripted reply left for {key!r} (tag={tag!r}, role={role!r})"
             text = self.script[key].pop(0)
             self.prompts.append((role, system, user))
-            self.calls.append({"role": role, "tag": tag, "model": "fake", "latency_s": 0.0, "usage": {"prompt_tokens": 1, "completion_tokens": 1}, "error": None, "timed_out": False})
-        return Reply(text, "", {"prompt_tokens": 1, "completion_tokens": 1}, 0.0, "fake", None)
+            self.calls.append({"role": role, "tag": tag, "model": "fake", "latency_s": 0.0, "usage": dict(self.usage), "error": None, "timed_out": False})
+        return Reply(text, "", dict(self.usage), 0.0, "fake", None)

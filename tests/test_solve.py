@@ -114,6 +114,21 @@ def test_repair_stops_at_max_repairs_and_emits_best(tmp_path):
     rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert rep["status"] == "emitted_with_failures" and rep["repairs"] == 2 and len(llm.script["repair"]) == 1
 
+def test_cost_cap_blocks_the_repair_call(tmp_path):
+    # 3 initial calls * 0.05 = 0.15 against a 0.10 cap -> every optional call after them is off.
+    llm = FakeLLM({"solve": [BUGGY], "repair": [REPAIR_FIX], "oracle": [ORACLE_OK], "stress": [STRESS_OK]}, cost=0.05)
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert [c["tag"] for c in llm.calls].count("repair") == 0
+    assert rep["repairs"] == 0 and rep["status"] == "emitted_with_failures"
+    assert sum("cost.cap reached" in e for e in rep["events"]) == 1   # logged once, not per check
+
+def test_cost_cap_blocks_the_oracle_retry_and_selfrepair(tmp_path):
+    # empty ORACLE reply -> a retry AND, since no tier has cases, a self-repair would both fire.
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": ["", ORACLE_OK], "stress": [STRESS_OK]}, cost=0.05)
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert [c["tag"] for c in llm.calls].count("oracle") == 1
+    assert rep["oracle_selfrepaired"] == 0 and any("cost.cap reached" in e for e in rep["events"])
+
 def test_deadline_forces_emit_without_repair(tmp_path):
     class Clock:
         t = 0.0
