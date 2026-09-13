@@ -134,12 +134,16 @@ def differential(problem, source: str, cases: list[Case], kind: str, *, workdir:
     case_timeout = timeout_s if problem.language == "python" else max(0.25, timeout_s / max(1, len(cases)))
     dl = None if problem.language == "python" else time.monotonic() + timeout_s
     res = run_candidate(problem, source, [c.input for c in cases], workdir=workdir, timeout_s=case_timeout, binary=binary, mem_mb=mem_mb, per_case_s=per_case_s, deadline_s=dl)
-    for i, (c, r) in enumerate(zip(cases, res)):
-        if not same(problem, r, c.expected):
-            return Evidence(kind, False, len(cases), time.monotonic() - t0,
-                            {"index": i, "input": c.input, "expected": c.expected, "actual": _actual_for_report(r),
-                             "error": r.error[-600:], "timed_out": r.timed_out})
-    return Evidence(kind, True, len(cases), time.monotonic() - t0)
+    # The batch already ran, so counting every mismatch is free -- and the count is what tells the
+    # repair model whether it is looking at a boundary bug (a few cases) or two different readings of
+    # the statement (most of them). Reporting only the first mismatch discarded that for nothing.
+    bad = [(i, c, r) for i, (c, r) in enumerate(zip(cases, res)) if not same(problem, r, c.expected)]
+    if bad:
+        i, c, r = bad[0]
+        return Evidence(kind, False, len(cases), time.monotonic() - t0,
+                        {"index": i, "input": c.input, "expected": c.expected, "actual": _actual_for_report(r),
+                         "error": r.error[-600:], "timed_out": r.timed_out, "mismatches": len(bad), "cases": len(cases)})
+    return Evidence(kind, True, len(cases), time.monotonic() - t0, {"mismatches": 0, "cases": len(cases)})
 
 def _fails(problem, source, oracle_src, inp, workdir, binary, timeout_s: float = 5.0) -> tuple[bool, object]:
     exp = run_python_cases(oracle_src, "reference", [_ref_args(problem, inp)], workdir=os.path.join(workdir, "o"), timeout_s=timeout_s)[0]
@@ -545,6 +549,23 @@ def _previous_attempt_note(run, cand, failed: Evidence) -> str:
             f"{_fmt(diff, 1500)}\n"
             "That change did NOT fix the case: the candidate shown below still fails. Do not repeat it.\n")
 
+def _agreement_note(run, cand, failed: Evidence, gi: GateInputs, detail: dict) -> str:
+    """How wholesale the disagreement is, in one phrase for the repair prompt. One failing input
+    reads the same whether the candidate is off by one at a boundary or has read the whole statement
+    differently -- and those want opposite responses from the repair model. The failing tier's own
+    numbers answer it when the tier is large enough; an edge/public failure (often a single case) is
+    measured against cases_small instead, reusing the compiled binary in the candidate's gate
+    workdir so a Rust candidate is not recompiled."""
+    if detail.get("cases") and failed.kind in ("diff_small", "diff_medium"):
+        return f"disagrees with the reference on {detail.get('mismatches', 0)} of {detail['cases']} {failed.kind[5:]} inputs"
+    if failed.kind in ("diff_edge", "diff_public") and gi.cases_small:
+        e = differential(run.p, cand.source, gi.cases_small, "agreement", workdir=os.path.join(run.dir, cand.id),
+                         timeout_s=run.budget.step_timeout(30.0, reserve_s=20.0), mem_mb=run.cfg["limits"]["mem_mb"],
+                         per_case_s=run.cfg["limits"].get("per_case_limit_s", 0.0))
+        if e.cases:
+            return f"disagrees with the reference on {e.detail.get('mismatches', 0)} of {e.cases} small inputs"
+    return "was not measured against a whole tier of inputs"
+
 def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, str]:
     problem = run.p
     previous_attempt = _previous_attempt_note(run, cand, failed)
@@ -557,6 +578,7 @@ def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, 
             run.log(f"shrink input={_fmt(case.input)[:120]}")
         detail["input"], detail["expected"] = case.input, case.expected
         gi.regressions.append(case)
+    agreement = _agreement_note(run, cand, failed, gi, detail)
     pv_repair = {**pv, "statement": _fmt(pv["statement"], 12000)}
     # Derived from config.toml's [phases].repair_call_share, not a literal fraction -- see
     # regenerate_oracle's identical use of generate_call_share, and BENCHMARK-FINDINGS.md F6 for
@@ -565,7 +587,7 @@ def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, 
     repair_cap = run.cfg["phases"]["repair_call_share"] * run.budget.usable_s
     r = run.chat("strong", "repair", repair_cap, kind=failed.kind, input=_fmt_typed(detail.get("input")), expected=_fmt_typed(detail.get("expected")),
                  actual=_fmt_typed(detail.get("actual")), details=_fmt({k: v for k, v in detail.items() if k not in ("input", "expected", "actual")}),
-                 code=_fmt(cand.source), previous_attempt=previous_attempt, **pv_repair)
+                 code=_fmt(cand.source), previous_attempt=previous_attempt, agreement=agreement, **pv_repair)
     blocks = parse_blocks(r.text)
     verdict = "oracle" if blocks.get("VERDICT", "").strip().lower().startswith("oracle") else "candidate"
     run.log(f"repair.verdict={verdict}")

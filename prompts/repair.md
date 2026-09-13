@@ -9,6 +9,13 @@ Actual:
 {{actual}}
 Details:
 {{details}}
+
+Scope of the disagreement: this solution {{agreement}}.
+
+When it disagrees on most of the inputs, this is not a boundary bug: the two sides are reading one
+rule of the statement differently. Re-read the statement for the rule they disagree about, name that
+rule, and fix the reading — a tweak at the failing value will not move the other cases. When only a
+few inputs disagree, the boundary-bug framing above is the right one.
 {{previous_attempt}}
 First, in one sentence, name the specific expression or line that produces the wrong value on this
 input. Then change only what that sentence names. A rewrite of the whole approach is almost never the

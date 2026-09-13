@@ -603,3 +603,10 @@ def test_second_oracle_verdict_with_no_regeneration_left_does_not_mint_a_candida
     assert rep["oracle_regenerated"] == 1
     assert list(rep["evidence"]) == ["c1"]   # no c2 minted from the second `oracle` verdict
     assert any("repair.oracle_verdict_unactionable" in e for e in rep["events"])
+
+def test_repair_prompt_states_how_wholesale_the_disagreement_is(tmp_path):
+    llm = FakeLLM({"solve": [BUGGY], "repair": [REPAIR_FIX], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    repair_prompt = next(u for r, s, u in llm.prompts if "Failure kind" in u)
+    assert re.search(r"disagrees with the reference on \d+ of \d+ (small|edge) inputs", repair_prompt)
+    assert "{{agreement}}" not in repair_prompt

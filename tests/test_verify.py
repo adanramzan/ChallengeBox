@@ -455,3 +455,10 @@ def test_shrink_keeps_the_original_when_every_smaller_input_is_invalid(tmp_path)
     case = V.Case((1000, 999), 1999, "small")
     out = V.shrink(PY, BUG, ORACLE_VALIDATE_ONLY_ORIGINAL, case, workdir=str(tmp_path), budget_s=3.0, validate_trusted=True)
     assert out.input == (1000, 999) and out.expected == 1999
+
+def test_differential_failure_counts_every_mismatch_not_just_the_first(tmp_path):
+    # How wholesale the disagreement is decides whether the repair model should hunt a boundary bug
+    # or re-read the statement; the batch already ran, so counting the rest is free.
+    cases = [V.Case((a, 1), a + 1, "small") for a in range(30)]   # BUG is wrong for a >= 15
+    ev = V.differential(PY, BUG, cases, "diff_small", workdir=str(tmp_path), timeout_s=20)
+    assert not ev.passed and ev.detail["mismatches"] == 15 and ev.detail["cases"] == 30
