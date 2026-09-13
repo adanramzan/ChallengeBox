@@ -166,6 +166,15 @@ def test_rust_timeout(tmp_path):
     r = run_rust_cases(binp, [""], timeout_s=0.5)[0]
     assert r.timed_out and not r.ok
 
+@needs_rustc
+def test_rust_cases_stop_at_batch_deadline(tmp_path):
+    # 20 hung cases at 0.3s each is 6s of wall clock without a batch ceiling.
+    binp, _ = compile_rust("fn main(){loop{}}", overflow_checks=False, workdir=str(tmp_path))
+    t0 = time.monotonic()
+    res = run_rust_cases(binp, [""] * 20, timeout_s=0.3, deadline_s=time.monotonic() + 0.6)
+    assert time.monotonic() - t0 < 1.5
+    assert len(res) == 20 and all(r.timed_out and not r.ok for r in res)
+
 def test_rust_static_rules():
     assert rust_static("fn main(){}") == []
     assert any("main" in v for v in rust_static("fn helper(){}"))

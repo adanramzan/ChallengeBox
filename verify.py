@@ -80,14 +80,14 @@ def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str
         detail["validation_skipped"] = validation_skipped
     return cases, Evidence(f"oracle_{tag}", bool(cases), len(cases), time.monotonic() - t0, detail)
 
-def run_candidate(problem, source: str, inputs: list, *, workdir: str, timeout_s: float, binary: str | None = None, overflow_checks: bool = True, mem_mb: int = 4096, per_case_s: float = 0.0) -> list[CaseResult]:
+def run_candidate(problem, source: str, inputs: list, *, workdir: str, timeout_s: float, binary: str | None = None, overflow_checks: bool = True, mem_mb: int = 4096, per_case_s: float = 0.0, deadline_s: float | None = None) -> list[CaseResult]:
     if problem.language == "python":
         return run_python_cases(source, problem.entrypoint, [tuple(i) if isinstance(i, (tuple, list)) else (i,) for i in inputs], timeout_s=timeout_s, workdir=workdir, mem_mb=mem_mb, per_case_s=per_case_s)
     if binary is None:
         binary, err = compile_rust(source, overflow_checks=overflow_checks, workdir=workdir)
         if binary is None:
             return [CaseResult(False, error="compile: " + err[-800:]) for _ in inputs]
-    return run_rust_cases(binary, list(inputs), timeout_s=timeout_s, mem_mb=mem_mb)
+    return run_rust_cases(binary, list(inputs), timeout_s=timeout_s, mem_mb=mem_mb, deadline_s=deadline_s)
 
 def same(problem, actual: CaseResult, expected) -> bool:
     if not actual.ok: return False
@@ -116,8 +116,11 @@ def differential(problem, source: str, cases: list[Case], kind: str, *, workdir:
     # Rust runs each case as a separate process with its own timeout, so a batch timeout must be
     # divided across cases or the ceiling is timeout_s * len(cases); Python runs the whole batch
     # inside one subprocess call, so the full timeout_s already bounds the batch.
+    # The per-case division spreads the grant fairly; deadline_s is the hard ceiling on top of it,
+    # so a hung candidate cannot turn timeout_s into timeout_s * len(cases) of wall clock.
     case_timeout = timeout_s if problem.language == "python" else max(0.25, timeout_s / max(1, len(cases)))
-    res = run_candidate(problem, source, [c.input for c in cases], workdir=workdir, timeout_s=case_timeout, binary=binary, mem_mb=mem_mb, per_case_s=per_case_s)
+    dl = None if problem.language == "python" else time.monotonic() + timeout_s
+    res = run_candidate(problem, source, [c.input for c in cases], workdir=workdir, timeout_s=case_timeout, binary=binary, mem_mb=mem_mb, per_case_s=per_case_s, deadline_s=dl)
     for i, (c, r) in enumerate(zip(cases, res)):
         if not same(problem, r, c.expected):
             return Evidence(kind, False, len(cases), time.monotonic() - t0,
@@ -385,8 +388,9 @@ def behavior(problem, source: str, cases: list[Case], *, workdir: str, timeout_s
             return Evidence("behavior", False, 3, time.monotonic() - t0, {"check": "mutation", "input": inputs[0]})
         if aba[0].ok and aba[2].ok and aba[0].output != aba[2].output:
             return Evidence("behavior", False, 3, time.monotonic() - t0, {"check": "global_state", "input": inputs[0], "first": aba[0].output, "again": aba[2].output})
-    r1 = run_candidate(problem, source, inputs, workdir=os.path.join(workdir, "p1"), timeout_s=case_timeout, binary=binary, mem_mb=mem_mb, per_case_s=per_case_s)
-    r2 = run_candidate(problem, source, inputs, workdir=os.path.join(workdir, "p2"), timeout_s=case_timeout, binary=binary, mem_mb=mem_mb, per_case_s=per_case_s)
+    rust_deadline = lambda: None if problem.language == "python" else time.monotonic() + timeout_s   # see differential()
+    r1 = run_candidate(problem, source, inputs, workdir=os.path.join(workdir, "p1"), timeout_s=case_timeout, binary=binary, mem_mb=mem_mb, per_case_s=per_case_s, deadline_s=rust_deadline())
+    r2 = run_candidate(problem, source, inputs, workdir=os.path.join(workdir, "p2"), timeout_s=case_timeout, binary=binary, mem_mb=mem_mb, per_case_s=per_case_s, deadline_s=rust_deadline())
     for i, (a, b) in enumerate(zip(r1, r2)):
         if a.ok and b.ok and (a.output if problem.language == "python" else tokens(a.output)) != (b.output if problem.language == "python" else tokens(b.output)):
             return Evidence("behavior", False, len(inputs), time.monotonic() - t0, {"check": "nondeterminism", "input": inputs[i], "run1": a.output, "run2": b.output})

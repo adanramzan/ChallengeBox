@@ -141,14 +141,15 @@ def test_differential_rust_divides_timeout_by_case_count(tmp_path, monkeypatch):
     # cases before reaching it, or a 200-case differential with a 60s cap has a 3-hour ceiling.
     rust = Problem("p", "rust", "s", "main", [], 300.0)
     captured = {}
-    def fake_run_candidate(problem, source, inputs, *, workdir, timeout_s, binary=None, overflow_checks=True, mem_mb=4096, per_case_s=0.0):
-        captured["timeout_s"] = timeout_s; captured["n"] = len(inputs)
+    def fake_run_candidate(problem, source, inputs, *, workdir, timeout_s, binary=None, overflow_checks=True, mem_mb=4096, per_case_s=0.0, deadline_s=None):
+        captured["timeout_s"] = timeout_s; captured["n"] = len(inputs); captured["deadline_s"] = deadline_s
         return [V.CaseResult(True, output=str(i)) for i in inputs]
     monkeypatch.setattr(V, "run_candidate", fake_run_candidate)
     cases = [V.Case(str(i), str(i), "small") for i in range(200)]
     ev = V.differential(rust, "src", cases, "diff_small", workdir=str(tmp_path), timeout_s=60.0, binary="bin")
     assert ev.passed and captured["n"] == 200
     assert captured["timeout_s"] == pytest.approx(60.0 / 200)
+    assert captured["deadline_s"] is not None   # the divided per-case grant still needs a batch ceiling
 
 def test_behavior_rust_divides_timeout_by_case_count(tmp_path, monkeypatch):
     # C4 completion: behavior() calls run_candidate for up to 10 inputs, twice (plus a third for the
@@ -156,16 +157,17 @@ def test_behavior_rust_divides_timeout_by_case_count(tmp_path, monkeypatch):
     # same division differential() got, or 10 cases * 60s * 2 calls = 1200s against a 285s budget.
     rust = Problem("p", "rust", "s", "main", [], 300.0)
     captured = []
-    def fake_run_candidate(problem, source, inputs, *, workdir, timeout_s, binary=None, overflow_checks=True, mem_mb=4096, per_case_s=0.0):
-        captured.append((timeout_s, len(inputs)))
+    def fake_run_candidate(problem, source, inputs, *, workdir, timeout_s, binary=None, overflow_checks=True, mem_mb=4096, per_case_s=0.0, deadline_s=None):
+        captured.append((timeout_s, len(inputs), deadline_s))
         return [V.CaseResult(True, output=str(i)) for i in inputs]
     monkeypatch.setattr(V, "run_candidate", fake_run_candidate)
     cases = [V.Case(str(i), str(i), "small") for i in range(50)]
     ev = V.behavior(rust, "src", cases, workdir=str(tmp_path), timeout_s=60.0)
     assert ev.passed and captured
-    for timeout_s, n in captured:
+    for timeout_s, n, deadline_s in captured:
         assert n == 10   # behavior() only ever looks at cases[:10]
         assert timeout_s == pytest.approx(60.0 / 10)
+        assert deadline_s is not None
 
 def test_behavior_skips_on_zero_budget_instead_of_failing(tmp_path):
     cases = [V.Case((a, 1), a + 1, "small") for a in range(3)]

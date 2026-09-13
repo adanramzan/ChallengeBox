@@ -359,11 +359,17 @@ def compile_rust(source: str, *, overflow_checks: bool, workdir: str, timeout_s:
         return None, err if not r.timed_out else "rustc timed out"
     return binp, err
 
-def run_rust_cases(binary: str, stdins: list[str], *, timeout_s: float, mem_mb: int = 4096) -> list[CaseResult]:
+def run_rust_cases(binary: str, stdins: list[str], *, timeout_s: float, mem_mb: int = 4096, deadline_s: float | None = None) -> list[CaseResult]:
     binary = os.path.abspath(binary)   # cwd is derived from it below; a relative path would double
     out = []
     for s in stdins:
-        r = run_cmd([binary], stdin=s.encode("utf-8"), timeout_s=timeout_s, cwd=os.path.dirname(binary), mem_mb=mem_mb, max_output=50_000_000)
+        # One process per case means the real ceiling is timeout_s * len(stdins): a hung candidate
+        # on 200 cases burns 50s even when 10s remain. deadline_s (an absolute time.monotonic()) is
+        # the hard ceiling on the batch -- cases past it are reported timed out without running.
+        case_s = timeout_s if deadline_s is None else min(timeout_s, deadline_s - time.monotonic())
+        if case_s <= 0:
+            out.append(CaseResult(False, error="timeout", timed_out=True)); continue
+        r = run_cmd([binary], stdin=s.encode("utf-8"), timeout_s=case_s, cwd=os.path.dirname(binary), mem_mb=mem_mb, max_output=50_000_000)
         ok = r.returncode == 0 and not r.timed_out
         out.append(CaseResult(ok, r.stdout.decode("utf-8", "replace"), "" if ok else r.stderr.decode("utf-8", "replace")[-1500:], r.duration_s, False, r.timed_out))
     return out
