@@ -45,7 +45,12 @@ In `report.json`:
   input, or no budget left) is a real gap and still blocks it, same as any other skipped step. A
   `stress` entry whose `detail.degraded` is set means `gen_max` failed and the timing ran against
   the largest available `medium`-tier case instead — a weak, non-zero signal, not a real max-size
-  check; don't read that timing as proof the solution is fast at true maximum scale.
+  check; don't read that timing as proof the solution is fast at true maximum scale. A `diff_small`
+  or `diff_medium` entry gets a `detail.degraded` too when it agreed on fewer cases than
+  `[limits] min_cases_small` / `min_cases_medium` (the oracle's `gen()` mostly crashed, or its
+  `validate()` rejected most of what it generated). Any evidence carrying `detail.degraded` counts
+  exactly like a skipped one for the `passed_all_gates` decision, and shows as `degraded` rather
+  than `pass` in `benchmark.md`.
 - `diff_public` runs first among the gate's differential-style checks — right after compile, before
   `diff_edge`/`diff_small`/`diff_medium` — because `public_examples` (when the problem ships any) is
   the only evidence in the whole system that isn't manufactured by a model: real input/output pairs
@@ -108,11 +113,13 @@ Prices are whatever OpenRouter bills for these models at call time; the report r
 `usage.cost` on each response rather than keeping a local price table. OpenRouter includes `usage.cost`
 on every response by default now — the request body needs no extra parameter for this (the older
 `usage: {include: true}` flag is deprecated). The per-problem cost cap is
-`[limits] max_cost_usd_per_problem = 0.10` — the repair loop checks cumulative cost before each
-repair attempt and stops (emitting the best candidate so far) once the cap is reached.
+`[limits] max_cost_usd_per_problem = 0.10` — every optional model call (the oracle retry, the
+oracle self-repair, each repair attempt, and an adjudication regeneration) checks cumulative cost
+first via `Run.over_cost()` and is skipped once the cap is reached, emitting the best candidate so
+far. Only the three initial concurrent calls are unchecked — nothing has been spent yet.
 
 The three generate-phase calls (SOLVE, ORACLE, STRESS) each get `[phases] generate_call_share` (default
-`0.45`) of usable time — a real config knob, not a literal in `solve.py` — capped underneath by each
+`0.55`) of usable time — a real config knob, not a literal in `solve.py` — capped underneath by each
 role's own `timeout_cap_s` (`fast` is `150.0`, raised from a stale `110.0` so the measured 128 s oracle
 worst case is no longer clipped by the role cap; the share is what actually binds in practice). The
 ORACLE call writes the most output of the three (it defines `reference`, `gen`, *and* `validate`), so
