@@ -682,3 +682,13 @@ def test_an_ungated_second_attempt_is_never_a_full_pass(tmp_path):
     rep = S.solve(prob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert len(rep["evidence"]) == 2
     assert rep["status"] == "emitted_unverified"
+
+
+# --- round 8: prompt rules ---
+
+def test_oracle_prompt_ties_validate_and_gen_to_one_precondition_list(tmp_path):
+    # bench8: oracles whose validate() re-modelled the state more loosely than gen(), rejecting most
+    # of what they generated. Both must be written from the same list, and traced against each other.
+    rendered = S.render("oracle", **S.prompt_vars(prob(tmp_path)))
+    assert "`validate()` and `gen()` must agree" in rendered
+    assert "trace one `gen()` output through `validate()` by hand" in rendered

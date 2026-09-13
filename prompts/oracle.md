@@ -13,6 +13,8 @@ Also define `validate(...)`, taking exactly the same arguments as `reference` ab
 
 ## Generate only inputs the statement calls valid
 
+`validate()` and `gen()` must agree: every input `gen()` returns must make `validate()` return `True`. Write the precondition list once, write `validate()` from it first, then write `gen()` from the same list, and before answering trace one `gen()` output through `validate()` by hand. A `validate()` that models the state (which identifiers exist, what is currently open, what has been used) must apply every state change the statement describes — the most common failure is a `validate()` that forgets to record what an earlier operation created and then rejects every later reference to it.
+
 This is the most common way this task is failed, and an invalid input makes every later comparison meaningless. Before writing `gen`, list the preconditions the statement states — value ranges, distinctness, "must currently exist", "never appeared before", ordering, and any limit expressed against the current size or state — and honor every one.
 
 * Build operation sequences from a running model of the state, never by sampling blindly. At each step choose only from the operations that are legal in the state at that moment, apply the chosen one to your model, then choose the next. If nothing is legal, stop early and return a shorter input.
