@@ -48,9 +48,13 @@ In `report.json`:
   check; don't read that timing as proof the solution is fast at true maximum scale. A `diff_small`
   or `diff_medium` entry gets a `detail.degraded` too when it agreed on fewer cases than
   `[limits] min_cases_small` / `min_cases_medium` (the oracle's `gen()` mostly crashed, or its
-  `validate()` rejected most of what it generated). Any evidence carrying `detail.degraded` counts
-  exactly like a skipped one for the `passed_all_gates` decision, and shows as `degraded` rather
-  than `pass` in `benchmark.md`.
+  `validate()` rejected most of what it generated). Every `diff_*` entry gets one when the oracle was
+  regenerated mid-run and the replacement disagrees with the reference it replaced on more than
+  `[limits] oracle_regen_max_disagreement` (default `0.5`) of the old small inputs — two references
+  written from the same statement that disagree on most tiny inputs cannot both be near-correct, so
+  the run has no ground truth to have verified anything against. Any evidence carrying
+  `detail.degraded` counts exactly like a skipped one for the `passed_all_gates` decision, and shows
+  as `degraded` rather than `pass` in `benchmark.md`.
 - `diff_public` runs first among the gate's differential-style checks — right after compile, before
   `diff_edge`/`diff_small`/`diff_medium` — because `public_examples` (when the problem ships any) is
   the only evidence in the whole system that isn't manufactured by a model: real input/output pairs
@@ -114,6 +118,11 @@ Prices are whatever OpenRouter bills for these models at call time; the report r
 `price_out_per_m` and the client computes it — without those, cost reads $0 and the cap never fires. OpenRouter includes `usage.cost`
 on every response by default now — the request body needs no extra parameter for this (the older
 `usage: {include: true}` flag is deprecated). The per-problem cost cap is
+`[limits] max_consecutive_case_timeouts = 5` — the Python harness stops running a batch after this
+many consecutive per-case timeouts (`[limits] per_case_limit_s` each) and reports the rest as
+`skipped: batch abandoned ...`: a reference or candidate that times out on five small inputs in a row
+is dead, not slow. `0` disables it.
+
 `[limits] max_cost_usd_per_problem = 0.10` — every optional model call (the oracle retry, the
 oracle self-repair, each repair attempt, and an adjudication regeneration) checks cumulative cost
 first via `Run.over_cost()` and is skipped once the cap is reached, emitting the best candidate so
