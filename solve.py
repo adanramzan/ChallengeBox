@@ -215,12 +215,31 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     # through its OWN one-shot counter (gi.oracle_selfrepairs) so this can fire and the unrelated
     # adjudication regeneration (gi.oracle_regens, in the repair loop below) can still fire later in
     # the same run -- one broken-oracle recovery must never spend the other's budget.
-    if V.oracle_unusable(gi) and run.budget.can_afford(cfg["limits"]["oracle_selfrepair_afford_s"]) and not run.over_cost():
-        run.log(f"oracle.selfrepair triggered: no usable case in any tier; notes={'; '.join(gi.notes)[:300]}")
+    # Second trigger, same one-shot path: the oracle ran, but its own validate() threw out most of what
+    # its own gen() produced (30 of 32 small inputs on bench8/2beff58fa923). gen and validate are then
+    # two readings of the same preconditions and one of them is wrong, so the survivors are either too
+    # few to be coverage or inputs one half of the oracle calls illegal -- either way, rewriting both
+    # from one precondition list beats gating on them.
+    selfrepair_why = ""
+    if V.oracle_unusable(gi):
+        selfrepair_why = "no usable case in any tier"
+    elif gi.validate_reject_frac >= cfg["limits"]["validate_reject_frac_regen"]:
+        selfrepair_why = f"validate() rejected {gi.validate_reject_frac:.0%} of its own gen() inputs"
+    if selfrepair_why and run.budget.can_afford(cfg["limits"]["oracle_selfrepair_afford_s"]) and not run.over_cost():
+        run.log(f"oracle.selfrepair triggered: {selfrepair_why}; notes={'; '.join(gi.notes)[:300]}")
+        prev = gi
         try:
             gi = V.regenerate_oracle(run, gi, V.selfrepair_extra(gi), pv, counter="oracle_selfrepairs", workdir_tag="oracle_selfrepair")
         except Exception as e:
             run.log(f"oracle.selfrepair crashed {type(e).__name__}: {e}")
+        # Coming from the rejection trigger there was a working-but-inconsistent oracle to lose: keep it
+        # unless the replacement is actually better. (The crash trigger has nothing to fall back to.)
+        if prev.validate_reject_frac and gi is not prev and not gi.regen_failed \
+                and (V.oracle_unusable(gi) or gi.validate_reject_frac > prev.validate_reject_frac):
+            run.log(f"oracle.selfrepair kept the original oracle: regenerated reject_frac={gi.validate_reject_frac:.2f} small={len(gi.cases_small)}")
+            prev.notes.append("oracle self-repair discarded: the regenerated oracle rejected at least as much of its own gen() output")
+            prev.oracle_selfrepairs = gi.oracle_selfrepairs
+            gi = prev
     repairs = 0
     syntax_repairs = 0
     while run.cands:

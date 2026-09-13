@@ -7,7 +7,7 @@ def prob(tmp_path, lang="python"):
     return Problem("pid", lang, "Return a+b for ints a,b. At most 10^18.", "add" if lang == "python" else "main", [], 300.0)
 
 def cfg():
-    return {"limits": {"safety_margin_s": 15.0, "cases_small": 5, "cases_medium": 2, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0, "max_repairs": 2, "max_syntax_repairs": 2, "mem_mb": 2048, "shrink_budget_s": 1.0, "max_cost_usd_per_problem": 0.10, "oracle_retry_afford_s": 130.0, "repair_afford_s": 60.0, "oracle_selfrepair_afford_s": 130.0},
+    return {"limits": {"safety_margin_s": 15.0, "cases_small": 5, "cases_medium": 2, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0, "max_repairs": 2, "max_syntax_repairs": 2, "mem_mb": 2048, "shrink_budget_s": 1.0, "max_cost_usd_per_problem": 0.10, "oracle_retry_afford_s": 130.0, "repair_afford_s": 60.0, "oracle_selfrepair_afford_s": 130.0, "validate_reject_frac_regen": 0.5},
             "phases": {"generate_until": 0.32, "gate_until": 0.39, "repair_until": 0.81, "settle_until": 0.93, "generate_call_share": 0.45, "repair_call_share": 0.25}, "profile": "fake"}
 
 SOLVE_OK = "===RULES===\nr\n===END===\n===TRAPS===\nt\n===END===\n===ALGORITHM===\na\n===END===\n===CODE===\n```python\ndef add(a, b):\n    return a + b\n```\n===END===\n"
@@ -488,6 +488,24 @@ def test_oracle_selfrepair_triggers_once_and_recovers_with_good_oracle(tmp_path)
     evs = {e["kind"]: e for e in rep["evidence"][rep["final_candidate"]]}
     assert evs["diff_small"]["passed"] and not evs["diff_small"]["skipped"]
     assert evs["diff_medium"]["passed"] and not evs["diff_medium"]["skipped"]
+
+# Round 8: the oracle whose own validate() rejects most of its own gen() output. gen(seed) is (seed, 1)
+# and validate accepts only seed 0, so 4 of 5 small and 1 of 2 medium inputs are thrown away -- far
+# above validate_reject_frac_regen, and neither tier is "distrusted" (each keeps one input).
+ORACLE_REJECTS_ITS_OWN_GEN = ("===ORACLE===\ndef reference(a, b):\n    return a + b\n"
+                              "def gen(seed, mode):\n    return (seed, 1)\n"
+                              "def validate(a, b):\n    return a == 0\n===END===\n")
+
+def test_oracle_is_regenerated_when_validate_rejects_most_of_its_own_gen(tmp_path):
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_REJECTS_ITS_OWN_GEN, ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 1 and rep["oracle_regenerated"] == 0
+    assert len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 2   # exactly one extra call
+    oracle_prompts = [u for r, s_, u in llm.prompts if "===ORACLE===" in u]
+    assert "rejected" in oracle_prompts[1] and "(1, 1)" in oracle_prompts[1]   # counts and a rejected input
+    # the gate ran on the second oracle's cases (5 small / 2 medium), not the first's single survivor
+    assert rep["gate_inputs"]["small"] == 5 and rep["gate_inputs"]["medium"] == 2
+
 
 def test_oracle_selfrepair_and_adjudication_regen_counters_are_independent(tmp_path):
     # A broken oracle triggers self-repair first (recovering a usable-but-WRONG oracle), and that

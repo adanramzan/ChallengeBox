@@ -42,6 +42,14 @@ max_cost_usd_per_problem = 0.10
 # prose that disagree on more than half of tiny inputs cannot both be near-correct, so the run has no
 # ground truth; tuned against cases_small above (the cross-check reuses those inputs).
 oracle_regen_max_disagreement = 0.5
+# Fraction of its own gen() output that the oracle's validate() may reject (over the small and medium
+# tiers together) before the oracle is regenerated. When validate rejects at least this much, gen and
+# validate disagree about the statement's preconditions and one of them is wrong; regenerating both
+# from the same list is cheaper than gating on a handful of survivors or on inputs one side calls
+# invalid. Tuned against round 8, where four of ten runs shipped unverified on exactly this: 30 of 32
+# small inputs rejected (2beff58fa923), 163 of 200 small and 17 of 20 medium (5d02bd0e16ab), 46 of 55
+# (6eca8a9120e0) -- all far above half, while an honest validate drops a handful.
+validate_reject_frac_regen = 0.5
 
 # Minimum remaining budget (seconds) required before starting another ORACLE call after the first
 # one produced no ===ORACLE=== block (timeout or empty reply). Tuned to the measured worst-case

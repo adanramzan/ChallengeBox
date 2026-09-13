@@ -34,6 +34,8 @@ class GateInputs:
     stress_input: object = None
     stress_degraded: bool = False
     validate_trusted: bool = False   # the oracle's validate() accepted at least one generated input and was not distrusted
+    validate_reject_frac: float = 0.0   # rejected/checked over small+medium: how far the oracle's validate() and gen() disagree
+    validate_rejects: dict = field(default_factory=dict)   # tier -> (checked, rejected, up to two rejected inputs), for the self-repair prompt
     diff_degraded: str = ""   # why every diff_* evidence against this oracle is weaker than it looks (set by regenerate_oracle)
     oracle_src: str = ""
     oracle_regens: int = 0        # adjudication: repair blamed the oracle for a wrong answer
@@ -74,6 +76,7 @@ def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str
     t0 = time.monotonic()
     valid_inputs = inputs
     checked = invalid_dropped = 0
+    rejected_examples = []
     validation_skipped = ""
     if inputs:
         verdicts, validation_skipped = _validate_inputs(problem, oracle_src, inputs, workdir=os.path.join(workdir, "validate"),
@@ -83,12 +86,18 @@ def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str
             kept = [i for i, v in zip(inputs, verdicts) if v is True]
             if kept:
                 valid_inputs, invalid_dropped = kept, checked - len(kept)
+                # Kept for the self-repair prompt: telling the model *which* of its own generated
+                # inputs its own validate() threw out is the only concrete evidence of the
+                # disagreement between the two (see prepare_gate_inputs / selfrepair_extra).
+                rejected_examples = [i for i, v in zip(inputs, verdicts) if v is False][:2]
             else:
                 validation_skipped = "validate() rejected every input; distrusted, kept all"
     res = run_python_cases(oracle_src, "reference", [_ref_args(problem, i) for i in valid_inputs], workdir=workdir, timeout_s=timeout_s, per_case_s=per_case_s, max_consec_timeouts=max_consec_timeouts)
     cases = [Case(i, r.output, tag) for i, r in zip(valid_inputs, res) if r.ok]
     dropped = [r.error[-200:] for r in res if not r.ok]
     detail = {"dropped": len(dropped), "errors": dropped[:3], "checked": checked, "invalid_dropped": invalid_dropped}
+    if rejected_examples:
+        detail["rejected_examples"] = rejected_examples
     if validation_skipped:
         detail["validation_skipped"] = validation_skipped
     # Two independent signals that the oracle cannot parse this input format at all: its validate()
@@ -218,6 +227,10 @@ def _log_and_note_validation(gi: GateInputs, ev: Evidence, mode: str, log) -> No
     invalid = ev.detail.get("invalid_dropped", 0)
     skip = ev.detail.get("validation_skipped", "")
     log(f"oracle.{mode} cases={ev.cases} dropped={ev.detail['dropped']} invalid={invalid}" + (f" skip={skip}" if skip else ""))
+    # Only a validate() that actually ran and was not distrusted has a verdict worth counting; a tier
+    # where it was absent or rejected everything says nothing about gen/validate *disagreeing*.
+    if ev.detail.get("checked") and not skip:
+        gi.validate_rejects[mode] = (ev.detail["checked"], invalid, ev.detail.get("rejected_examples", []))
     if invalid:
         gi.notes.append(f"{mode}: dropped {invalid} of {ev.detail.get('checked', 0)} generated inputs as invalid (failed validate())")
     if ev.detail.get("unusable"):
@@ -290,9 +303,26 @@ def oracle_unusable(gi: GateInputs) -> bool:
     return not gi.cases_small and not gi.cases_medium
 
 def selfrepair_extra(gi: GateInputs) -> str:
-    """Extra context for regenerate_oracle when the oracle is being reissued because its own code
-    crashed rather than because a repair disputed one of its answers -- the failure notes collected
-    by prepare_gate_inputs (tracebacks from reference()/gen()) are the only evidence available."""
+    """Extra context for regenerate_oracle when the oracle is being reissued because of its own code
+    rather than because a repair disputed one of its answers. Two shapes, matching the two triggers in
+    solve(): the code crashed (the failure notes prepare_gate_inputs collected -- tracebacks from
+    reference()/gen() -- are the only evidence available), or validate() rejected most of what gen()
+    produced (the counts and a couple of the rejected inputs are the evidence). Never any candidate
+    material: the oracle is generated in its own context and never sees the candidate."""
+    if gi.validate_reject_frac and not oracle_unusable(gi):
+        gen_tiers = [v for t, v in gi.validate_rejects.items() if t in ("small", "medium")]
+        checked = sum(c for c, _, _ in gen_tiers)
+        rejected = sum(r for _, r, _ in gen_tiers)
+        examples = [e for _, _, ex in gen_tiers for e in ex][:2]
+        edge = gi.validate_rejects.get("edge")
+        independent = f" (and {edge[1]} of {edge[0]} inputs from an independent generator)" if edge else ""
+        shown = "\n".join(f"- {_fmt(e)}" for e in examples) or "(none captured)"
+        return (f"\n\nYour validate() rejected {rejected} of {checked} inputs that your own gen() produced"
+                f"{independent}. Both were written from the statement's preconditions, so at least one of them "
+                "misreads a precondition. Here are rejected inputs:\n"
+                f"{shown}\n"
+                "Re-list the preconditions from the statement, then write validate() and gen() from that one "
+                "list, and trace one gen() output through validate() before answering.\n")
     notes = "\n".join(f"- {n}" for n in gi.notes) or "(no details captured)"
     return ("\n\nYour previous reference()/gen()/validate() code crashed instead of running -- these "
             "are the actual errors your code produced when executed on real inputs. Fix these specific "
@@ -386,6 +416,15 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
             gi.notes.append("stress input degraded: no usable gen_max output, using largest medium case instead (not a true max-size input)")
     else:
         gi.notes.append("no stress source")
+    # How far the oracle's own validate() and gen() disagree about the statement's preconditions.
+    # Edge counts are recorded above but deliberately excluded here: those inputs come from the
+    # independent STRESS author, so they are corroboration, not evidence about this oracle's gen().
+    gen_tiers = [v for t, v in gi.validate_rejects.items() if t in ("small", "medium")]
+    checked = sum(c for c, _, _ in gen_tiers)
+    rejected = sum(r for _, r, _ in gen_tiers)
+    if checked and rejected:
+        gi.validate_reject_frac = rejected / checked
+        gi.notes.append(f"validate() rejected {rejected} of {checked} inputs its own gen() produced (small+medium)")
     return gi
 
 def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, mem_mb: int, degraded: bool = False) -> Evidence:
