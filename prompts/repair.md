@@ -53,3 +53,9 @@ Statement:
 Current solution:
 
 {{code}}
+
+Reference implementation — slow and literal by design, and written by a different model from the same
+statement; it may be the wrong one. Use it only to locate where the two readings of the statement
+diverge. Never copy its approach, its data structures, or its output into the solution.
+
+{{reference}}

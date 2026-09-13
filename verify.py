@@ -587,7 +587,8 @@ def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, 
     repair_cap = run.cfg["phases"]["repair_call_share"] * run.budget.usable_s
     r = run.chat("strong", "repair", repair_cap, kind=failed.kind, input=_fmt_typed(detail.get("input")), expected=_fmt_typed(detail.get("expected")),
                  actual=_fmt_typed(detail.get("actual")), details=_fmt({k: v for k, v in detail.items() if k not in ("input", "expected", "actual")}),
-                 code=_fmt(cand.source), previous_attempt=previous_attempt, agreement=agreement, **pv_repair)
+                 code=_fmt(cand.source), previous_attempt=previous_attempt, agreement=agreement,
+                 reference=_fmt(gi.oracle_src, 8000) if gi.oracle_src.strip() else "(no reference available)", **pv_repair)
     blocks = parse_blocks(r.text)
     verdict = "oracle" if blocks.get("VERDICT", "").strip().lower().startswith("oracle") else "candidate"
     run.log(f"repair.verdict={verdict}")

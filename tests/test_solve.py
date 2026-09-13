@@ -610,3 +610,11 @@ def test_repair_prompt_states_how_wholesale_the_disagreement_is(tmp_path):
     repair_prompt = next(u for r, s, u in llm.prompts if "Failure kind" in u)
     assert re.search(r"disagrees with the reference on \d+ of \d+ (small|edge) inputs", repair_prompt)
     assert "{{agreement}}" not in repair_prompt
+
+def test_repair_prompt_shows_the_reference_it_is_asked_to_judge(tmp_path):
+    # repair.md asks the model to trace what the reference would produce, so it has to see it.
+    llm = FakeLLM({"solve": [BUGGY], "repair": [REPAIR_FIX], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    repair_prompt = next(u for r, s, u in llm.prompts if "Failure kind" in u)
+    assert "def reference(a, b):" in repair_prompt and "Reference implementation" in repair_prompt
+    assert "{{reference}}" not in repair_prompt
