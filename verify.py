@@ -2,7 +2,7 @@
 from __future__ import annotations
 import difflib, os, re, time
 from dataclasses import dataclass, field
-from sandbox import CaseResult, run_python_cases, compile_rust, run_rust_cases, tokens
+from sandbox import CaseResult, run_python_cases, compile_rust, compile_rust_with_imports, run_rust_cases, tokens
 from llm import parse_blocks
 
 # Prepended to every generated oracle/stress source before it runs. The oracle prompt tells the
@@ -464,8 +464,15 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
     ev: list[Evidence] = []
     binary = None
     if problem.language == "rust":
-        t0 = time.monotonic(); binary, err = compile_rust(source, overflow_checks=True, workdir=workdir, timeout_s=budget.step_timeout(90.0))
-        ev.append(Evidence("compile", binary is not None, 0, time.monotonic() - t0, {"stderr": err[-1500:]}))
+        t0 = time.monotonic(); binary, err, fixed = compile_rust_with_imports(source, overflow_checks=True, workdir=workdir, timeout_s=budget.step_timeout(90.0))
+        detail = {"stderr": err[-1500:]}
+        if fixed != source:
+            # rustc named the missing `use` and the retry compiled: every later step -- stress's
+            # unchecked rebuild included -- and the emitted solution must be this patched source, so
+            # it travels back to solve() in the evidence.
+            detail["patched_source"] = fixed
+            source = fixed
+        ev.append(Evidence("compile", binary is not None, 0, time.monotonic() - t0, detail))
         if binary is None: return ev
     else:
         e = python_import_check(source, problem.entrypoint, gi, workdir=os.path.join(workdir, "compile"), timeout_s=budget.step_timeout(30.0, reserve_s=20.0), mem_mb=limits["mem_mb"])

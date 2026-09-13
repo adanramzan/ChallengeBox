@@ -1,6 +1,6 @@
 import os, sys, time, ast, pytest, shutil
 import sandbox
-from sandbox import run_cmd, run_python_cases, python_static, Problem, rust_static, compile_rust, run_rust_cases, tokens, _PY_HARNESS, PYTHON
+from sandbox import run_cmd, run_python_cases, python_static, Problem, rust_static, compile_rust, compile_rust_with_imports, run_rust_cases, tokens, _PY_HARNESS, PYTHON
 
 ALLOWED_OS_INJECTED = {"__CF_USER_TEXT_ENCODING"}  # macOS injects this into every child; not inherited from our env dict
 
@@ -325,3 +325,21 @@ def test_per_case_limit_cannot_be_swallowed_by_the_candidate(tmp_path):
 def test_per_case_limit_off_by_default(tmp_path):
     res = run_python_cases("def f(x):\n    return x\n", "f", [(1,)], timeout_s=10, workdir=str(tmp_path))
     assert res[0].ok and res[0].output == 1
+
+
+# --- round 6: rustc names the missing import; harvest it and retry once, for zero model tokens ---
+
+RS_MISSING_USE = 'fn main(){let mut s=String::new();std::io::stdin().read_to_string(&mut s).unwrap();print!("{}",s.trim());}\n'
+
+@needs_rustc
+def test_compile_rust_retries_with_the_import_rustc_suggested(tmp_path):
+    assert compile_rust(RS_MISSING_USE, overflow_checks=True, workdir=str(tmp_path / "a"))[0] is None
+    binp, err, fixed = compile_rust_with_imports(RS_MISSING_USE, overflow_checks=True, workdir=str(tmp_path / "b"))
+    assert binp is not None, err
+    assert fixed.startswith("use std::io::Read;") and "added missing imports" in err
+    assert [tokens(r.output) for r in run_rust_cases(binp, ["7\n"], timeout_s=5)] == [["7"]]
+
+@needs_rustc
+def test_compile_rust_with_imports_leaves_a_real_error_alone(tmp_path):
+    binp, err, fixed = compile_rust_with_imports("fn main(){ let x: i32 = \"s\"; }", overflow_checks=True, workdir=str(tmp_path))
+    assert binp is None and fixed == "fn main(){ let x: i32 = \"s\"; }" and "mismatched types" in err

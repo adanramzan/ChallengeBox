@@ -233,6 +233,13 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         try:
             if len(cand.evidence) == 1 and cand.evidence[0].passed:
                 cand.evidence = [cand.evidence[0]] + V.run_gate(problem, cand.source, gi, workdir=os.path.join(run_dir, cand.id), budget=run.budget, limits=cfg["limits"], log=run.log)
+                # The Rust compile step may have added the imports rustc asked for; the gate ran that
+                # patched source, so it is the one that must be emitted and re-gated from here on.
+                patched = next((e.detail["patched_source"] for e in cand.evidence if "patched_source" in e.detail), None)
+                if patched:
+                    cand.source = patched
+                    with open(os.path.join(run.dir, "candidates", f"{cand.id}.{run.ext()}"), "w", encoding="utf-8") as f: f.write(patched)
+                    run.log(f"candidate.imports_added id={cand.id}")
             if cand.all_passed():
                 # "static"/"compile" are pre-flight checks, not verification against the oracle; if
                 # everything past them was skipped, nothing was actually checked -- don't log this as

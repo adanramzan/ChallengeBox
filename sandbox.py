@@ -359,6 +359,40 @@ def compile_rust(source: str, *, overflow_checks: bool, workdir: str, timeout_s:
         return None, err if not r.timed_out else "rustc timed out"
     return binp, err
 
+# rustc prints a suggested import either as a numbered insertion inside a help block
+# ("1 + use std::io::Read;") or inline in backticks ("= help: ... `use std::io::Read;`").
+_RUST_USE_SUGGESTION = re.compile(r"^\s*\d+\s*\+\s*(use\s+[^;\n]+;)|`(use\s+[^;\n]+;)`", re.M)
+
+def rust_missing_imports(stderr: str, source: str) -> list[str]:
+    """The `use ...;` lines rustc itself suggested, minus any the source already has."""
+    src = re.sub(r"\s+", " ", source)
+    out: list[str] = []
+    for m in _RUST_USE_SUGGESTION.finditer(stderr):
+        u = re.sub(r"\s+", " ", m.group(1) or m.group(2)).strip()
+        if u not in src and u not in out:
+            out.append(u)
+    return out[:5]
+
+def compile_rust_with_imports(source: str, *, overflow_checks: bool, workdir: str, timeout_s: float = 90.0) -> tuple[str | None, str, str]:
+    """compile_rust, plus one retry with the imports rustc asked for. Two benchmark runs in a row
+    lost a Rust candidate to nothing but a missing `use std::io::Read;`, which rustc names in its own
+    help block -- harvesting it costs zero model tokens and one extra compile.
+
+    Returns (binary, stderr, source_actually_compiled). The caller MUST keep the third value as the
+    candidate's source: it is what the returned binary was built from, and what every later step
+    (stress's unchecked rebuild, the emitted solution) has to use."""
+    binary, err = compile_rust(source, overflow_checks=overflow_checks, workdir=workdir, timeout_s=timeout_s)
+    if binary is not None:
+        return binary, err, source
+    uses = rust_missing_imports(err, source)
+    if not uses:
+        return None, err, source
+    patched = "".join(u + "\n" for u in uses) + source
+    binary2, err2 = compile_rust(patched, overflow_checks=overflow_checks, workdir=workdir, timeout_s=timeout_s)
+    if binary2 is None:
+        return None, err, source
+    return binary2, "added missing imports: " + " ".join(uses) + "\n" + err2, patched
+
 def run_rust_cases(binary: str, stdins: list[str], *, timeout_s: float, mem_mb: int = 4096, deadline_s: float | None = None) -> list[CaseResult]:
     binary = os.path.abspath(binary)   # cwd is derived from it below; a relative path would double
     out = []
