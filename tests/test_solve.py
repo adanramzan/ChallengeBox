@@ -38,6 +38,16 @@ def test_broken_oracle_and_no_stress_emits_unverified_not_passed(tmp_path):
     assert all(e["passed"] for e in evs)
     assert any(e.get("skipped") for e in evs)
 
+def test_degraded_stress_evidence_is_not_a_full_pass(tmp_path):
+    # gen_max crashes -> stress falls back to the largest medium case and marks itself degraded.
+    # Every gate step still "passes", but the max-size check never really happened.
+    STRESS_NO_GENMAX = "===STRESS===\ndef gen_max(seed):\n    raise RuntimeError('boom')\nEDGES = [(0, 0)]\n===END===\n"
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_NO_GENMAX]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
+    assert ev["stress"]["passed"] and ev["stress"]["detail"].get("degraded")
+    assert rep["status"] == "emitted_unverified"
+
 def test_static_failure_repair_reaches_cap_and_emits_best(tmp_path):
     # each scripted repair reply is genuinely repair-shaped (VERDICT + CODE) and produces DIFFERENT
     # source each time, so the loop keeps making progress and burns both repair attempts (max_repairs=2)

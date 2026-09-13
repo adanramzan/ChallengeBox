@@ -272,7 +272,10 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         # the check is definitionally not applicable, not a coverage gap -- and must not by itself
         # demote a fully-passing Python run out of "passed_all_gates". A skipped overflow check on a
         # Rust candidate (no stress input / no budget) is a real gap and still counts.
-        skipped = any(e.skipped for e in best.evidence if not (e.kind == "overflow" and problem.language == "python"))
+        # Evidence carrying detail["degraded"] (a stress input that is not really max-size, a tier
+        # with far too few cases) passed against weaker input than the gate claims to check, so it
+        # is not full evidence either -- count it exactly like a skip.
+        skipped = any(e.skipped or e.detail.get("degraded") for e in best.evidence if not (e.kind == "overflow" and problem.language == "python"))
         status = ("passed_all_gates" if best.all_passed() and not skipped
                   else "emitted_unverified" if best.all_passed() else "emitted_with_failures")
         run.log(f"emit candidate={best.id} status={status}")
@@ -304,7 +307,7 @@ def bench(sample_dir: str, out_dir: str, cfg: dict, llm, deadline_scale: float) 
                 p = Problem.load(os.path.join(sample_dir, name)); pid = p.problem_id[:12]
                 rep = solve(p, llm, cfg, out_path=os.path.join(out_dir, f"{pid}.{'py' if p.language == 'python' else 'rs'}"), run_dir=os.path.join(out_dir, pid), deadline_scale=deadline_scale)
                 ev = {e["kind"]: e for e in rep["evidence"].get(rep["final_candidate"] or "", [])}
-                mark = lambda k: "n/a" if k not in ev else "skip" if ev[k].get("skipped") else ("pass" if ev[k]["passed"] else "FAIL")
+                mark = lambda k: "n/a" if k not in ev else "skip" if ev[k].get("skipped") else "FAIL" if not ev[k]["passed"] else ("degraded" if (ev[k].get("detail") or {}).get("degraded") else "pass")
                 rows.append({"id": pid, "lang": p.language, "compiles": mark("compile"), "public": mark("diff_public"), "edge": mark("diff_edge"), "small": mark("diff_small"),
                              "medium": mark("diff_medium"), "behavior": mark("behavior"), "stress": mark("stress"), "overflow": mark("overflow"), "repairs": rep["repairs"], "syntax_repairs": rep["syntax_repairs"], "calls": len(rep["calls"]),
                              "tokens": f"{rep['token_usage']['prompt']}/{rep['token_usage']['completion']}", "elapsed": rep["elapsed_s"], "cost": rep["cost_usd"], "status": rep["status"]})
