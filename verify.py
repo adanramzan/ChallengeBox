@@ -39,7 +39,6 @@ class GateInputs:
     oracle_selfrepairs: int = 0   # this module noticed its own oracle crashed and produced zero usable cases
     notes: list = field(default_factory=list)
     regressions: list = field(default_factory=list)
-    dispute_trace: str = ""
     regen_failed: bool = False
     def summary(self) -> dict:
         return {"small": len(self.cases_small), "medium": len(self.cases_medium), "edge": len(self.cases_edge),
@@ -284,12 +283,17 @@ def selfrepair_extra(gi: GateInputs) -> str:
 
 def dispute_extra(gi: GateInputs, failed: Evidence) -> str:
     """Extra context for regenerate_oracle when a repair call adjudicated candidate vs. oracle and
-    blamed the oracle for a wrong answer on a specific input."""
-    extra = ("\n\nA previous reference was judged WRONG on this input; re-read the statement and follow it literally here:\n"
-             f"Input: {_fmt(failed.detail.get('input'))}\nPrevious (wrong) expected: {_fmt(failed.detail.get('expected'))}\n")
-    if gi.dispute_trace:
-        extra += f"A solver hand-traced the statement on this input and concluded the previous reference was wrong. Its trace:\n{gi.dispute_trace}\n"
-    return extra
+    blamed the oracle for a wrong answer on a specific input.
+
+    It carries the disputed input and what the current reference answered on it -- and nothing else.
+    It used to append the repair model's own prose about the candidate, which is the candidate
+    leaking into the oracle's context: on runs/bench6/1dea32802072 the regenerated oracle inherited
+    the candidate's exact bug and agreed with it on 4000/4000 inputs, while the original oracle had
+    been right. The oracle is generated in its own context and never sees the candidate."""
+    return ("\n\nA previous reference produced this output on this input:\n"
+            f"Input: {_fmt(failed.detail.get('input'))}\nPrevious reference output: {_fmt(failed.detail.get('expected'))}\n"
+            "An independent review believes the reference's output on this input does not follow the statement. "
+            "Re-derive the expected output from the statement alone, sentence by sentence, before writing the new reference.\n")
 
 def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict, *, workdir: str, budget, log) -> GateInputs:
     gi = GateInputs(oracle_src=oracle_src)
@@ -508,8 +512,6 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
     ev.append(eo); log(f"gate.overflow passed={eo.passed} skipped={eo.skipped}")
     return ev
 
-_BLOCKS_RE = re.compile(r"===[A-Z_]+===.*?(===END===|\Z)", re.S)
-
 def _fmt(v, limit: int = 4000) -> str:
     s = repr(v) if not isinstance(v, str) else v
     return s if len(s) <= limit else s[:limit] + " ...[truncated]"
@@ -560,8 +562,6 @@ def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, 
                  actual=_fmt_typed(detail.get("actual")), details=_fmt({k: v for k, v in detail.items() if k not in ("input", "expected", "actual")}),
                  code=_fmt(cand.source), previous_attempt=previous_attempt, **pv_repair)
     blocks = parse_blocks(r.text)
-    trace = _BLOCKS_RE.sub("", r.text).strip()
-    gi.dispute_trace = _fmt(trace)
     verdict = "oracle" if blocks.get("VERDICT", "").strip().lower().startswith("oracle") else "candidate"
     run.log(f"repair.verdict={verdict}")
     return blocks.get("CODE", ""), verdict
@@ -601,7 +601,7 @@ def regenerate_oracle(run, gi: GateInputs, extra: str, pv: dict, *, counter: str
     new.stress_input, new.cases_edge, new.regressions = gi.stress_input, gi.cases_edge, []
     new.oracle_regens, new.oracle_selfrepairs = gi.oracle_regens, gi.oracle_selfrepairs
     setattr(new, counter, getattr(new, counter) + 1)
-    new.dispute_trace, new.regen_failed = "", False
+    new.regen_failed = False
     # re-derive edge expectations with the new reference
     if gi.cases_edge:
         new.cases_edge, _ = make_cases(run.p, new.oracle_src, [c.input for c in gi.cases_edge], "edge", workdir=os.path.join(run.dir, workdir_tag, "edge"), timeout_s=run.budget.step_timeout(30.0))
