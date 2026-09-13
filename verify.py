@@ -56,7 +56,7 @@ def _ref_args(problem, inp) -> tuple:
         return (inp,)
     return tuple(inp) if isinstance(inp, (tuple, list)) else (inp,)
 
-def _validate_inputs(problem, oracle_src: str, inputs: list, *, workdir: str, timeout_s: float, per_case_s: float = 0.0) -> tuple[list | None, str]:
+def _validate_inputs(problem, oracle_src: str, inputs: list, *, workdir: str, timeout_s: float, per_case_s: float = 0.0, max_consec_timeouts: int = 0) -> tuple[list | None, str]:
     """Run the oracle's own validate() over `inputs` in the sandbox -- the single place any input the
     gate will use is checked against the statement's preconditions. Returns (verdicts, absent_reason):
     verdicts[i] is True (accepted), False (rejected) or None (validate crashed or timed out on that
@@ -65,19 +65,19 @@ def _validate_inputs(problem, oracle_src: str, inputs: list, *, workdir: str, ti
     Policy is the caller's: make_cases drops a rejected input and distrusts a validate that rejected a
     whole tier, while the stress and shrink paths keep an input validate could not judge."""
     res = run_python_cases(oracle_src, "validate", [_ref_args(problem, i) for i in inputs],
-                           workdir=workdir, timeout_s=timeout_s, per_case_s=per_case_s)
+                           workdir=workdir, timeout_s=timeout_s, per_case_s=per_case_s, max_consec_timeouts=max_consec_timeouts)
     if res and res[0].error.startswith("IMPORT:"):
         return None, "no validate() defined in oracle"
     return [(r.output is True) if r.ok else None for r in res], ""
 
-def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str, timeout_s: float, per_case_s: float = 0.0) -> tuple[list[Case], Evidence]:
+def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str, timeout_s: float, per_case_s: float = 0.0, max_consec_timeouts: int = 0) -> tuple[list[Case], Evidence]:
     t0 = time.monotonic()
     valid_inputs = inputs
     checked = invalid_dropped = 0
     validation_skipped = ""
     if inputs:
         verdicts, validation_skipped = _validate_inputs(problem, oracle_src, inputs, workdir=os.path.join(workdir, "validate"),
-                                                        timeout_s=timeout_s, per_case_s=per_case_s)
+                                                        timeout_s=timeout_s, per_case_s=per_case_s, max_consec_timeouts=max_consec_timeouts)
         if verdicts is not None:
             checked = len(inputs)
             kept = [i for i, v in zip(inputs, verdicts) if v is True]
@@ -85,7 +85,7 @@ def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str
                 valid_inputs, invalid_dropped = kept, checked - len(kept)
             else:
                 validation_skipped = "validate() rejected every input; distrusted, kept all"
-    res = run_python_cases(oracle_src, "reference", [_ref_args(problem, i) for i in valid_inputs], workdir=workdir, timeout_s=timeout_s, per_case_s=per_case_s)
+    res = run_python_cases(oracle_src, "reference", [_ref_args(problem, i) for i in valid_inputs], workdir=workdir, timeout_s=timeout_s, per_case_s=per_case_s, max_consec_timeouts=max_consec_timeouts)
     cases = [Case(i, r.output, tag) for i, r in zip(valid_inputs, res) if r.ok]
     dropped = [r.error[-200:] for r in res if not r.ok]
     detail = {"dropped": len(dropped), "errors": dropped[:3], "checked": checked, "invalid_dropped": invalid_dropped}
@@ -93,9 +93,9 @@ def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str
         detail["validation_skipped"] = validation_skipped
     return cases, Evidence(f"oracle_{tag}", bool(cases), len(cases), time.monotonic() - t0, detail)
 
-def run_candidate(problem, source: str, inputs: list, *, workdir: str, timeout_s: float, binary: str | None = None, overflow_checks: bool = True, mem_mb: int = 4096, per_case_s: float = 0.0, deadline_s: float | None = None) -> list[CaseResult]:
+def run_candidate(problem, source: str, inputs: list, *, workdir: str, timeout_s: float, binary: str | None = None, overflow_checks: bool = True, mem_mb: int = 4096, per_case_s: float = 0.0, deadline_s: float | None = None, max_consec_timeouts: int = 0) -> list[CaseResult]:
     if problem.language == "python":
-        return run_python_cases(source, problem.entrypoint, [tuple(i) if isinstance(i, (tuple, list)) else (i,) for i in inputs], timeout_s=timeout_s, workdir=workdir, mem_mb=mem_mb, per_case_s=per_case_s)
+        return run_python_cases(source, problem.entrypoint, [tuple(i) if isinstance(i, (tuple, list)) else (i,) for i in inputs], timeout_s=timeout_s, workdir=workdir, mem_mb=mem_mb, per_case_s=per_case_s, max_consec_timeouts=max_consec_timeouts)
     if binary is None:
         binary, err = compile_rust(source, overflow_checks=overflow_checks, workdir=workdir)
         if binary is None:
@@ -120,7 +120,7 @@ def _actual_for_report(r: CaseResult):
     last = [l for l in (r.error or "").strip().splitlines() if l.strip()][-2:]
     return "(no answer: crashed before completing) " + " | ".join(last) if last else "(no answer: crashed before completing)"
 
-def differential(problem, source: str, cases: list[Case], kind: str, *, workdir: str, timeout_s: float, binary: str | None = None, mem_mb: int = 4096, per_case_s: float = 0.0) -> Evidence:
+def differential(problem, source: str, cases: list[Case], kind: str, *, workdir: str, timeout_s: float, binary: str | None = None, mem_mb: int = 4096, per_case_s: float = 0.0, max_consec_timeouts: int = 0) -> Evidence:
     t0 = time.monotonic()
     if not cases:
         return Evidence(kind, True, 0, 0.0, {"skipped": "no cases"}, skipped=True)
@@ -133,7 +133,7 @@ def differential(problem, source: str, cases: list[Case], kind: str, *, workdir:
     # so a hung candidate cannot turn timeout_s into timeout_s * len(cases) of wall clock.
     case_timeout = timeout_s if problem.language == "python" else max(0.25, timeout_s / max(1, len(cases)))
     dl = None if problem.language == "python" else time.monotonic() + timeout_s
-    res = run_candidate(problem, source, [c.input for c in cases], workdir=workdir, timeout_s=case_timeout, binary=binary, mem_mb=mem_mb, per_case_s=per_case_s, deadline_s=dl)
+    res = run_candidate(problem, source, [c.input for c in cases], workdir=workdir, timeout_s=case_timeout, binary=binary, mem_mb=mem_mb, per_case_s=per_case_s, deadline_s=dl, max_consec_timeouts=max_consec_timeouts)
     # The batch already ran, so counting every mismatch is free -- and the count is what tells the
     # repair model whether it is looking at a boundary bug (a few cases) or two different readings of
     # the statement (most of them). Reporting only the first mismatch discarded that for nothing.
@@ -317,7 +317,8 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
         inputs = [r.output for r in gen if r.ok]
         if not inputs:
             gi.notes.append(f"gen({mode}) produced nothing: {(gen[0].error if gen else '')[-200:]}"); continue
-        cases, ev = make_cases(problem, oracle_src, inputs, mode, workdir=os.path.join(workdir, f"ref_{mode}"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), per_case_s=limits.get("per_case_limit_s", 0.0))
+        cases, ev = make_cases(problem, oracle_src, inputs, mode, workdir=os.path.join(workdir, f"ref_{mode}"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0),
+                               per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
         if not cases: gi.notes.append(f"reference failed on all {mode} inputs: {ev.detail['errors']}")
         # "Trusted" = this validate() actually ran and accepted something in at least one tier, so a
         # False from it elsewhere (the stress input, a shrunk input) is a real precondition violation
@@ -330,7 +331,8 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
         edges = run_python_cases(stress_src + "\ndef _edges():\n    return list(EDGES)\n", "_edges", [()], workdir=os.path.join(workdir, "edges"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         if edges and edges[0].ok and isinstance(edges[0].output, list):
             cleaned_edges = [_clean_stdin(problem, s) for s in edges[0].output]
-            gi.cases_edge, ev = make_cases(problem, oracle_src, cleaned_edges, "edge", workdir=os.path.join(workdir, "ref_edge"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), per_case_s=limits.get("per_case_limit_s", 0.0))
+            gi.cases_edge, ev = make_cases(problem, oracle_src, cleaned_edges, "edge", workdir=os.path.join(workdir, "ref_edge"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0),
+                                           per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
             _log_and_note_validation(gi, ev, "edge", log)
         mx = run_python_cases(stress_src, "gen_max", [(1,)], workdir=os.path.join(workdir, "genmax"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         if mx and mx[0].ok:
@@ -483,7 +485,8 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
     # trustworthy evidence available. Absent entirely (the common case), this step is not added at
     # all, so behavior is exactly what it was before this existed.
     if gi.cases_public:
-        e = differential(problem, source, gi.cases_public, "diff_public", workdir=os.path.join(workdir, "diff_public"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"], per_case_s=limits.get("per_case_limit_s", 0.0))
+        e = differential(problem, source, gi.cases_public, "diff_public", workdir=os.path.join(workdir, "diff_public"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"],
+                         per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
         if gi.public_disagreements:
             e.detail = {**e.detail, "oracle_disagreements": gi.public_disagreements}
         if gi.diff_degraded:
@@ -491,7 +494,8 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         ev.append(e); log(f"gate.diff_public passed={e.passed} cases={e.cases}")
         if not e.passed: return ev
     for kind, cases in (("diff_edge", gi.regressions + gi.cases_edge), ("diff_small", gi.cases_small), ("diff_medium", gi.cases_medium)):
-        e = differential(problem, source, cases, kind, workdir=os.path.join(workdir, kind), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"], per_case_s=limits.get("per_case_limit_s", 0.0))
+        e = differential(problem, source, cases, kind, workdir=os.path.join(workdir, kind), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"],
+                         per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
         # A generated tier that agreed on a handful of cases is thin evidence, not coverage: the
         # oracle's gen() mostly crashed or its validate() rejected most of what it produced. Mark it
         # degraded (solve() then demotes the status); an empty tier is already `skipped`.

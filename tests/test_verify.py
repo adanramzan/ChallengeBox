@@ -141,7 +141,7 @@ def test_differential_rust_divides_timeout_by_case_count(tmp_path, monkeypatch):
     # cases before reaching it, or a 200-case differential with a 60s cap has a 3-hour ceiling.
     rust = Problem("p", "rust", "s", "main", [], 300.0)
     captured = {}
-    def fake_run_candidate(problem, source, inputs, *, workdir, timeout_s, binary=None, overflow_checks=True, mem_mb=4096, per_case_s=0.0, deadline_s=None):
+    def fake_run_candidate(problem, source, inputs, *, workdir, timeout_s, binary=None, overflow_checks=True, mem_mb=4096, per_case_s=0.0, deadline_s=None, max_consec_timeouts=0):
         captured["timeout_s"] = timeout_s; captured["n"] = len(inputs); captured["deadline_s"] = deadline_s
         return [V.CaseResult(True, output=str(i)) for i in inputs]
     monkeypatch.setattr(V, "run_candidate", fake_run_candidate)

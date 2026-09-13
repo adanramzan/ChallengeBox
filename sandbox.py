@@ -113,6 +113,12 @@ except Exception:
 # every later case is reported as a timeout it never got to run -- and the caller waits the full
 # grant to learn a verdict the first case already settled. 0 disables.
 PER_CASE = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
+# Consecutive per-case timeouts after which the rest of the batch is skipped unrun. A function that
+# times out on N small inputs in a row is dead, not slow, and every further case costs the full
+# per-case limit for nothing. 0 disables.
+MAX_CONSEC = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+consec = 0
+abandoned = ""
 class _CaseTimeout(BaseException): pass   # BaseException, not Exception: a candidate's `except Exception:` must not be able to swallow its own wall limit
 def _on_alarm(sig, frame): raise _CaseTimeout()
 if PER_CASE > 0: signal.signal(signal.SIGALRM, _on_alarm)
@@ -120,6 +126,9 @@ if PER_CASE > 0: signal.signal(signal.SIGALRM, _on_alarm)
 for line in open(sys.argv[3], encoding="utf-8"):
     line = line.rstrip("\n")
     if not line: continue
+    if abandoned:
+        print(repr({"ok": False, "output": None, "error": abandoned, "duration_s": 0.0, "mutated": False}), flush=True)
+        continue
     t0 = time.perf_counter()
     try:
         args = ast.literal_eval(line); before = copy.deepcopy(args)
@@ -127,8 +136,14 @@ for line in open(sys.argv[3], encoding="utf-8"):
         out = fn(*args); ok = True; err = ""
     except _CaseTimeout:
         args = before = None; out = None; ok = False; err = "case exceeded per-case limit of %gs" % PER_CASE
+        consec += 1
+        if MAX_CONSEC > 0 and consec >= MAX_CONSEC:
+            abandoned = "skipped: batch abandoned after %d consecutive per-case timeouts" % MAX_CONSEC
     except BaseException:
         args = before = None; out = None; ok = False; err = traceback.format_exc()[-1500:]
+        consec = 0
+    else:
+        consec = 0
     finally:
         if PER_CASE > 0: signal.setitimer(signal.ITIMER_REAL, 0)
     dt = time.perf_counter() - t0
@@ -147,7 +162,7 @@ for line in open(sys.argv[3], encoding="utf-8"):
     print(line, flush=True)
 '''
 
-def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, timeout_s: float, workdir: str, mem_mb: int = 4096, per_case_s: float = 0.0) -> list[CaseResult]:
+def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, timeout_s: float, workdir: str, mem_mb: int = 4096, per_case_s: float = 0.0, max_consec_timeouts: int = 0) -> list[CaseResult]:
     # run_cmd sets cwd=workdir, so every path handed to the child must be absolute: a relative
     # workdir would otherwise be resolved a second time against itself and double the path.
     workdir = os.path.abspath(workdir)
@@ -157,7 +172,7 @@ def run_python_cases(source: str, entrypoint: str, args_list: list[tuple], *, ti
     with open(harness, "w", encoding="utf-8") as f: f.write(_PY_HARNESS)
     with open(cases, "w", encoding="utf-8") as f:
         for a in args_list: f.write(repr(tuple(a)) + "\n")
-    r = run_cmd([PYTHON, harness, cand, entrypoint, cases, repr(float(per_case_s))], timeout_s=timeout_s, cwd=workdir, max_output=50_000_000, mem_mb=mem_mb)
+    r = run_cmd([PYTHON, harness, cand, entrypoint, cases, repr(float(per_case_s)), str(int(max_consec_timeouts))], timeout_s=timeout_s, cwd=workdir, max_output=50_000_000, mem_mb=mem_mb)
     results: list[CaseResult] = []
     for line in r.stdout.decode("utf-8", "replace").splitlines():
         try:

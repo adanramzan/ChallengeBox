@@ -29,6 +29,12 @@ mem_mb = 4096
 # same batch hung -- three times over, 159s of a 265s run. Keep it well above a legitimate case
 # (tiny edge/small fixtures finish in milliseconds) and well below the batch grant.
 per_case_limit_s = 10.0
+# Consecutive per-case timeouts after which the python harness stops running a batch and reports the
+# rest as skipped. A reference or candidate that times out on five small inputs in a row is dead, not
+# slow, and every further case would cost the full per_case_limit_s above for nothing: on 6eca8a9120e0
+# the oracle's reference() timed out on 40 of 92 SMALL inputs (sizes <= 6), burned the batch's whole
+# 60 s grant, left 5 usable cases, and the gate started at 244 s of 285. Tuned against per_case_limit_s.
+max_consecutive_case_timeouts = 5
 shrink_budget_s = 3.0
 max_cost_usd_per_problem = 0.10
 # Fraction of the old small inputs on which a REGENERATED oracle may disagree with the oracle it

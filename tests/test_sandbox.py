@@ -343,3 +343,24 @@ def test_compile_rust_retries_with_the_import_rustc_suggested(tmp_path):
 def test_compile_rust_with_imports_leaves_a_real_error_alone(tmp_path):
     binp, err, fixed = compile_rust_with_imports("fn main(){ let x: i32 = \"s\"; }", overflow_checks=True, workdir=str(tmp_path))
     assert binp is None and fixed == "fn main(){ let x: i32 = \"s\"; }" and "mismatched types" in err
+
+
+def test_batch_is_abandoned_after_n_consecutive_per_case_timeouts(tmp_path):
+    # A reference that times out on five small inputs in a row is dead, not slow: running the rest
+    # costs the full per-case limit each for nothing (6eca8a9120e0 burned a 60s grant this way).
+    hangs = "def f(n):\n    while True:\n        pass\n"
+    t0 = time.monotonic()
+    res = run_python_cases(hangs, "f", [(i,) for i in range(20)], timeout_s=30, workdir=str(tmp_path),
+                           per_case_s=0.2, max_consec_timeouts=3)
+    assert time.monotonic() - t0 < 2.0
+    assert len(res) == 20
+    assert all("per-case limit" in r.error for r in res[:3])
+    assert all(r.error.startswith("skipped: batch abandoned after 3") for r in res[3:])
+    assert not any(r.ok for r in res)
+
+def test_batch_abandonment_is_off_by_default_and_needs_consecutive_timeouts(tmp_path):
+    # Alternating timeout/success must never trip it: only a run of consecutive timeouts is fatal.
+    src = "import time\ndef f(n):\n    if n % 2:\n        time.sleep(5)\n    return n\n"
+    res = run_python_cases(src, "f", [(i,) for i in range(6)], timeout_s=30, workdir=str(tmp_path),
+                           per_case_s=0.2, max_consec_timeouts=2)
+    assert [r.ok for r in res] == [True, False, True, False, True, False]
