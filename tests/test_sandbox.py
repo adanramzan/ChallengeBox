@@ -312,6 +312,16 @@ def test_per_case_limit_bounds_one_case_not_the_whole_batch(tmp_path):
     assert res[2].ok and res[2].output == 2, "cases after the hung one must still run"
 
 
+def test_per_case_limit_cannot_be_swallowed_by_the_candidate(tmp_path):
+    # A candidate with a blanket `except Exception:` used to catch its own wall limit and return a
+    # wrong-but-plausible answer instead of timing out -- _CaseTimeout must derive from BaseException.
+    src = "def f(x):\n    try:\n        while True: pass\n    except Exception:\n        return 0\n"
+    t0 = time.monotonic()
+    res = run_python_cases(src, "f", [(1,)], timeout_s=30, workdir=str(tmp_path), per_case_s=0.2)
+    assert time.monotonic() - t0 < 20
+    assert not res[0].ok and res[0].output != 0 and "per-case limit" in res[0].error
+
+
 def test_per_case_limit_off_by_default(tmp_path):
     res = run_python_cases("def f(x):\n    return x\n", "f", [(1,)], timeout_s=10, workdir=str(tmp_path))
     assert res[0].ok and res[0].output == 1

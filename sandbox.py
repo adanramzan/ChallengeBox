@@ -113,7 +113,7 @@ except Exception:
 # every later case is reported as a timeout it never got to run -- and the caller waits the full
 # grant to learn a verdict the first case already settled. 0 disables.
 PER_CASE = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
-class _CaseTimeout(Exception): pass
+class _CaseTimeout(BaseException): pass   # BaseException, not Exception: a candidate's `except Exception:` must not be able to swallow its own wall limit
 def _on_alarm(sig, frame): raise _CaseTimeout()
 if PER_CASE > 0: signal.signal(signal.SIGALRM, _on_alarm)
 
