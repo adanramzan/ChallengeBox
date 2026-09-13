@@ -78,9 +78,15 @@ In `report.json`:
   *independent* one-shot oracle-regeneration counters, both capped at 1 per run and both able to fire
   in the same run: `oracle_regenerated` counts adjudication (a repair call blamed the oracle for a
   wrong answer on a specific input); `oracle_selfrepaired` counts the orchestrator noticing, on its
-  own, that the oracle's `reference()`/`gen()`/`validate()` crashed at runtime and yielded zero usable
-  cases in every tier (small/medium/edge) even though the ORACLE call itself succeeded — a failure
-  mode `gate_inputs.notes` already recorded but nothing used to act on before this fix. All four
+  own, that the oracle is unusable even though the ORACLE call itself succeeded — either its
+  `reference()`/`gen()`/`validate()` crashed at runtime and yielded zero usable cases in every tier
+  (small/medium/edge), or its `validate()` rejected at least `[limits] validate_reject_frac_regen`
+  (default `0.5`) of the inputs its own `gen()` produced across the small and medium tiers, which
+  means `gen` and `validate` read the statement's preconditions differently and one of them is wrong.
+  Both are failure modes `gate_inputs.notes` already recorded but nothing used to act on. In the
+  rejection case the replacement is kept only if it is actually better: an oracle that rejects at
+  least as much of its own output, or that comes back with no cases at all, is discarded and the
+  original is used (`events` logs `oracle.selfrepair kept the original oracle`). All four
   counters are mutually independent budgets, so a run can spend up to each without any one crowding
   out another — a missing import can't burn the attempts meant for an actual algorithmic bug, and a
   self-inflicted oracle crash can't spend the budget a later real candidate/oracle dispute needs.
