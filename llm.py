@@ -14,6 +14,12 @@ class Role:
     max_concurrent: int
     timeout_cap_s: float
     extra: dict = field(default_factory=dict)
+    # Retries for a call that failed before the model ever answered -- a DNS blip, a refused
+    # connection, a 429/5xx from the gateway. Measured on the round-6 benchmark: one machine-side
+    # DNS flap turned nine of fifteen runs into instant no_candidate. A model that answered wrongly
+    # or timed out is NOT retried here; that is the orchestrator's decision.
+    transport_retries: int = 2
+    transport_backoff_s: float = 2.0
 
 
 @dataclass
@@ -35,7 +41,8 @@ def load_config(path: str, profile: str) -> dict:
         cfg = tomllib.load(f)
     prof = cfg["profiles"][profile]  # KeyError on unknown profile is intended
     roles = {name: Role(name, r["base_url"].rstrip("/"), r["model"], r.get("api_key_env", ""), int(r["max_tokens"]),
-                        int(r.get("max_concurrent", 1)), float(r.get("timeout_cap_s", 120.0)), dict(r.get("extra", {})))
+                        int(r.get("max_concurrent", 1)), float(r.get("timeout_cap_s", 120.0)), dict(r.get("extra", {})),
+                        int(r.get("transport_retries", 2)), float(r.get("transport_backoff_s", 2.0)))
              for name, r in prof.items()}
     return {"roles": roles, "limits": cfg["limits"], "phases": cfg["phases"], "profile": profile}
 
@@ -66,24 +73,33 @@ class LLM:
         if key:
             headers["Authorization"] = f"Bearer {key}"
         req = urllib.request.Request(r.base_url + "/chat/completions", data=json.dumps(body).encode(), headers=headers)
-        result: dict = {}
         sem = self._sems[(r.base_url, r.model)]
-        sem.acquire()
-
-        def work():
-            try:
-                with urllib.request.urlopen(req, timeout=timeout_s + 5) as resp:
-                    result["data"] = json.load(resp)
-            except urllib.error.HTTPError as e:
-                result["error"] = f"http {e.code}: {e.read().decode('utf-8', 'replace')[:300]}"
-            except Exception as e:  # transport errors
-                result["error"] = f"transport: {e!r}"[:300]
-            finally:
-                sem.release()
-
         t0 = time.monotonic()
-        th = threading.Thread(target=work, daemon=True); th.start(); th.join(timeout=timeout_s)
-        timed_out = th.is_alive()
+        for attempt in range(r.transport_retries + 1):
+            result: dict = {}
+            sem.acquire()
+
+            def work(result=result):
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout_s + 5) as resp:
+                        result["data"] = json.load(resp)
+                except urllib.error.HTTPError as e:
+                    result["error"] = f"http {e.code}: {e.read().decode('utf-8', 'replace')[:300]}"
+                    result["retryable"] = e.code == 429 or e.code >= 500
+                except Exception as e:  # transport errors
+                    result["error"] = f"transport: {e!r}"[:300]; result["retryable"] = True
+                finally:
+                    sem.release()
+
+            remaining = timeout_s - (time.monotonic() - t0)
+            th = threading.Thread(target=work, daemon=True); th.start(); th.join(timeout=max(0.0, remaining))
+            timed_out = th.is_alive()
+            # Retry only a failure that happened before the model answered, and only while the call's
+            # own timeout still has room for the backoff plus a real attempt.
+            backoff = r.transport_backoff_s * (attempt + 1)
+            if timed_out or not result.get("retryable") or timeout_s - (time.monotonic() - t0) - backoff < 5.0:
+                break
+            time.sleep(backoff)
         latency = time.monotonic() - t0
         if timed_out:
             reply = Reply("", "", {}, latency, r.model, "timeout")

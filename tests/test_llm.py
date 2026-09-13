@@ -148,3 +148,48 @@ def test_fake_llm_scripts_by_tag_then_role():
     with pytest.raises(AssertionError):
         f.chat("strong", "", "", timeout_s=1)
     assert f.calls[0]["tag"] == "oracle"
+
+
+class _FlakyHandler(_Handler):
+    """Fails the first `fail_first` requests with `code`, then serves normally."""
+    fail_first = 0; code = 503
+    def do_POST(self):
+        with _Handler.lock:
+            _Handler.requests += 1; n = _Handler.requests
+        if n <= _FlakyHandler.fail_first:
+            self.send_response(_FlakyHandler.code); self.send_header("Content-Length", "0"); self.end_headers(); return
+        _Handler.requests -= 1   # let the parent count the served request itself
+        super().do_POST()
+
+@pytest.fixture
+def flaky():
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _FlakyHandler); th = threading.Thread(target=srv.serve_forever, daemon=True); th.start()
+    yield f"http://127.0.0.1:{srv.server_port}/v1"; srv.shutdown()
+
+def test_chat_retries_5xx_then_succeeds(flaky):
+    _Handler.requests = 0; _FlakyHandler.fail_first = 2; _FlakyHandler.code = 503; _Handler.delay = 0.0
+    role = Role("fast", flaky, "m", "", 100, 1, 30.0, {}, transport_retries=2, transport_backoff_s=0.01)
+    reply = LLM({"fast": role}).chat("fast", "s", "u", timeout_s=30.0)
+    assert reply.error is None and reply.text.startswith("===CODE===")
+    assert _Handler.requests == 3
+
+def test_chat_does_not_retry_4xx(flaky):
+    _Handler.requests = 0; _FlakyHandler.fail_first = 5; _FlakyHandler.code = 403
+    role = Role("fast", flaky, "m", "", 100, 1, 30.0, {}, transport_retries=2, transport_backoff_s=0.01)
+    reply = LLM({"fast": role}).chat("fast", "s", "u", timeout_s=30.0)
+    assert reply.error.startswith("http 403") and _Handler.requests == 1
+
+def test_chat_retries_transport_error_then_gives_up():
+    # Nothing listens on this port: every attempt is a refused connection.
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler); port = srv.server_port; srv.server_close()
+    role = Role("fast", f"http://127.0.0.1:{port}/v1", "m", "", 100, 1, 30.0, {}, transport_retries=2, transport_backoff_s=0.01)
+    llm = LLM({"fast": role}); t0 = time.monotonic()
+    reply = llm.chat("fast", "s", "u", timeout_s=30.0)
+    assert reply.error.startswith("transport:") and time.monotonic() - t0 < 5
+    assert len(llm.calls) == 1   # one logical call, however many attempts it took
+
+def test_chat_no_retry_when_timeout_has_no_room(flaky):
+    _Handler.requests = 0; _FlakyHandler.fail_first = 5; _FlakyHandler.code = 503
+    role = Role("fast", flaky, "m", "", 100, 1, 30.0, {}, transport_retries=2, transport_backoff_s=0.01)
+    reply = LLM({"fast": role}).chat("fast", "s", "u", timeout_s=4.0)   # backoff + 5 s floor exceeds it
+    assert reply.error.startswith("http 503") and _Handler.requests == 1
