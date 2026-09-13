@@ -261,7 +261,13 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             else:
                 repairs += 1
             new_source, verdict = V.repair(run, cand, failed, gi, pv)
-            if verdict == "oracle" and gi.oracle_regens == 0:
+            if verdict == "oracle":
+                # repair.md tells the model to repeat the current code unchanged when it blames the
+                # oracle, so its CODE block is not a fix. With no regeneration left there is nothing
+                # to act on: adding that block as a new candidate is how a worse candidate became the
+                # emitted one on 1c182498c9c7.
+                if gi.oracle_regens or gi.regen_failed:
+                    run.log("repair.oracle_verdict_unactionable no oracle regeneration left"); break
                 gi = V.regenerate_oracle(run, gi, V.dispute_extra(gi, failed), pv, counter="oracle_regens")
                 if gi.regen_failed:
                     run.log("oracle.regen failed: stopping repair loop"); break

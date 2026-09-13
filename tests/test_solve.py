@@ -591,3 +591,15 @@ def test_regenerated_oracle_disagreeing_everywhere_degrades_the_diff_evidence(tm
     diffs = [e for evs in rep["evidence"].values() for e in evs if e["kind"].startswith("diff_")]
     assert diffs and all(e["detail"].get("degraded") for e in diffs)
     assert rep["status"] != "passed_all_gates"
+
+
+def test_second_oracle_verdict_with_no_regeneration_left_does_not_mint_a_candidate(tmp_path):
+    # repair.md asks for the current code repeated unchanged behind an `oracle` verdict, so that CODE
+    # block is not a fix. With the one regeneration already spent there is nothing to act on: the
+    # loop must stop rather than promote it to a candidate (1c182498c9c7 emitted such a c3).
+    llm = FakeLLM({"solve": [SOLVE_OK], "repair": [REPAIR_BLAME_ORACLE, REPAIR_BLAME_ORACLE],
+                   "oracle": [ORACLE_WRONG, ORACLE_OFF_BY_1000], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_regenerated"] == 1
+    assert list(rep["evidence"]) == ["c1"]   # no c2 minted from the second `oracle` verdict
+    assert any("repair.oracle_verdict_unactionable" in e for e in rep["events"])
