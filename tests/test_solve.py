@@ -269,7 +269,8 @@ def test_solve_falls_back_to_raw_reply_when_no_code_block_parsed(tmp_path):
     assert (tmp_path / "s.py").exists()
 
 def test_main_missing_api_key_returns_2_and_names_the_var(tmp_path, monkeypatch, capsys):
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    for var in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):   # any one set would be auto-picked and hit the network
+        monkeypatch.delenv(var, raising=False)
     p = tmp_path / "p.json"
     p.write_text(json.dumps({"problem_id": "pid", "language": "python", "statement": "s", "entrypoint": "add", "public_examples": [], "deadline_s": 300.0}))
     rc = S.main([str(p), "-o", str(tmp_path / "out.py")])
@@ -550,3 +551,19 @@ def test_repair_targets_the_best_attempt_not_the_last_gated(tmp_path):
     rep = S.solve(prob(tmp_path), llm, cfg_n(2), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert rep["parents"].get("c3") == "c1", f"repair should build on the better attempt, got {rep['parents']}"
     assert any("repair.target c1" in e for e in rep["events"])
+
+
+# --- round 6: the max-size stress input must pass the oracle's validate() too ---
+
+ORACLE_VALIDATES = ("===ORACLE===\nimport random\ndef reference(a, b):\n    return a + b\n"
+                    "def gen(seed, mode):\n    r = random.Random(seed)\n    return (r.randint(0, 20), r.randint(0, 20))\n"
+                    "def validate(a, b):\n    return a <= 100 and b <= 100\n===END===\n")
+
+def test_gen_max_output_rejected_by_validate_is_not_stressed(tmp_path):
+    # STRESS's gen_max invents an input the statement forbids: running it proves nothing and its
+    # crash burns repair attempts. It must be dropped (degraded fallback), never gated as a FAIL.
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_VALIDATES], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert any("gen_max output rejected by validate(); not used" in n for n in rep["gate_inputs"]["notes"])
+    stress = next(e for e in rep["evidence"][rep["final_candidate"]] if e["kind"] == "stress")
+    assert stress["passed"] and (stress["skipped"] or stress["detail"].get("degraded"))

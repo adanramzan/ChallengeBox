@@ -33,6 +33,7 @@ class GateInputs:
     public_disagreements: list = field(default_factory=list)   # reference() vs a public example: evidence the ORACLE is wrong
     stress_input: object = None
     stress_degraded: bool = False
+    validate_trusted: bool = False   # the oracle's validate() accepted at least one generated input and was not distrusted
     oracle_src: str = ""
     oracle_regens: int = 0        # adjudication: repair blamed the oracle for a wrong answer
     oracle_selfrepairs: int = 0   # this module noticed its own oracle crashed and produced zero usable cases
@@ -55,19 +56,31 @@ def _ref_args(problem, inp) -> tuple:
         return (inp,)
     return tuple(inp) if isinstance(inp, (tuple, list)) else (inp,)
 
+def _validate_inputs(problem, oracle_src: str, inputs: list, *, workdir: str, timeout_s: float, per_case_s: float = 0.0) -> tuple[list | None, str]:
+    """Run the oracle's own validate() over `inputs` in the sandbox -- the single place any input the
+    gate will use is checked against the statement's preconditions. Returns (verdicts, absent_reason):
+    verdicts[i] is True (accepted), False (rejected) or None (validate crashed or timed out on that
+    input, so there is no verdict -- which is not a rejection); verdicts is None, with a reason, when
+    the oracle defines no validate() at all (detected via the harness's IMPORT: prefix).
+    Policy is the caller's: make_cases drops a rejected input and distrusts a validate that rejected a
+    whole tier, while the stress and shrink paths keep an input validate could not judge."""
+    res = run_python_cases(oracle_src, "validate", [_ref_args(problem, i) for i in inputs],
+                           workdir=workdir, timeout_s=timeout_s, per_case_s=per_case_s)
+    if res and res[0].error.startswith("IMPORT:"):
+        return None, "no validate() defined in oracle"
+    return [(r.output is True) if r.ok else None for r in res], ""
+
 def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str, timeout_s: float, per_case_s: float = 0.0) -> tuple[list[Case], Evidence]:
     t0 = time.monotonic()
     valid_inputs = inputs
     checked = invalid_dropped = 0
     validation_skipped = ""
     if inputs:
-        val_res = run_python_cases(oracle_src, "validate", [_ref_args(problem, i) for i in inputs],
-                                    workdir=os.path.join(workdir, "validate"), timeout_s=timeout_s, per_case_s=per_case_s)
-        if val_res[0].error.startswith("IMPORT:"):
-            validation_skipped = "no validate() defined in oracle"
-        else:
+        verdicts, validation_skipped = _validate_inputs(problem, oracle_src, inputs, workdir=os.path.join(workdir, "validate"),
+                                                        timeout_s=timeout_s, per_case_s=per_case_s)
+        if verdicts is not None:
             checked = len(inputs)
-            kept = [i for i, r in zip(inputs, val_res) if r.ok and r.output is True]
+            kept = [i for i, v in zip(inputs, verdicts) if v is True]
             if kept:
                 valid_inputs, invalid_dropped = kept, checked - len(kept)
             else:
@@ -158,7 +171,7 @@ def _shrink_value(v):
         for k in list(v):
             d = dict(v); del d[k]; yield d
 
-def shrink(problem, source: str, oracle_src: str, case: Case, *, workdir: str, budget_s: float, binary: str | None = None) -> Case:
+def shrink(problem, source: str, oracle_src: str, case: Case, *, workdir: str, budget_s: float, binary: str | None = None, validate_trusted: bool = False) -> Case:
     if problem.language != "python":
         return case
     t0 = time.monotonic(); cur = tuple(case.input); exp = case.expected
@@ -171,6 +184,14 @@ def shrink(problem, source: str, oracle_src: str, case: Case, *, workdir: str, b
                 if now - t0 >= budget_s: break
                 call_timeout = max(0.5, min(5.0, budget_s - (now - t0)))
                 cand = cur[:i] + (alt,) + cur[i + 1 :]
+                # _shrink_value knows nothing about the statement's preconditions -- driving ids to 0
+                # produces duplicates, emptying a list produces a "must currently exist" violation. A
+                # counterexample that the statement forbids is a phantom: it drives repair and is kept
+                # as a regression that fails every later candidate forever. Reject it like a
+                # non-reproducing step. Bounded by the same budget_s as everything else in this loop.
+                if validate_trusted:
+                    v, _ = _validate_inputs(problem, oracle_src, [cand], workdir=os.path.join(workdir, "v"), timeout_s=call_timeout)
+                    if v is not None and v[0] is not True: continue
                 still, e = _fails(problem, source, oracle_src, cand, workdir, binary, timeout_s=call_timeout)
                 if still:
                     cur, exp, improved = cand, e, True
@@ -289,6 +310,11 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
             gi.notes.append(f"gen({mode}) produced nothing: {(gen[0].error if gen else '')[-200:]}"); continue
         cases, ev = make_cases(problem, oracle_src, inputs, mode, workdir=os.path.join(workdir, f"ref_{mode}"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), per_case_s=limits.get("per_case_limit_s", 0.0))
         if not cases: gi.notes.append(f"reference failed on all {mode} inputs: {ev.detail['errors']}")
+        # "Trusted" = this validate() actually ran and accepted something in at least one tier, so a
+        # False from it elsewhere (the stress input, a shrunk input) is a real precondition violation
+        # rather than a validate that rejects everything or does not exist.
+        if ev.detail.get("checked") and not ev.detail.get("validation_skipped"):
+            gi.validate_trusted = True
         setattr(gi, f"cases_{mode}", cases); _log_and_note_validation(gi, ev, mode, log)
     if stress_src.strip():
         stress_src = _STDLIB_PREAMBLE + stress_src
@@ -299,10 +325,22 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
             _log_and_note_validation(gi, ev, "edge", log)
         mx = run_python_cases(stress_src, "gen_max", [(1,)], workdir=os.path.join(workdir, "genmax"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         if mx and mx[0].ok:
-            gi.stress_input = _clean_stdin(problem, mx[0].output)
+            candidate_input = _clean_stdin(problem, mx[0].output)
+            # The stress input is the one gate input that never went through validate(). An invalid
+            # max-size input makes the stress step meaningless: the candidate crashes or answers
+            # nonsense on something the statement forbids, and repair attempts get spent chasing it.
+            verdicts = None
+            if gi.validate_trusted:
+                verdicts, _ = _validate_inputs(problem, oracle_src, [candidate_input], workdir=os.path.join(workdir, "genmax_validate"),
+                                               timeout_s=budget.step_timeout(20.0, reserve_s=20.0))
+            if verdicts and verdicts[0] is False:   # None = validate crashed/timed out on it: keep the input
+                gi.notes.append("gen_max output rejected by validate(); not used")
+            else:
+                gi.stress_input = candidate_input
         else:
             gi.notes.append("gen_max failed: " + (mx[0].error[-200:] if mx else ""))
-            # gen_max is the only source of a stress input; rather than ship a correct-but-slow
+        if gi.stress_input is None and gi.cases_medium:
+            # gen_max is the only source of a real stress input; rather than ship a correct-but-slow
             # solution with the timing check silently skipped, fall back to the largest medium case.
             # "Largest" by len(str(...)): generic across a Python argument tuple (str() of the tuple
             # scales with its total content) and a Rust stdin string (str() is the string itself), so
@@ -310,11 +348,10 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
             # NOT a true maximum-size input -- medium is capped far below gen_max's target scale -- so
             # it's marked degraded and stress()'s evidence records that, so the timing it produces is
             # never mistaken for a real max-size check.
-            if gi.cases_medium:
-                biggest = max(gi.cases_medium, key=lambda c: len(str(c.input)))
-                gi.stress_input = _clean_stdin(problem, biggest.input)
-                gi.stress_degraded = True
-                gi.notes.append("stress input degraded: gen_max failed, using largest medium case instead (not a true max-size input)")
+            biggest = max(gi.cases_medium, key=lambda c: len(str(c.input)))
+            gi.stress_input = _clean_stdin(problem, biggest.input)
+            gi.stress_degraded = True
+            gi.notes.append("stress input degraded: no usable gen_max output, using largest medium case instead (not a true max-size input)")
     else:
         gi.notes.append("no stress source")
     return gi
@@ -508,7 +545,8 @@ def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, 
     if failed.kind.startswith("diff_") and "input" in detail:
         case = Case(detail["input"], detail["expected"], failed.kind)
         if problem.language == "python" and gi.oracle_src:
-            case = shrink(problem, cand.source, gi.oracle_src, case, workdir=os.path.join(run.dir, cand.id, "shrink"), budget_s=run.cfg["limits"]["shrink_budget_s"])
+            case = shrink(problem, cand.source, gi.oracle_src, case, workdir=os.path.join(run.dir, cand.id, "shrink"),
+                          budget_s=run.cfg["limits"]["shrink_budget_s"], validate_trusted=gi.validate_trusted)
             run.log(f"shrink input={_fmt(case.input)[:120]}")
         detail["input"], detail["expected"] = case.input, case.expected
         gi.regressions.append(case)

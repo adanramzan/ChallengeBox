@@ -441,3 +441,17 @@ def test_passing_candidate_still_reports_its_real_output(tmp_path):
     ev = V.differential(PY, BUG, [V.Case((20, 1), 21, "small")], "diff_small",
                         workdir=str(tmp_path / "d"), timeout_s=10)
     assert not ev.passed and ev.detail["actual"] == 22   # wrong, but it ran: show the real answer
+
+
+# --- round 6: every input the gate uses must pass the oracle's validate() ---
+
+ORACLE_VALIDATE_ONLY_ORIGINAL = ("def reference(a, b):\n    return a + b\n"
+                                 "def gen(seed, mode):\n    return (seed, seed)\n"
+                                 "def validate(a, b):\n    return (a, b) == (1000, 999) or a < 5\n")
+
+def test_shrink_keeps_the_original_when_every_smaller_input_is_invalid(tmp_path):
+    # _shrink_value knows nothing about preconditions; a shrunk input validate() rejects is a phantom
+    # counterexample (it later fails every candidate as a regression), so the step must be rejected.
+    case = V.Case((1000, 999), 1999, "small")
+    out = V.shrink(PY, BUG, ORACLE_VALIDATE_ONLY_ORIGINAL, case, workdir=str(tmp_path), budget_s=3.0, validate_trusted=True)
+    assert out.input == (1000, 999) and out.expected == 1999
