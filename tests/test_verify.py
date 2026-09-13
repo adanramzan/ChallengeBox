@@ -483,3 +483,14 @@ def test_a_genuinely_constant_answer_survives_when_validate_accepts(tmp_path):
     limits = {"cases_small": 4, "cases_medium": 0, "mem_mb": 2048}
     gi = V.prepare_gate_inputs(PY, const, "", limits, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
     assert len(gi.cases_small) == 4 and not any("cannot parse" in n for n in gi.notes)
+
+
+def test_medium_tier_yields_to_repair_when_the_budget_is_already_late(tmp_path):
+    class LateBudget(FakeBudget):
+        def phase(self): return "repair"
+    limits = {"cases_small": 5, "cases_medium": 3, "mem_mb": 2048}
+    gi = V.prepare_gate_inputs(PY, ORACLE, "", limits, workdir=str(tmp_path / "gi"), budget=LateBudget(), log=lambda m: None)
+    assert len(gi.cases_small) == 5 and gi.cases_medium == []
+    assert any("medium tier skipped" in n for n in gi.notes)
+    gi2 = V.prepare_gate_inputs(PY, ORACLE, "", limits, workdir=str(tmp_path / "gi2"), budget=FakeBudget(), log=lambda m: None)
+    assert len(gi2.cases_medium) == 3

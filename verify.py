@@ -326,6 +326,14 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
     if gi.cases_public:
         _check_public_against_oracle(problem, gi, oracle_src, workdir=workdir, budget=budget, log=log)
     for mode, n in (("small", limits["cases_small"]), ("medium", limits["cases_medium"])):
+        # The medium tier is the most expensive evidence per second (literal loops over 10^4-10^5
+        # multipliers) and the least decisive: small already catches most logic bugs. When the oracle
+        # call itself ran long enough that the budget is already past the gate phase, a repair attempt
+        # is worth more than medium coverage -- measured on bench7/5cb294c18288, where an 82 s medium
+        # pass ended at 172 s of 285 and the single repair could not even be re-gated. The tier is
+        # then skipped (not degraded: the evidence is absent, and the status says unverified).
+        if mode == "medium" and budget.phase() not in ("generate", "gate"):
+            gi.notes.append(f"medium tier skipped: budget already in the {budget.phase()} phase; time reserved for repair"); continue
         gen = run_python_cases(oracle_src, "gen", [(s, mode) for s in range(n)], workdir=os.path.join(workdir, f"gen_{mode}"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         inputs = [r.output for r in gen if r.ok]
         if not inputs:
