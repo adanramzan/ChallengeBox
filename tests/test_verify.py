@@ -45,6 +45,17 @@ def test_prepare_gate_inputs_and_run_gate(tmp_path):
     assert ev[0].kind == "compile" and ev[0].passed
     assert ev[1].kind == "diff_edge" and not ev[1].passed and ev[1].detail["input"] == (15, 0)
 
+def test_thin_tier_passes_but_is_marked_degraded(tmp_path):
+    limits = {"cases_small": 5, "cases_medium": 2, "min_cases_small": 30, "min_cases_medium": 5,
+              "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0, "mem_mb": 2048, "shrink_budget_s": 1.0}
+    gi = V.GateInputs(oracle_src=ORACLE, cases_small=[V.Case((a, 1), a + 1, "small") for a in range(5)])
+    ev = {e.kind: e for e in V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "a"), budget=FakeBudget(), limits=limits, log=lambda m: None)}
+    assert ev["diff_small"].passed and "degraded" in ev["diff_small"].detail
+    assert ev["diff_medium"].skipped and "degraded" not in ev["diff_medium"].detail   # empty tier is skipped, not degraded
+    gi.cases_small = [V.Case((a, 1), a + 1, "small") for a in range(30)]
+    ev = {e.kind: e for e in V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "b"), budget=FakeBudget(), limits=limits, log=lambda m: None)}
+    assert ev["diff_small"].passed and "degraded" not in ev["diff_small"].detail
+
 def test_prepare_gate_inputs_survives_broken_oracle(tmp_path):
     gi = V.prepare_gate_inputs(PY, "def reference(a, b): raise RuntimeError()\ndef gen(seed, mode): return (1, 2)\n", "", {"cases_small": 3, "cases_medium": 1, "mem_mb": 2048}, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
     assert gi.cases_small == [] and any("reference" in n for n in gi.notes)

@@ -2,6 +2,13 @@
 safety_margin_s = 15.0
 cases_small = 200
 cases_medium = 20
+# Floor below which a differential tier is thin evidence rather than coverage, so run_gate marks it
+# degraded and solve() demotes the status out of "passed_all_gates". A run that produced far fewer
+# cases than the cases_small/cases_medium targets above had an oracle whose gen() mostly crashed or
+# whose validate() rejected most of what it generated; 48 small / 4 medium was observed shipping as
+# a full pass. Tuned against the 200/20 targets -- raise these together with those.
+min_cases_small = 30
+min_cases_medium = 5
 stress_limit_python_s = 5.0
 stress_limit_rust_s = 2.0
 max_repairs = 2

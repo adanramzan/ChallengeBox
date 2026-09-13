@@ -433,6 +433,12 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         if not e.passed: return ev
     for kind, cases in (("diff_edge", gi.regressions + gi.cases_edge), ("diff_small", gi.cases_small), ("diff_medium", gi.cases_medium)):
         e = differential(problem, source, cases, kind, workdir=os.path.join(workdir, kind), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"], per_case_s=limits.get("per_case_limit_s", 0.0))
+        # A generated tier that agreed on a handful of cases is thin evidence, not coverage: the
+        # oracle's gen() mostly crashed or its validate() rejected most of what it produced. Mark it
+        # degraded (solve() then demotes the status); an empty tier is already `skipped`.
+        m = 0 if e.skipped else limits.get(f"min_cases_{kind[5:]}", 0)
+        if e.passed and e.cases < m:
+            e.detail["degraded"] = f"only {e.cases} {kind[5:]} cases (min {m})"
         ev.append(e); log(f"gate.{kind} passed={e.passed} cases={e.cases}")
         if not e.passed: return ev
     e = behavior(problem, source, gi.cases_small or gi.cases_edge, workdir=os.path.join(workdir, "behavior"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"], per_case_s=limits.get("per_case_limit_s", 0.0))
