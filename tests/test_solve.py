@@ -1011,3 +1011,70 @@ def test_stress_prompt_demands_huge_bounded_quantities_and_an_input_valid_to_the
     assert "the blowup is exactly what the check exists to find" in rendered
     assert "must stay valid, in the statement's own sense, all the way to its end" in rendered
     assert "Put any deliberately invalid operation last" in rendered
+
+
+# --- round 14: oracle preparation overlaps the solver ---
+
+class _LatchLLM(FakeLLM):
+    """FakeLLM whose reply for one tag is held until an Event is set, so a test can control which
+    of the three concurrent generation calls lands first."""
+    def __init__(self, script, gates):
+        super().__init__(script)
+        self.gates = gates
+    def chat(self, role, system, user, *, timeout_s, max_tokens=None, tag=""):
+        ev = self.gates.get(tag)
+        if ev is not None:
+            ev.wait(timeout=20)
+        return super().chat(role, system, user, timeout_s=timeout_s, max_tokens=max_tokens, tag=tag)
+
+def _spy_on(monkeypatch, name, before=None, after=None):
+    real = getattr(S.V, name)
+    def wrapper(*a, **k):
+        if before: before()
+        out = real(*a, **k)
+        if after: after()
+        return out
+    monkeypatch.setattr(S.V, name, wrapper)
+
+def test_oracle_prep_starts_before_the_solve_reply_arrives(tmp_path, monkeypatch):
+    # bench14: solves 17 s, oracle 30 s, stress 51 s, prep 62 s. Prep is subprocess-bound and needs
+    # nothing from the solver, so it must not wait for it -- with a slow strong model that ordering
+    # wastes the entire prep.
+    import threading
+    solve_gate = threading.Event()
+    _spy_on(monkeypatch, "prepare_oracle_tiers", after=solve_gate.set)   # the SOLVE reply is released only once the tiers are built
+    llm = _LatchLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]}, {"solve": solve_gate})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert any("prep.overlap solve_pending=1" in l for l in rep["events"])
+    small = next(i for i, l in enumerate(rep["events"]) if "oracle.small cases=" in l)
+    done = next(i for i, l in enumerate(rep["events"]) if "solve.done" in l)
+    assert small < done   # the tier was built while the solver was still running
+    # and the candidate is still gated against fully prepared inputs
+    assert rep["gate_inputs"]["small"] > 0 and rep["gate_inputs"]["edge"] > 0 and rep["gate_inputs"]["stress_source"] == "gen_max"
+    ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
+    assert ev["diff_small"].get("cases") and ev["diff_edge"].get("cases") and ev["diff_examples"].get("cases")
+    assert rep["status"] == "passed_all_gates"
+
+def test_a_slow_stress_reply_does_not_delay_the_small_and_medium_tiers(tmp_path, monkeypatch):
+    import threading
+    stress_gate = threading.Event()
+    _spy_on(monkeypatch, "prepare_oracle_tiers", after=stress_gate.set)   # STRESS lands only after the oracle tiers are done
+    llm = _LatchLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]}, {"stress": stress_gate})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    small = next(i for i, l in enumerate(rep["events"]) if "oracle.small cases=" in l)
+    stress_done = next(i for i, l in enumerate(rep["events"]) if "stress.done" in l)
+    assert small < stress_done
+    # the stress-dependent parts are still filled in afterwards, on the same GateInputs
+    assert rep["gate_inputs"]["edge"] > 0 and rep["gate_inputs"]["stress"] and rep["gate_inputs"]["stress_source"] == "gen_max"
+    assert rep["status"] == "passed_all_gates"
+
+def test_the_example_check_runs_against_the_prepared_oracle_after_the_solves(tmp_path):
+    # the examples only exist once the SOLVE replies are in, so the check is the last prep step --
+    # it must still see the same oracle the tiers were built from.
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    ec = rep["gate_inputs"]["example_checks"]
+    assert ec["cases"] == 3 and ec["agreements"] == 3 and ec["disagreements"] == [] and ec["rejected"] == []
+    small = next(i for i, l in enumerate(rep["events"]) if "oracle.small cases=" in l)
+    ex = next(i for i, l in enumerate(rep["events"]) if "oracle.examples cases=" in l)
+    assert small < ex

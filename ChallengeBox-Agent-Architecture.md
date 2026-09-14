@@ -96,7 +96,7 @@ flowchart TD
     T --> K
 ```
 
-The three generation calls run concurrently. The gate is deterministic and costs no tokens. The repair loop runs at most twice against a semantic (behavioral) failure and, independently, at most twice against a mechanical (static/compile) one — see §5.7. The time controller can interrupt at any point and finalize.
+The three generation calls run concurrently, and preparation of the gate's inputs overlaps them: the orchestrator waits for the ORACLE reply first and starts building the small and medium differential tiers immediately, while the SOLVE and STRESS calls are still in flight (§5.3). The gate is deterministic and costs no tokens. The repair loop runs at most twice against a semantic (behavioral) failure and, independently, at most twice against a mechanical (static/compile) one — see §5.7. The time controller can interrupt at any point and finalize.
 
 ### 4.1 Time budget for a 300-second problem
 
@@ -105,7 +105,7 @@ Usable time is `deadline_s` minus a 15-second safety margin. Phases are expresse
 | Window (s) | Share | Phase | Allowed |
 |---:|---:|---|---|
 | 0–5 | 2% | intake | parse, validate, build contract, start clock |
-| 5–95 | 30% | generate | three concurrent model calls, each capped at `[phases].generate_call_share` (config.toml, default 0.55) of usable time — since they run concurrently, the phase costs max() of the three, not their sum, so each can get most of the phase rather than a third of it; role caps underneath: strong 120 s, fast 150 s |
+| 5–95 | 30% | generate | three concurrent model calls, each capped at `[phases].generate_call_share` (config.toml, default 0.70) of usable time — since they run concurrently, the phase costs max() of the three, not their sum, so each can get most of the phase rather than a third of it; role caps underneath: strong 120 s, fast 150 s |
 | 95–115 | 7% | gate | compile, contract checks, differential, stress |
 | 115–235 | 40% | repair | up to two shrink → repair → gate cycles, each capped at 60 s, plus at most one fresh solve (§5.7) while `repair_afford_s` + one gate pass (~60 s) still fits |
 | 235–270 | 12% | settle | no new model calls; the last gate result stands; write report |
@@ -214,6 +214,10 @@ The oracle is Python for both target languages. For Rust problems this gives a s
 The oracle writes the largest output of the three concurrent calls (three functions, not one), so it is reliably the slowest and the one most likely to hit its timeout. If the first attempt returns no `===ORACLE===` block at all (a timeout, most often), the orchestrator retries the ORACLE call exactly once — a local counter, not a `GateInputs` field — guarded by `budget.can_afford(130)` (the measured worst-case oracle latency is 128 s) so the retry never fires this close to the deadline. This is independent of `regenerate_oracle` (§5.7), which reissues the oracle for two different reasons, each with its own separate one-shot counter (§5.3.1 and §5.7).
 
 Before any generated oracle or stress source is executed, a fixed preamble — `import random, math, itertools, collections, string, heapq, bisect` — is prepended to it. The prompt tells the model to *use* `random.Random(seed)` but never explicitly tells it to import anything, and one live run produced a module with no imports at all, whose `gen()` died with `NameError`. A duplicate import is harmless if the model already wrote one. The preamble is prepended to the exact string that gets written to disk as that run's `cand.py`, so any traceback line number always matches what's actually sitting in the run directory — it only differs from the raw LLM completion's own line count.
+
+**Preparation overlaps the other two calls.** `prepare_gate_inputs` is split into three phases over one `GateInputs`: `prepare_oracle_tiers` (public examples, the `small` and `medium` differential tiers, the validate/gen reject fraction) needs only the ORACLE reply; `prepare_stress_inputs` (the `EDGES` fixtures and the max-size timing input) needs the STRESS reply; `check_oracle_examples` needs the SOLVE replies, since the hand-traced examples arrive with them. The orchestrator therefore waits for the oracle first, runs its retry/self-repair decision, and starts the tiers while the other calls are still outstanding — logged as `prep.overlap solve_pending=<n>`. On bench14 the oracle landed at 30 s, stress at 51 s and prep did not begin until 51 s, finishing at 62 s: eleven seconds that were free, and with a slow strong model the whole preparation is. The work is subprocess-bound, so it runs in the orchestrator's own thread rather than in the pool, whose workers belong to the model calls. `prepare_gate_inputs` remains as the all-at-once wrapper for `regenerate_oracle`, which has every input in hand.
+
+**The `medium` tier is time-boxed, not phase-gated.** It is the most expensive evidence per second and the least decisive, so it gets at most `[limits] medium_tier_budget_s` (default 20 s) for the generator batch and the reference batch together; if the generator alone spends it, medium ships 0 cases with the note `medium tier: time box exhausted`. It used to be *dropped* once the budget left the `gate` phase, which cost bench14 its only mid-size tier twice over: 60.3 s to produce 6 cases, which the oracle regeneration then discarded, and the re-prep skipped the tier entirely with time still on the clock. A box bounds the cost without ever silently dropping the tier, and the same rule applies to a regenerated oracle's re-prep.
 
 #### 5.3.1 Oracle self-repair: the CALL can succeed while the CODE is unusable
 

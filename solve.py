@@ -231,6 +231,9 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     run.log(f"intake lang={problem.language} deadline={problem.deadline_s} scale={deadline_scale} usable={run.budget.usable_s:.0f}")
     pv = prompt_vars(problem)
     attempts = max(1, int(cfg["limits"].get("solve_attempts", 1)))
+    limits = cfg["limits"]
+    oracle_dir = os.path.join(run_dir, "oracle")
+    gi = V.GateInputs()
     with ThreadPoolExecutor(max_workers=attempts + 2) as ex:
         # All of these run concurrently, so the generate phase costs max(), not sum() —
         # each call can therefore have the whole generate budget rather than a share of it.
@@ -238,8 +241,50 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         f_solves = [ex.submit(run.chat, "strong", "solve", gen_cap, **pv) for _ in range(attempts)]
         f_oracle = ex.submit(run.chat, "fast", "oracle", gen_cap, **pv)
         f_stress = ex.submit(run.chat, "fast", "stress", gen_cap, **pv)
+        # The ORACLE reply is waited for FIRST and its preparation starts immediately, while the
+        # solve and stress calls are still in flight. Preparation is subprocess-bound work that needs
+        # nothing from either of them: on bench14 the oracle landed at 30 s, stress at 51 s, and prep
+        # did not start until 51 s and then ran to 62 s -- eleven seconds that were free. With a slow
+        # strong model in the strong role (100-200 s) the whole prep is free. It runs in this thread,
+        # not in the pool: it spawns subprocesses, and the pool's workers are for the model calls.
+        r_oracle = f_oracle.result()
+        oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
+        # The oracle is the single source of ground truth for every gate step, so a timeout here
+        # (roughly half of them clip at a 60s median-tuned cap; see BENCHMARK-FINDINGS.md F4) costs
+        # the entire run its verification, not just one call. One retry, only when the budget can
+        # still afford a call as slow as the measured worst case -- config.toml's
+        # limits.oracle_retry_afford_s, not a literal, since that worst case is a function of whatever
+        # model is configured for the "fast" role.
+        #
+        # A first call that TIMED OUT is a different bet from one that answered without the block: the
+        # retry will run to the same cap, so it is only worth making when the budget covers that cap AND
+        # still leaves a repair's worth of time to use the oracle for something. Round 13 spent 240 s of
+        # a 285 s run on two capped oracle calls and gated nothing.
+        oracle_timed_out = r_oracle.error == "timeout"
+        if oracle_timed_out:
+            fast_cap = run.llm.roles["fast"].timeout_cap_s if hasattr(run.llm, "roles") else gen_cap
+            afford = run.budget.can_afford(fast_cap + limits["repair_afford_s"])
+        else:
+            afford = run.budget.can_afford(limits["oracle_retry_afford_s"])
+        if not oracle_src.strip() and afford and not run.over_cost():
+            run.log(f"oracle.retry reason={'timeout' if oracle_timed_out else 'no_block'}, retrying once")
+            r_oracle = run.chat("fast", "oracle", gen_cap, **pv)
+            oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
+        pending = sum(1 for f in f_solves if not f.done())
+        run.log(f"prep.overlap solve_pending={pending}")
+        prep_error = None
+        try:
+            gi = V.prepare_oracle_tiers(problem, oracle_src, limits, workdir=oracle_dir, budget=run.budget, log=run.log)
+        except Exception as e:
+            prep_error = e
+        r_stress = f_stress.result()
+        stress_src = parse_blocks(r_stress.text).get("STRESS", "")
+        if prep_error is None:
+            try:
+                V.prepare_stress_inputs(problem, gi, stress_src, limits, workdir=oracle_dir, budget=run.budget, log=run.log)
+            except Exception as e:
+                prep_error = e
         r_solves = [f.result() for f in f_solves]
-        r_oracle, r_stress = f_oracle.result(), f_stress.result()
     for i, r_solve in enumerate(r_solves):
         blocks = parse_blocks(r_solve.text)
         code = blocks.get("CODE", "")
@@ -255,39 +300,21 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             continue
         cand = run.add_candidate(code, None); cand.evidence.append(static_evidence(problem, code))
         # The author's own hand trace of the statement: checked against this candidate (gate step
-        # diff_examples) and against the oracle (prepare_gate_inputs), which never saw it.
+        # diff_examples) and against the oracle (check_oracle_examples), which never saw it.
         ex_block = blocks.get("EXAMPLES", "")
         cand.examples = V.parse_examples(problem, ex_block)
         cand.examples_dropped = max(0, V.example_line_count(ex_block) - len(cand.examples))
         cand.algorithm = blocks.get("ALGORITHM") or blocks.get("DESIGN", "")
         run.log(f"solve.examples id={cand.id} parsed={len(cand.examples)} dropped={cand.examples_dropped}")
-    oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
-    # The oracle is the single source of ground truth for every gate step, so a timeout here
-    # (roughly half of them clip at a 60s median-tuned cap; see BENCHMARK-FINDINGS.md F4) costs
-    # the entire run its verification, not just one call. One retry, only when the budget can
-    # still afford a call as slow as the measured worst case -- config.toml's
-    # limits.oracle_retry_afford_s, not a literal, since that worst case is a function of whatever
-    # model is configured for the "fast" role.
-    #
-    # A first call that TIMED OUT is a different bet from one that answered without the block: the
-    # retry will run to the same cap, so it is only worth making when the budget covers that cap AND
-    # still leaves a repair's worth of time to use the oracle for something. Round 13 spent 240 s of
-    # a 285 s run on two capped oracle calls and gated nothing.
-    oracle_timed_out = r_oracle.error == "timeout"
-    if oracle_timed_out:
-        fast_cap = run.llm.roles["fast"].timeout_cap_s if hasattr(run.llm, "roles") else gen_cap
-        afford = run.budget.can_afford(fast_cap + cfg["limits"]["repair_afford_s"])
-    else:
-        afford = run.budget.can_afford(cfg["limits"]["oracle_retry_afford_s"])
-    if not oracle_src.strip() and afford and not run.over_cost():
-        run.log(f"oracle.retry reason={'timeout' if oracle_timed_out else 'no_block'}, retrying once")
-        r_oracle = run.chat("fast", "oracle", gen_cap, **pv)
-        oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
-    stress_src = parse_blocks(r_stress.text).get("STRESS", "")
-    try:
-        gi = V.prepare_gate_inputs(problem, oracle_src, stress_src, cfg["limits"], workdir=os.path.join(run_dir, "oracle"), budget=run.budget, log=run.log,
-                                   examples={c.id: c.examples for c in run.cands if c.examples})
-    except Exception as e:
+    # The examples only exist once the SOLVE replies are in, so this is the last piece of preparation.
+    if prep_error is None:
+        try:
+            V.check_oracle_examples(problem, gi, limits, workdir=oracle_dir, budget=run.budget, log=run.log,
+                                    examples={c.id: c.examples for c in run.cands if c.examples})
+        except Exception as e:
+            prep_error = e
+    if prep_error is not None:
+        e = prep_error
         run.log(f"gate.crashed {type(e).__name__}: {e}")
         if run.cands:
             run.cands[-1].evidence.append(V.Evidence("gate_error", False, detail={"error": f"{type(e).__name__}: {e}"}))

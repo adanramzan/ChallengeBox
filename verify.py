@@ -585,7 +585,15 @@ def _accept_stress_input(problem, gi: GateInputs, oracle_src: str, value, source
     gi.stress_input, gi.stress_source = value, source
     return True
 
-def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict, *, workdir: str, budget, log, examples: dict | None = None) -> GateInputs:
+def prepare_oracle_tiers(problem, oracle_src: str, limits: dict, *, workdir: str, budget, log) -> GateInputs:
+    """Everything the gate needs that depends on the ORACLE reply alone: the public examples, the
+    small and medium differential tiers, and how far the oracle's own validate() and gen() disagree.
+
+    Split out of prepare_gate_inputs so solve() can run it the moment the oracle returns, while the
+    SOLVE and STRESS calls are still in flight -- on bench14 the oracle arrived at 30 s, the stress
+    reply at 51 s, and prep did not start until 51 s even though every second of it was
+    subprocess-bound work that needed nothing from either. prepare_stress_inputs fills in the rest.
+    """
     gi = GateInputs(oracle_src=oracle_src)
     gi.cases_public, parse_notes = _parse_public_examples(problem)
     gi.notes.extend(parse_notes)
@@ -597,21 +605,24 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
     gi.oracle_src = oracle_src
     if gi.cases_public:
         _check_public_against_oracle(problem, gi, oracle_src, workdir=workdir, budget=budget, log=log)
-    _check_examples_against_oracle(problem, gi, oracle_src, examples or {}, limits, workdir=workdir, budget=budget, log=log)
     for mode, n in (("small", limits["cases_small"]), ("medium", limits["cases_medium"])):
         # The medium tier is the most expensive evidence per second (literal loops over 10^4-10^5
-        # multipliers) and the least decisive: small already catches most logic bugs. When the oracle
-        # call itself ran long enough that the budget is already past the gate phase, a repair attempt
-        # is worth more than medium coverage -- measured on bench7/5cb294c18288, where an 82 s medium
-        # pass ended at 172 s of 285 and the single repair could not even be re-gated. The tier is
-        # then skipped (not degraded: the evidence is absent, and the status says unverified).
-        if mode == "medium" and budget.phase() not in ("generate", "gate"):
-            gi.notes.append(f"medium tier skipped: budget already in the {budget.phase()} phase; time reserved for repair"); continue
-        gen = run_python_cases(oracle_src, "gen", [(s, mode) for s in range(n)], workdir=os.path.join(workdir, f"gen_{mode}"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
+        # multipliers) and the least decisive: small already catches most logic bugs. It is therefore
+        # TIME-BOXED rather than skipped by phase: on bench14 gen(seed, "medium") took 60.3 s to make
+        # 6 cases and the run never recovered that time, and then the re-prep after an oracle
+        # regeneration dropped medium entirely because the budget had moved on -- so the run's only
+        # mid-size tier was paid for twice and delivered nothing. Both batches are capped at
+        # [limits] medium_tier_budget_s; if the generator alone spends it, medium ships 0 cases and
+        # says so, rather than eating the gate's and the repair loop's time as well.
+        box = float(limits.get("medium_tier_budget_s", 20.0)) if mode == "medium" else 60.0
+        t_mode = time.monotonic()
+        gen = run_python_cases(oracle_src, "gen", [(s, mode) for s in range(n)], workdir=os.path.join(workdir, f"gen_{mode}"), timeout_s=budget.step_timeout(min(60.0, box), reserve_s=20.0))
         inputs = [r.output for r in gen if r.ok]
         if not inputs:
             gi.notes.append(f"gen({mode}) produced nothing: {(gen[0].error if gen else '')[-200:]}"); continue
-        cases, ev = make_cases(problem, oracle_src, inputs, mode, workdir=os.path.join(workdir, f"ref_{mode}"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0),
+        if mode == "medium" and time.monotonic() - t_mode >= box:
+            gi.notes.append("medium tier: time box exhausted"); continue
+        cases, ev = make_cases(problem, oracle_src, inputs, mode, workdir=os.path.join(workdir, f"ref_{mode}"), timeout_s=budget.step_timeout(min(60.0, box), reserve_s=20.0),
                                per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
         if not cases: gi.notes.append(f"reference failed on all {mode} inputs: {ev.detail['errors']}")
         # "Trusted" = this validate() actually ran and accepted something in at least one tier, so a
@@ -620,6 +631,31 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
         if ev.detail.get("checked") and not ev.detail.get("validation_skipped"):
             gi.validate_trusted = True
         setattr(gi, f"cases_{mode}", cases); _log_and_note_validation(gi, ev, mode, log)
+    # How far the oracle's own validate() and gen() disagree about the statement's preconditions.
+    # The edge tier's counts are recorded by prepare_stress_inputs but deliberately excluded here:
+    # those inputs come from the independent STRESS author, so they are corroboration, not evidence
+    # about this oracle's gen().
+    gen_tiers = [v for t, v in gi.validate_rejects.items() if t in ("small", "medium")]
+    checked = sum(c for c, _, _ in gen_tiers)
+    rejected = sum(r for _, r, _ in gen_tiers)
+    if checked and rejected:
+        gi.validate_reject_frac = rejected / checked
+        gi.notes.append(f"validate() rejected, or reference() crashed on, {rejected} of {checked} inputs its own gen() produced (small+medium)")
+    return gi
+
+def check_oracle_examples(problem, gi: GateInputs, limits: dict, *, workdir: str, budget, log, examples: dict) -> None:
+    """The hand-traced examples against the prepared oracle. Separate from prepare_oracle_tiers
+    because the examples arrive with the SOLVE replies, which land after the oracle does."""
+    if gi.oracle_src.strip():
+        _check_examples_against_oracle(problem, gi, gi.oracle_src, examples or {}, limits, workdir=workdir, budget=budget, log=log)
+
+def prepare_stress_inputs(problem, gi: GateInputs, stress_src: str, limits: dict, *, workdir: str, budget, log) -> None:
+    """The parts that need the STRESS reply: the edge fixtures and the max-size timing input. Fills
+    `gi` in place -- GateInputs stays the single result of preparation, whichever order it was
+    assembled in."""
+    oracle_src = gi.oracle_src
+    if not oracle_src.strip():
+        return
     if stress_src.strip():
         stress_src = _STDLIB_PREAMBLE + stress_src
         edges = run_python_cases(stress_src + "\ndef _edges():\n    return list(EDGES)\n", "_edges", [()], workdir=os.path.join(workdir, "edges"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
@@ -639,7 +675,7 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
     # product: with it gone the timing check had nothing to run on. The oracle writes a generator from
     # the same statement, in its own context, so its "large" mode is a second, independent source of a
     # real maximum-size input -- tried before falling back to a medium case, which is not one.
-    if gi.stress_input is None and oracle_src.strip():
+    if gi.stress_input is None:
         lg = run_python_cases(oracle_src, "gen", [(1, "large")], workdir=os.path.join(workdir, "gen_large"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         if not (lg and lg[0].ok):
             gi.notes.append("gen(large) failed: " + ((lg[0].error[-200:] if lg else "") or "no output"))
@@ -667,15 +703,13 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
         gi.notes.append("stress input degraded: no usable gen_max or gen(large) output, using largest medium case instead (not a true max-size input)")
     if gi.stress_input is not None:
         log(f"stress.input source={gi.stress_source} size={_input_size(gi.stress_input)}")
-    # How far the oracle's own validate() and gen() disagree about the statement's preconditions.
-    # Edge counts are recorded above but deliberately excluded here: those inputs come from the
-    # independent STRESS author, so they are corroboration, not evidence about this oracle's gen().
-    gen_tiers = [v for t, v in gi.validate_rejects.items() if t in ("small", "medium")]
-    checked = sum(c for c, _, _ in gen_tiers)
-    rejected = sum(r for _, r, _ in gen_tiers)
-    if checked and rejected:
-        gi.validate_reject_frac = rejected / checked
-        gi.notes.append(f"validate() rejected, or reference() crashed on, {rejected} of {checked} inputs its own gen() produced (small+medium)")
+
+def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict, *, workdir: str, budget, log, examples: dict | None = None) -> GateInputs:
+    """All three phases in one call, for every caller that has the oracle, the stress source and the
+    examples in hand at once (regenerate_oracle, and the tests)."""
+    gi = prepare_oracle_tiers(problem, oracle_src, limits, workdir=workdir, budget=budget, log=log)
+    check_oracle_examples(problem, gi, limits, workdir=workdir, budget=budget, log=log, examples=examples or {})
+    prepare_stress_inputs(problem, gi, stress_src, limits, workdir=workdir, budget=budget, log=log)
     return gi
 
 def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, mem_mb: int, degraded: bool = False, min_plausible_s: float = 0.0) -> Evidence:

@@ -526,15 +526,22 @@ def test_a_genuinely_constant_answer_survives_when_validate_accepts(tmp_path):
     assert len(gi.cases_small) == 4 and not any("cannot parse" in n for n in gi.notes)
 
 
-def test_medium_tier_yields_to_repair_when_the_budget_is_already_late(tmp_path):
+def test_medium_tier_is_time_boxed_rather_than_skipped_by_phase(tmp_path):
+    # The medium tier used to be dropped outright once the budget left the gate phase, which cost
+    # bench14 its only mid-size tier on the re-prep after an oracle regeneration -- with time still
+    # on the clock. It is now bounded by limits.medium_tier_budget_s instead, so a late budget still
+    # gets medium coverage, and a slow gen() cannot spend more than the box.
     class LateBudget(FakeBudget):
         def phase(self): return "repair"
     limits = {"cases_small": 5, "cases_medium": 3, "mem_mb": 2048}
     gi = V.prepare_gate_inputs(PY, ORACLE, "", limits, workdir=str(tmp_path / "gi"), budget=LateBudget(), log=lambda m: None)
-    assert len(gi.cases_small) == 5 and gi.cases_medium == []
-    assert any("medium tier skipped" in n for n in gi.notes)
-    gi2 = V.prepare_gate_inputs(PY, ORACLE, "", limits, workdir=str(tmp_path / "gi2"), budget=FakeBudget(), log=lambda m: None)
-    assert len(gi2.cases_medium) == 3
+    assert len(gi.cases_small) == 5 and len(gi.cases_medium) == 3
+    # a gen() whose medium mode alone spends the box yields 0 medium cases, and says why
+    slow = ORACLE.replace("def gen(seed, mode):\n", "import time\ndef gen(seed, mode):\n    if mode == 'medium':\n        time.sleep(0.4)\n")
+    boxed = dict(limits, medium_tier_budget_s=0.5)
+    gi2 = V.prepare_gate_inputs(PY, slow, "", boxed, workdir=str(tmp_path / "gi2"), budget=FakeBudget(), log=lambda m: None)
+    assert len(gi2.cases_small) == 5 and gi2.cases_medium == []
+    assert any("medium tier: time box exhausted" in n or "gen(medium) produced nothing" in n for n in gi2.notes)
 
 
 def test_repairing_a_root_again_shows_the_failed_childs_diff():
