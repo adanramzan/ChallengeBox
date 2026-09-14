@@ -155,6 +155,24 @@ def test_parse_blocks_no_fence_unchanged():
     t = "===CODE===\nplain text no fence\n===END===\n"
     assert parse_blocks(t)["CODE"] == "plain text no fence"
 
+# An unclosed fence: the model opened ```python inside the block and closed it after ===END===, so
+# the marker line landed in the candidate and every such candidate failed static (round 13, both runs).
+def test_parse_blocks_strips_an_unclosed_leading_fence():
+    t = "===CODE===\n```python\nx = 1\n===END===\n"
+    assert parse_blocks(t)["CODE"] == "x = 1"
+
+def test_parse_blocks_strips_an_unmatched_trailing_fence():
+    t = "===CODE===\nx = 1\n```\n===END===\n"
+    assert parse_blocks(t)["CODE"] == "x = 1"
+
+def test_parse_blocks_strips_both_unmatched_fence_lines():
+    # not a matched pair: the opener has a language tag and no closer of its own before the body ends
+    assert parse_blocks("===CODE===\n```py\n```\n===END===\n")["CODE"] == ""
+
+def test_parse_blocks_keeps_a_code_line_that_merely_starts_with_backticks():
+    t = "===CODE===\ns = '```not a fence'\nx = 1\n===END===\n"
+    assert parse_blocks(t)["CODE"] == "s = '```not a fence'\nx = 1"
+
 def test_calls_record_the_served_model_not_the_requested_slug(server):
     # Minor fix: `calls` used to record the requested model slug (Role.model) unconditionally; it
     # should record what the provider actually served (Reply.model / response "model" field).

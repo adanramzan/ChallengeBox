@@ -140,13 +140,23 @@ class LLM:
 
 _BLOCK = re.compile(r"===([A-Z_]+)===\s*\n(.*?)(?:\n===END===|\Z)", re.S)
 _FENCE = re.compile(r"```[a-zA-Z0-9_+-]*[ \t]*\n(.*?)\n```", re.S)
+_OPEN_FENCE = re.compile(r"^```[a-zA-Z0-9_+-]*[ \t]*$")
+_CLOSE_FENCE = re.compile(r"^```[ \t]*$")
 
 
 def _unfence(body: str) -> str:
     fences = _FENCE.findall(body)
-    if not fences:
-        return body
-    return max(fences, key=len).strip()
+    if fences:
+        return max(fences, key=len).strip()
+    # A fence opened inside the block and closed after ===END=== leaves an unmatched marker line in
+    # the body; left in place it is a syntax error and the whole candidate scores zero. Only a line
+    # that is nothing but the marker counts, so backticks inside a string literal are untouched.
+    lines = body.split("\n")
+    if lines and _OPEN_FENCE.match(lines[0]):
+        lines = lines[1:]
+    if lines and _CLOSE_FENCE.match(lines[-1]):
+        lines = lines[:-1]
+    return "\n".join(lines)
 
 
 def parse_blocks(text: str) -> dict[str, str]:
