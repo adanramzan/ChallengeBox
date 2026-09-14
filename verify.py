@@ -1,6 +1,6 @@
 """Verification: cases from the oracle, differential, behavior, stress, shrink, repair glue."""
 from __future__ import annotations
-import ast, difflib, os, re, time
+import ast, collections, difflib, os, re, time
 from dataclasses import dataclass, field
 from sandbox import CaseResult, run_python_cases, compile_rust, compile_rust_with_imports, run_rust_cases, tokens
 from llm import parse_blocks
@@ -807,6 +807,94 @@ def _fmt_typed(v, limit: int = 4000) -> str:
     # next to the value removes any doubt for the repair model. Display only -- same() is untouched.
     return f"{_fmt(v, limit)}  (type: {type(v).__name__})"
 
+_SHAPE_NODE_CAP = 200_000   # ponytail: bounded scan, not a sample -- raise it if a real input is ever bigger
+
+def _shape_stats(v) -> tuple[int, int | None]:
+    """(nesting depth, largest integer magnitude) of one value, by explicit stack: a max-size input
+    can be deeper than Python's recursion limit. Bounded by _SHAPE_NODE_CAP nodes."""
+    depth, biggest, seen = 0, None, 0
+    stack = [(v, 1)]
+    while stack and seen < _SHAPE_NODE_CAP:
+        cur, d = stack.pop(); seen += 1
+        depth = max(depth, d)
+        if isinstance(cur, bool):
+            continue
+        if isinstance(cur, int):
+            biggest = abs(cur) if biggest is None else max(biggest, abs(cur))
+        elif isinstance(cur, dict):
+            for k, val in cur.items(): stack.append((k, d + 1)); stack.append((val, d + 1))
+        elif isinstance(cur, (list, tuple, set, frozenset)):
+            for e in cur: stack.append((e, d + 1))
+    return depth, biggest
+
+def _op_histogram(v) -> list:
+    """How often each operation kind appears, when the argument is a list of records whose first
+    element names the operation -- the shape every operation-sequence statement in the samples uses.
+    Empty for anything else."""
+    if not isinstance(v, (list, tuple)) or not v:
+        return []
+    if not all(isinstance(e, (tuple, list)) and e and isinstance(e[0], str) for e in v[:50]):
+        return []
+    c = collections.Counter(e[0] for e in v if isinstance(e, (tuple, list)) and e and isinstance(e[0], str))
+    return c.most_common(10)
+
+def describe_input(value, limit: int = 1500) -> str:
+    """A description of an input's SHAPE, for a prompt that must not carry the input itself -- the
+    max-size stress input is megabytes, and pasting it would crowd out the statement. Generic over
+    nested tuples/lists/dicts/strings/ints: per argument, its type, its length, how deeply it nests,
+    the largest integer magnitude anywhere inside it, and the operation mix when it is a list of
+    records. That is what tells a model which quantity its next algorithm has to be cheap in."""
+    args = value if isinstance(value, tuple) else (value,)
+    lines = []
+    for i, a in enumerate(args):
+        parts = [f"type {type(a).__name__}"]
+        if isinstance(a, (str, bytes, list, tuple, dict, set, frozenset)):
+            parts.append(f"length {len(a)}")
+        if isinstance(a, str):
+            parts.append(f"{len(a.split())} whitespace-separated tokens")
+        d, biggest = _shape_stats(a)
+        if d > 1:
+            parts.append(f"nesting depth {d}")
+        if biggest is not None:
+            parts.append(f"largest integer magnitude {biggest}")
+        hist = _op_histogram(a)
+        if hist:
+            parts.append("operation kinds " + ", ".join(f"{k}x{n}" for k, n in hist))
+        lines.append(f"argument {i + 1}: " + "; ".join(parts))
+    return _fmt("\n".join(lines), limit)
+
+def expected_source(kind: str) -> str:
+    """Where the `expected` value of a differential failure came from. Named in every prompt that
+    shows one, because how much the model should trust it differs by source."""
+    if kind == "diff_examples":
+        return "from the solution author's own hand trace of the statement, which may itself be wrong"
+    if kind == "diff_public":
+        return "from a public example shipped with the problem statement: this one is ground truth"
+    return "from an independent literal reference, which may itself be wrong"
+
+def previous_attempt_section(problem, cand, failed: Evidence, gi: GateInputs) -> str:
+    """The `{{previous_attempt}}` section of a fresh SOLVE prompt: what the last attempt did, and
+    the concrete failure that ended it. A timing failure deliberately carries the input's SHAPE
+    rather than the input (megabytes of it), plus the measured duration against the limit."""
+    algorithm = (getattr(cand, "algorithm", "") or "").strip() or "(the previous reply recorded no algorithm block)"
+    head = ("A previous solution to this statement failed. Its algorithm and code follow, then the failure.\n"
+            "Choose a DIFFERENT algorithm or data structure that removes the cause named below; do not "
+            "resubmit a variant of this approach.\n\n"
+            f"Previous algorithm:\n{_fmt(algorithm, 3000)}\n\n"
+            f"Previous code:\n{_fmt(cand.source, 6000)}\n\n")
+    if failed.kind == "stress":
+        d = failed.detail
+        return (head + "Failure: it was too slow on a maximum-size input. The input itself is too large to show; "
+                "this is its shape:\n"
+                f"{describe_input(gi.stress_input)}\n"
+                f"measured duration {d.get('duration_s')} s vs limit {d.get('limit_s')} s\n"
+                f"timed out: {'yes' if d.get('timed_out') else 'no'}\n"
+                "A smaller edit cannot fix this: the complexity of the approach is what has to change.\n")
+    return (head + f"Failure: it disagreed with a checked expected value ({failed.kind}).\n"
+            f"Input:\n{_fmt_typed(failed.detail.get('input'))}\n"
+            f"Expected ({expected_source(failed.kind)}):\n{_fmt_typed(failed.detail.get('expected'))}\n"
+            f"Actual:\n{_fmt_typed(failed.detail.get('actual'))}\n")
+
 def _previous_attempt_note(run, cand, failed: Evidence) -> str:
     """If `cand` is itself the result of an earlier repair, describe that attempt: the input it was
     given, what it changed, and that the candidate above still fails -- so the model doesn't repeat a
@@ -868,22 +956,23 @@ def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, 
         si = gi.stress_input if isinstance(gi.stress_input, str) else repr(gi.stress_input)
         detail["input"] = si[:1500] + (f"\n(max-size input, {len(si)} characters total; truncated)" if len(si) > 1500 else "")
     agreement = _agreement_note(run, cand, failed, gi, detail)
-    pv_repair = {**pv, "statement": _fmt(pv["statement"], 12000)}
+    pv_repair = {**pv, "statement": _fmt(pv["statement"], 12000), "previous_attempt": previous_attempt}
     # Derived from config.toml's [phases].repair_call_share, not a literal fraction -- see
     # regenerate_oracle's identical use of generate_call_share, and BENCHMARK-FINDINGS.md F6 for
     # what goes wrong when a phase cap is hardcoded instead (raising the config knob then does
     # nothing because the hardcoded fraction still wins the min() in Run.chat/step_timeout).
     repair_cap = run.cfg["phases"]["repair_call_share"] * run.budget.usable_s
-    expected_source = ("from the solution author's own hand trace of the statement, which may itself be wrong"
-                       if failed.kind == "diff_examples" else
-                       "from an independent literal reference, which may itself be wrong")
-    r = run.chat("strong", "repair", repair_cap, kind=failed.kind, expected_source=expected_source,
+    r = run.chat("strong", "repair", repair_cap, kind=failed.kind, expected_source=expected_source(failed.kind),
                  input=_fmt_typed(detail.get("input")), expected=_fmt_typed(detail.get("expected")),
                  actual=_fmt_typed(detail.get("actual")), details=_fmt({k: v for k, v in detail.items() if k not in ("input", "expected", "actual")}),
-                 code=_fmt(cand.source), previous_attempt=previous_attempt, agreement=agreement,
+                 code=_fmt(cand.source), agreement=agreement,
                  reference=_fmt(gi.oracle_src, 8000) if gi.oracle_src.strip() else "(no reference available)", **pv_repair)
     blocks = parse_blocks(r.text)
-    verdict = "oracle" if blocks.get("VERDICT", "").strip().lower().startswith("oracle") else "candidate"
+    # "approach": the model says no patch of this code can meet the stated limits. Its CODE block is
+    # then the current code unchanged (the prompt asks for that), so solve() starts a fresh solution
+    # from a different algorithm instead of minting a child that changes nothing.
+    said = blocks.get("VERDICT", "").strip().lower()
+    verdict = next((v for v in ("oracle", "approach") if said.startswith(v)), "candidate")
     run.log(f"repair.verdict={verdict}")
     return blocks.get("CODE", ""), verdict
 

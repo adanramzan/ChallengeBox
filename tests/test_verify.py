@@ -668,3 +668,43 @@ def test_shrink_value_never_yields_an_empty_sequence():
     assert all(len(c) > 0 for c in V._shrink_value([1, 2, 3, 4]) if isinstance(c, list))
     assert all(c != [] for c in V._shrink_value([7]))   # a one-element list shrinks its element, never to []
     assert all(len(c) > 0 for c in V._shrink_value((1, 2)) if isinstance(c, tuple))
+
+
+# --- round 13: the fresh-solve path ---
+
+def test_describe_input_names_the_shape_not_the_values():
+    # A timing failure cannot show the model its input (megabytes of it), so the fresh SOLVE prompt
+    # carries the shape instead: what the next algorithm has to be cheap in.
+    v = ([("add", 1, [2, 3]), ("del", 4, [])], {"k": [[[9]]]}, 10**18)
+    s = V.describe_input(v)
+    assert "argument 1: type list; length 2" in s
+    assert "operation kinds addx1, delx1" in s
+    assert "nesting depth 4" in s
+    assert "argument 3: type int; largest integer magnitude 1000000000000000000" in s
+    assert "argument 2: type dict; length 1" in s
+
+def test_describe_input_handles_strings_and_stays_capped():
+    assert "type str; length 5; 3 whitespace-separated tokens" in V.describe_input("1 2\n3")
+    big = V.describe_input(tuple([list(range(200))] * 400))
+    assert len(big) < 1600 and "truncated" in big
+
+def test_previous_attempt_section_carries_the_shape_for_a_timing_failure(tmp_path):
+    class C:
+        source = "def f(xs):\n    return 0\n"
+        algorithm = "re-sum every prefix"
+    gi = V.GateInputs(stress_input=(list(range(500)),))
+    failed = V.Evidence("stress", False, 1, 0.0, {"duration_s": 7.5, "limit_s": 5.0, "timed_out": False, "too_slow": True})
+    s = V.previous_attempt_section(PY, C(), failed, gi)
+    assert "re-sum every prefix" in s and "def f(xs)" in s
+    assert "argument 1: type list; length 500" in s and "measured duration 7.5 s vs limit 5.0 s" in s
+    assert "timed out: no" in s
+    assert "497, 498, 499" not in s   # the shape, never the input itself
+
+def test_previous_attempt_section_names_where_the_expected_value_came_from(tmp_path):
+    class C:
+        source = "def add(a, b):\n    return a + b\n"
+        algorithm = "add them"
+    failed = V.Evidence("diff_examples", False, 1, 0.0, {"input": (1, 2), "expected": 4, "actual": 3})
+    s = V.previous_attempt_section(PY, C(), failed, V.GateInputs())
+    assert "solution author's own hand trace" in s and "(type: tuple)" in s
+    assert "public example" in V.expected_source("diff_public")

@@ -52,6 +52,8 @@ class Candidate:
     evidence: list = field(default_factory=list)
     examples: list = field(default_factory=list)   # the author's hand-traced (input, expected) cases
     examples_dropped: int = 0                      # lines of the ===EXAMPLES=== block that did not parse
+    algorithm: str = ""                            # the reply's ===ALGORITHM=== (or ===DESIGN===) block
+    replaces: str | None = None                    # set on a fresh solve: the candidate whose failure asked for this one
 
     def passed_count(self) -> int:
         return sum(1 for e in self.evidence if e.passed and not e.skipped)
@@ -102,7 +104,10 @@ def prompt_vars(p: Problem) -> dict:
             "language_rules": " ".join(filter(None, (_LANG_RULES[p.language].format(ep=p.entrypoint), io_rules))),
             "oracle_signature": (f"Define reference(*args) with the same parameters as {p.entrypoint} and the same return value." if py
                                  else "Define reference(stdin_text: str) -> str that returns the exact expected stdout for that stdin."),
-            "gen_returns": "a tuple of positional arguments" if py else "the stdin text as a str"}
+            "gen_returns": "a tuple of positional arguments" if py else "the stdin text as a str",
+            # Empty for the concurrent SOLVE calls, which have no previous attempt; fresh_solve()
+            # overrides it with the failed attempt and the failure that ended it.
+            "previous_attempt": ""}
 
 
 class Run:
@@ -166,9 +171,52 @@ def candidate_score(c: Candidate) -> tuple:
     return (c.passed_count(), -mismatches, -failures, -int(c.id[1:]))
 
 
+def regression_score(c: Candidate) -> tuple:
+    """How a repaired child is compared against the parent it came from. Deliberately NOT
+    candidate_score's mismatch totals: the child is gated against its parent's case set *plus* the
+    regression case the parent's failure produced, so the two mismatch counts are over different
+    inputs and are not comparable. Steps passed and steps failed are."""
+    return (c.passed_count(), -sum(1 for e in c.evidence if not e.passed and not e.skipped))
+
+
 def best_candidate(cands: list[Candidate]) -> Candidate | None:
     if not cands: return None
     return max(cands, key=candidate_score)
+
+
+# One gate pass, for the affordability check before a fresh solve. Taken from the measured numbers
+# in config.toml's comments -- a differential tier is bounded at 60 s and the expensive ones (an 82 s
+# medium pass, a 60.9 s edge pass) are what dominate -- not from a knob, because a fresh solve's real
+# cost is one strong call (repair_afford_s covers that shape) plus re-gating the result.
+GATE_PASS_ESTIMATE_S = 60.0
+
+
+def fresh_solve(run, prev_cand, failed, gi, pv) -> "Candidate | None":
+    """One more SOLVE call that starts over from a different algorithm, carrying the previous
+    attempt and the concrete failure that ended it.
+
+    This exists because with a fixed model a patch cannot reach a second algorithm: round 13's four
+    candidates for one statement were all asymptotically wrong in the same way, and every repair was
+    a variant of the same approach. The new candidate is a ROOT (parent None) -- it is not a repair
+    of anything -- and competes for emission through candidate_score like any other."""
+    gen_cap = run.cfg["phases"]["generate_call_share"] * run.budget.usable_s
+    section = V.previous_attempt_section(run.p, prev_cand, failed, gi)
+    r = run.chat("strong", "solve", gen_cap, **{**pv, "previous_attempt": section})
+    blocks = parse_blocks(r.text)
+    code = blocks.get("CODE", "")
+    if not code.strip() or any(c.source.strip() == code.strip() for c in run.cands):
+        run.log("solve.fresh no new code in the reply"); return None
+    nc = run.add_candidate(code, None)
+    nc.replaces = prev_cand.id
+    nc.evidence.append(static_evidence(run.p, code))
+    ex_block = blocks.get("EXAMPLES", "")
+    # The examples describe the statement, not the approach: keep the previous attempt's when this
+    # reply carried none, so the new candidate is held to the same hand trace.
+    nc.examples = V.parse_examples(run.p, ex_block) or prev_cand.examples
+    nc.examples_dropped = max(0, V.example_line_count(ex_block) - len(nc.examples))
+    nc.algorithm = blocks.get("ALGORITHM") or blocks.get("DESIGN", "")
+    run.log(f"solve.fresh candidate={nc.id} replaces={prev_cand.id} examples={len(nc.examples)}")
+    return nc
 
 
 def write_solution(out_path: str, source: str):
@@ -211,6 +259,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         ex_block = blocks.get("EXAMPLES", "")
         cand.examples = V.parse_examples(problem, ex_block)
         cand.examples_dropped = max(0, V.example_line_count(ex_block) - len(cand.examples))
+        cand.algorithm = blocks.get("ALGORITHM") or blocks.get("DESIGN", "")
         run.log(f"solve.examples id={cand.id} parsed={len(cand.examples)} dropped={cand.examples_dropped}")
     oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
     # The oracle is the single source of ground truth for every gate step, so a timeout here
@@ -295,6 +344,16 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             gi = prev
     repairs = 0
     syntax_repairs = 0
+    fresh_solves = 0
+    no_repair: set[str] = set()   # lineages a regression closed: another patch there is the same losing bet
+
+    def can_fresh_solve() -> bool:
+        """A fresh solve costs one strong call plus a gate pass on its result, so it is only started
+        while the budget still covers both (and the cost cap and the per-run count allow it)."""
+        return (fresh_solves < cfg["limits"].get("max_fresh_solves", 1)
+                and run.budget.can_afford(cfg["limits"]["repair_afford_s"] + GATE_PASS_ESTIMATE_S)
+                and not run.over_cost())
+
     while run.cands:
         # Gate every attempt that still has only its static evidence before spending a repair: a
         # second independent attempt is cheaper than a repair and often already correct. Once all
@@ -312,6 +371,14 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
                     cand.source = patched
                     with open(os.path.join(run.dir, "candidates", f"{cand.id}.{run.ext()}"), "w", encoding="utf-8") as f: f.write(patched)
                     run.log(f"candidate.imports_added id={cand.id}")
+                # A repaired child that now scores below the parent it came from is a regression: the
+                # repair made the candidate worse, and another patch down the same lineage is the
+                # same losing bet (round-10 L1). The parent already wins emission on score; what has
+                # to stop is repairing this lineage.
+                parent = next((c for c in run.cands if c.id == cand.parent), None)
+                if parent is not None and regression_score(cand) < regression_score(parent):
+                    run.log(f"repair.regressed child={cand.id} parent={parent.id}")
+                    no_repair.update({cand.id, parent.id})
             if cand.all_passed():
                 # "static"/"compile" are pre-flight checks, not verification against the oracle; if
                 # everything past them was skipped, nothing was actually checked -- don't log this as
@@ -339,6 +406,24 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
                 run.log("gate.passed"); break
             if ungated and cand.id != ungated[0].id:
                 run.log(f"repair.target {cand.id} (best of {len(run.cands)} candidates), not the last gated")
+            # Two failures a patch cannot fix, both routed to a fresh solution from a different
+            # algorithm instead of to the patch-style repair: a timing failure on a real max-size
+            # input (a smaller edit does not change an approach's complexity -- round-10 L2, round-13
+            # G4, where all four candidates for one statement were asymptotically wrong in the same
+            # way), and a lineage a repair already made worse (round-10 L1). A degraded stress input
+            # is excluded: its timing is not a max-size measurement and must not drive a re-solve.
+            timing = failed.kind == "stress" and failed.detail.get("too_slow") and not failed.detail.get("degraded")
+            fresh_why = "stress timing" if timing else "repair regression" if cand.id in no_repair else ""
+            if fresh_why:
+                if can_fresh_solve():
+                    fresh_solves += 1
+                    run.log(f"solve.fresh reason={fresh_why} previous={cand.id}")
+                    if fresh_solve(run, cand, failed, gi, pv) is not None:
+                        continue
+                # No budget, no cost headroom, no attempts left, or no usable reply: there is nothing
+                # else to try on this failure -- the best candidate so far is what gets emitted.
+                run.log(f"solve.fresh unavailable reason={fresh_why}")
+                break
             # A static/compile failure is mechanical (missing import, missing mut), not a semantic
             # defect -- it gets its own small budget so it can't eat the attempts meant for an actual
             # behavioral bug (diff_*, behavior, stress, overflow).
@@ -366,11 +451,22 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
                     run.log("oracle.regen failed: stopping repair loop"); break
                 cand.evidence = cand.evidence[:1]   # re-gate the same candidate against the new oracle
                 continue
+            if verdict == "approach":
+                # The model says no patch of this code can meet the stated limits, and repair.md asks
+                # it to return the current code unchanged with that verdict -- so there is no child to
+                # mint. Start over from a different algorithm instead.
+                if can_fresh_solve():
+                    fresh_solves += 1
+                    run.log(f"solve.fresh reason=approach_verdict previous={cand.id}")
+                    if fresh_solve(run, cand, failed, gi, pv) is not None:
+                        continue
+                run.log("solve.fresh unavailable reason=approach_verdict")
+                break
             if new_source.strip() and new_source.strip() != cand.source.strip():
                 nc = run.add_candidate(new_source, cand.id); nc.evidence.append(static_evidence(problem, new_source))
                 # The examples describe the problem, not the code: a repaired child inherits them and
                 # is held to the same hand trace its parent was.
-                nc.examples, nc.examples_dropped = cand.examples, cand.examples_dropped
+                nc.examples, nc.examples_dropped, nc.algorithm = cand.examples, cand.examples_dropped, cand.algorithm
             else:
                 break
         except Exception as e:
@@ -412,7 +508,8 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     report = {"problem_id": problem.problem_id, "language": problem.language, "profile": cfg.get("profile"), "deadline_s": problem.deadline_s,
               "deadline_scale": deadline_scale, "elapsed_s": round(run.budget.elapsed(), 1), "status": status,
               "solver_status": solver_status,
-              "final_candidate": best.id if best else None, "repairs": repairs, "syntax_repairs": syntax_repairs, "oracle_regenerated": gi.oracle_regens,
+              "final_candidate": best.id if best else None, "repairs": repairs, "syntax_repairs": syntax_repairs,
+              "fresh_solves": fresh_solves, "replaces": {c.id: c.replaces for c in run.cands}, "oracle_regenerated": gi.oracle_regens,
               "oracle_selfrepaired": gi.oracle_selfrepairs,
               "evidence": {c.id: [asdict(e) for e in c.evidence] for c in run.cands}, "parents": {c.id: c.parent for c in run.cands},
               "examples": {c.id: {"count": len(c.examples), "dropped": c.examples_dropped} for c in run.cands},

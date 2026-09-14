@@ -107,7 +107,7 @@ Usable time is `deadline_s` minus a 15-second safety margin. Phases are expresse
 | 0–5 | 2% | intake | parse, validate, build contract, start clock |
 | 5–95 | 30% | generate | three concurrent model calls, each capped at `[phases].generate_call_share` (config.toml, default 0.55) of usable time — since they run concurrently, the phase costs max() of the three, not their sum, so each can get most of the phase rather than a third of it; role caps underneath: strong 120 s, fast 150 s |
 | 95–115 | 7% | gate | compile, contract checks, differential, stress |
-| 115–235 | 40% | repair | up to two shrink → repair → gate cycles, each capped at 60 s |
+| 115–235 | 40% | repair | up to two shrink → repair → gate cycles, each capped at 60 s, plus at most one fresh solve (§5.7) while `repair_afford_s` + one gate pass (~60 s) still fits |
 | 235–270 | 12% | settle | no new model calls; the last gate result stands; write report |
 | 270–285 | 5% | emit | write the solution file atomically |
 | 285–300 | 5% | margin | reserved; never scheduled |
@@ -122,7 +122,7 @@ latency, and a run with no oracle verifies nothing.
 
 ### 4.2 Why this fits
 
-Serious reasoning calls take 20 to 90 seconds each. A sequential analyzer → architect → judge → coder → critic → tester → repairer chain is seven calls before the first verified candidate and does not fit. This design issues three calls at once, then spends the remaining time on deterministic checks and at most two repairs. Worst case is five model calls plus one optional adjudication call.
+Serious reasoning calls take 20 to 90 seconds each. A sequential analyzer → architect → judge → coder → critic → tester → repairer chain is seven calls before the first verified candidate and does not fit. This design issues three calls at once, then spends the remaining time on deterministic checks and at most two repairs. Worst case is five model calls plus one optional adjudication call and one optional fresh solve.
 
 ---
 
@@ -155,6 +155,10 @@ filled the token budget with prose before reaching the code; the configured stro
 tokens with no reasoning block, so a short quoted restatement first is affordable — and it is the
 restatement, not the code, that catches a misreading of the statement. The orchestrator parses by
 marker, so the order is a prompt decision only.
+
+The prompt carries one optional section on top of those six, `{{previous_attempt}}`, which is empty
+for the concurrent generation calls and filled in only for a **fresh solve** (§5.7.1): the failed
+attempt's algorithm and code, and the concrete failure that ended it.
 
 Language-specific instructions baked into the prompt:
 
@@ -291,6 +295,45 @@ A regenerated oracle is then cross-checked against the one it replaces: the new 
 The repair prompt also carries two things it lacked: how wholesale the disagreement is (`mismatches` of `cases`, measured on the failing tier, or against `cases_small` when the failure was a single edge/public case) — a disagreement on most inputs is a different reading of the statement, not a boundary bug — and the reference source itself, which the prompt asks it to trace, labelled as possibly-wrong and never to be copied. A `stress` failure that is a crash also carries the head of the max-size input, so the panic has a format and a scale attached to it.
 
 After every repair the full gate reruns, and every previously failing case is kept as a regression case.
+
+#### 5.7.1 Fresh solve: the failures a patch cannot fix
+
+Three failures are routed away from the patch-style repair and into one more SOLVE call that starts
+over from a **different algorithm**, carrying the previous attempt and the concrete failure that
+ended it (`solve.fresh_solve`, `[limits] max_fresh_solves`, default 1):
+
+1. **A timing failure** — the `stress` step measured the candidate too slow (or timed out) on a real
+   max-size input. A smaller edit cannot change an approach's complexity, so this never goes to
+   repair. A *degraded* stress input is excluded: its timing is not a max-size measurement.
+2. **`===VERDICT=== approach`** — the repair model itself says no patch of this code can meet the
+   stated limits, or the algorithm is wrong at its core. `repair.md` asks it to return the current
+   code unchanged with that verdict, so there is nothing to mint as a child.
+3. **A repair that regressed** — a repaired child that passes fewer gate steps, or fails more, than
+   the parent it came from (round-10 L1). The lineage is closed (`repair.regressed child=cX
+   parent=cY`); the parent already wins emission on score. The comparison deliberately ignores
+   `candidate_score`'s mismatch totals, because the child was gated against its parent's case set
+   *plus* the regression case the parent's failure produced, so the two totals are over different
+   inputs.
+
+The prompt is `solve.md` with its optional `{{previous_attempt}}` section filled in (it is empty
+everywhere else): the previous attempt's `===ALGORITHM===` block and its code, then the failure —
+input/expected/actual with the source of *expected* named for a differential failure, and for a
+timing failure the input's **shape** rather than the input (`verify.describe_input`: per argument,
+type, length, nesting depth, largest integer magnitude, and the operation-kind histogram when it is
+a list of records) plus the measured duration against the limit. The max-size input is megabytes;
+pasting it would crowd out the statement, and the shape is what says which quantity the next
+algorithm has to be cheap in.
+
+The result is a **root** candidate (`parent` is `None`, `replaces` names the attempt it answers, both
+in the report): it is not a repair of anything, it is gated like any other attempt, and it competes
+for emission through `candidate_score` on its own evidence. A fresh solve costs one strong call plus
+a gate pass on its result, so it starts only while `budget.can_afford(repair_afford_s + ~60 s)`, the
+cost cap allows it, and `max_fresh_solves` is not yet spent; otherwise the loop stops and the best
+candidate so far is emitted.
+
+Why it exists: with a fixed model, a re-solve carrying the concrete failure is the only path to a
+second algorithm. Round 13 produced four independent candidates for one statement, all asymptotically
+wrong in the same way, and every repair was a variant of the same approach (G4).
 
 ### 5.8 Finalize
 

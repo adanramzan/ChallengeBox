@@ -22,7 +22,7 @@ input. Then change only what that sentence names. A rewrite of the whole approac
 right response to a single failing input; if you believe the approach itself is fundamentally wrong,
 say so plainly before ===VERDICT=== instead of silently rewriting it.
 
-If the approach cannot meet the stated maximum constraints, say so plainly in one sentence before ===VERDICT===, and still return the best correction you can. Do not patch one output while keeping an approach that iterates a count the statement bounds by a huge number, or rescans the whole structure once per operation.
+If the failure proves this approach cannot meet the stated limits, or the algorithm is wrong at its core, the verdict is `approach`: say so plainly in one sentence, name the quantity it is too expensive in, and return the current code unchanged. Do not patch one output while keeping an approach that iterates a count the statement bounds by a huge number, or rescans the whole structure once per operation — a smaller edit cannot change the complexity of an approach. A fresh solution will be written from a different algorithm, and this verdict is what asks for one.
 
 Then hand-trace the statement on this input, and decide which side is actually wrong.
 
@@ -43,9 +43,10 @@ Respond with:
 
 ===VERDICT===
 candidate   (if the solution is wrong)  or  oracle   (if the reference is wrong and the solution is right)
+or  approach   (if no patch can meet the stated limits: the algorithm itself has to change)
 ===END===
 ===CODE===
-the full corrected solution (repeat the current one unchanged if VERDICT is oracle)
+the full corrected solution (repeat the current one unchanged if VERDICT is oracle or approach)
 ===END===
 
 Statement:

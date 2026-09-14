@@ -916,3 +916,88 @@ def test_solve_prompt_restates_the_rules_before_the_code(tmp_path):
     order = [m.group(1) for m in re.finditer(r"^===([A-Z]+)===$", rendered, re.M) if m.group(1) != "END"]
     assert order == ["RULES", "DESIGN", "CODE", "EXAMPLES", "TRAPS", "ALGORITHM"]
     assert "at most about 25 lines" in rendered
+
+
+# --- round 13: the fresh-solve path ---
+
+def sumprob(tmp_path):
+    return Problem("pid", "python", "Given a list xs of ints, return the sum of all its prefix sums.", "f", [], 300.0)
+
+SOLVE_QUADRATIC = ("===CODE===\ndef f(xs):\n    t = 0\n    for i in range(len(xs)):\n        t += sum(xs[:i + 1])\n    return t\n===END===\n"
+                   "===ALGORITHM===\nRe-sum the whole prefix at every index: quadratic in the length.\n===END===\n")
+SOLVE_LINEAR = ("===CODE===\ndef f(xs):\n    t = 0\n    run = 0\n    for x in xs:\n        run += x\n        t += run\n    return t\n===END===\n"
+                "===ALGORITHM===\nOne running prefix sum, linear.\n===END===\n")
+ORACLE_SUM = ("===ORACLE===\nimport random\ndef reference(xs):\n    return sum(sum(xs[:i + 1]) for i in range(len(xs)))\n"
+              "def gen(seed, mode):\n    r = random.Random(seed)\n    return ([r.randint(0, 20) for _ in range(r.randint(0, 6))],)\n===END===\n")
+STRESS_BIG_LIST = "===STRESS===\ndef gen_max(seed):\n    return (list(range(20000)),)\nEDGES = [([],), ([5],)]\n===END===\n"
+
+def slow_cfg():
+    c = cfg(); c["limits"]["stress_limit_python_s"] = 0.2; c["limits"]["max_fresh_solves"] = 1
+    return c
+
+def _prompts(llm, tag):
+    return [u for c, (r, s_, u) in zip(llm.calls, llm.prompts) if c["tag"] == tag]
+
+def test_a_timing_failure_starts_a_fresh_solve_that_can_win_emission(tmp_path):
+    # round-13 G4: a patch cannot change the complexity of an approach, so a candidate that is only
+    # too slow gets a second solution written from a different algorithm, carrying the failure.
+    llm = FakeLLM({"solve": [SOLVE_QUADRATIC, SOLVE_LINEAR], "oracle": [ORACLE_SUM], "stress": [STRESS_BIG_LIST]})
+    rep = S.solve(sumprob(tmp_path), llm, slow_cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
+    assert not ev["stress"]["passed"] and ev["stress"]["detail"]["too_slow"]
+    assert rep["fresh_solves"] == 1 and rep["repairs"] == 0   # never sent to the patch-style repair
+    p2 = _prompts(llm, "solve")[1]
+    assert "A previous solution to this statement failed" in p2
+    assert "Re-sum the whole prefix at every index" in p2       # the previous ALGORITHM block
+    assert "argument 1: type list; length 20000" in p2           # the input's shape...
+    assert "19997, 19998, 19999" not in p2                         # ...never the input itself
+    assert "measured duration" in p2 and "vs limit 0.2 s" in p2
+    # the fresh candidate is a root that replaces c1, and wins emission on its own evidence
+    assert rep["parents"]["c2"] is None and rep["replaces"]["c2"] == "c1"
+    assert rep["final_candidate"] == "c2" and rep["status"] == "passed_all_gates"
+    assert (tmp_path / "s.py").read_text().startswith("def f(xs):\n    t = 0\n    run = 0")
+
+def test_no_fresh_solve_left_falls_through_without_a_patch(tmp_path):
+    c = slow_cfg(); c["limits"]["max_fresh_solves"] = 0
+    llm = FakeLLM({"solve": [SOLVE_QUADRATIC, SOLVE_LINEAR], "oracle": [ORACLE_SUM], "stress": [STRESS_BIG_LIST]})
+    rep = S.solve(sumprob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["fresh_solves"] == 0 and rep["repairs"] == 0 and len(_prompts(llm, "solve")) == 1
+    assert rep["final_candidate"] == "c1" and rep["status"] == "emitted_with_failures"
+
+def test_no_budget_means_no_fresh_solve(tmp_path):
+    c = slow_cfg(); c["limits"]["repair_afford_s"] = 10**9   # nothing is affordable any more
+    llm = FakeLLM({"solve": [SOLVE_QUADRATIC, SOLVE_LINEAR], "oracle": [ORACLE_SUM], "stress": [STRESS_BIG_LIST]})
+    rep = S.solve(sumprob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["fresh_solves"] == 0 and len(_prompts(llm, "solve")) == 1
+    assert any("solve.fresh unavailable" in e for e in rep["events"])
+
+REPAIR_APPROACH = "===VERDICT===\napproach\n===END===\n===CODE===\ndef add(a, b):\n    return a + b if a < 15 else a + b + 1\n===END===\n"
+
+def test_an_approach_verdict_mints_no_child_and_starts_a_fresh_solve(tmp_path):
+    c = cfg(); c["limits"]["max_fresh_solves"] = 1
+    llm = FakeLLM({"solve": [BUGGY, SOLVE_OK], "repair": [REPAIR_APPROACH], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert any("repair.verdict=approach" in e for e in rep["events"])
+    assert rep["fresh_solves"] == 1 and rep["parents"] == {"c1": None, "c2": None}   # no repaired child
+    assert rep["replaces"]["c2"] == "c1" and rep["final_candidate"] == "c2"
+
+REPAIR_WORSE = "===VERDICT===\ncandidate\n===END===\n===CODE===\ndef add(a, b):\n    return 0\n===END===\n"
+
+def test_a_repair_that_regresses_stops_the_lineage_and_re_solves(tmp_path):
+    # round-10 L1: a child that fails more gate steps than its parent is a losing bet to patch again.
+    c = cfg(); c["limits"]["max_fresh_solves"] = 1
+    llm = FakeLLM({"solve": [BUGGY, SOLVE_OK], "repair": [REPAIR_WORSE], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert any("repair.regressed child=c2 parent=c1" in e for e in rep["events"])
+    assert rep["repairs"] == 1 and rep["fresh_solves"] == 1   # the second repair attempt is never spent
+    assert rep["replaces"]["c3"] == "c1" and rep["final_candidate"] == "c3"
+
+def test_the_solve_prompt_has_no_previous_attempt_section_by_default(tmp_path):
+    rendered = S.render("solve", **S.prompt_vars(prob(tmp_path)))
+    assert "{{previous_attempt}}" not in rendered and "A previous solution" not in rendered
+
+def test_repair_prompt_offers_the_approach_verdict(tmp_path):
+    rendered = S.render("repair", **{**S.prompt_vars(prob(tmp_path)), "kind": "stress", "input": "i", "expected": "e",
+                                     "actual": "a", "details": "d", "code": "c", "agreement": "x", "reference": "r",
+                                     "expected_source": "s"})
+    assert "the verdict is `approach`" in rendered and "if no patch can meet the stated limits" in rendered

@@ -51,6 +51,7 @@ For EACH item below, one line: what a naive solution would do and why it fails h
 Data structures, per-operation complexity against the stated maximum sizes, overflow and recursion treatment. Written as a record of the reasoning behind the code above, not a plan for it.
 ===END===
 
+{{previous_attempt}}
 Problem statement:
 
 {{statement}}

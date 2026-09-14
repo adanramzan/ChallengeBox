@@ -22,6 +22,15 @@ max_repairs = 2
 solve_attempts = 2
 max_syntax_repairs = 2   # separate, smaller-scope budget for a static/compile failure -- a mechanical
                          # fix (missing import, missing mut) must not consume a semantic repair attempt
+# Fresh solves per problem: a SOLVE call that starts over from a DIFFERENT algorithm, carrying the
+# previous attempt's algorithm, its code and the concrete failure that ended it. Triggered by a
+# timing failure on a real max-size input, by a repair that answers ===VERDICT=== approach, or by a
+# repaired child scoring below its parent -- three failures no patch can fix (round-10 L1/L2,
+# round-13 G4: four candidates for one statement, all asymptotically wrong in the same way, every
+# repair a variant of the same approach). Costs one strong call plus a gate pass on the result, so
+# it only starts while the budget covers repair_afford_s + one gate pass (~60 s, from the measured
+# tier timings above). Raise it only with the measured elapsed headroom to spend.
+max_fresh_solves = 1
 mem_mb = 4096
 # Wall limit for ONE case inside the python harness, enforced per call rather than per batch.
 # Without it a single pathological input consumes the whole batch grant: measured on 6e43a08ec05a,
