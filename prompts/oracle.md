@@ -25,6 +25,14 @@ def validate(*args):
 
 One reading of the preconditions, in one function. Do not write a second parser.
 
+Then define `bounds(...)`, taking exactly the same arguments as `reference`, as a cheap check of the **stated bounds of the input** and nothing else. It exists because `reference()` is far too slow to finish on a maximum-size input, so without it nothing in the system can say whether such an input is legal at all.
+
+* Return `None` when every numeric and structural bound the statement states holds: counts and sizes, sequence and name lengths, value ranges, nesting or reference depth, and any other quantity the statement bounds by a number.
+* Otherwise return a short string naming the first bound that is violated, for example `"there are 300000 items, the stated maximum is 200000"`.
+* It must be **linear** in the size of the input: look at the input, never simulate the operations, never rebuild the state, never call `reference()`. It is run on inputs far larger than anything `reference()` can process.
+* It must **never raise**. Guard every lookup; a `bounds()` that raises gives no verdict at all and the input goes unjudged.
+* Say nothing about preconditions that depend on evolving state — "must currently exist", "must never have appeared before", an ordering that depends on earlier operations. Those need the simulation `reference()` does, and this function is deliberately the part that does not.
+
 Also define `gen(seed: int, mode: str)` using only `random.Random(seed)` for randomness. {{gen_returns}}
 
 * `mode == "small"`: sizes at most 6, values at most 20. Include boundary shapes — the empty case where the statement allows one, a single element, repeated or tied values, and first, last and adjacent positions.
@@ -57,7 +65,7 @@ Before answering, hand-trace one sequence that covers the initial state, each ki
 Respond with exactly one block:
 
 ===ORACLE===
-python source defining reference, gen, and validate
+python source defining reference, gen, validate, and bounds
 ===END===
 
 Problem statement:

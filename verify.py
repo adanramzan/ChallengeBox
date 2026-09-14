@@ -52,7 +52,7 @@ class GateInputs:
     stress_input: object = None
     stress_degraded: bool = False
     stress_source: str = ""   # gen_max | gen_large | medium_degraded -- which generator produced the timing input
-    stress_validity: str = ""   # accepted | unjudged -- what the oracle's validate() said about the timing input
+    stress_validity: str = ""   # accepted | bounds_checked | unjudged -- what the oracle could say about the timing input
     stress_tried: list = field(default_factory=list)   # which of STRESS_SOURCES have already produced (or failed to produce) a timing input
     validate_trusted: bool = False   # the oracle's validate() accepted at least one generated input and was not distrusted
     input_skeleton: object = None   # the container shape the oracle's own gen() produces, per argument (see input_skeleton)
@@ -791,12 +791,36 @@ def dispute_extra(gi: GateInputs, failed: Evidence, agreement: dict | None = Non
             "Re-derive the expected output from the statement alone, sentence by sentence, before writing the new reference.\n"
             + _examples_paragraph(gi))
 
+# What bounds() said about an input when it said nothing at all: the oracle defines no bounds(), or
+# the call crashed or timed out. Distinct from None, which is bounds() actively saying "every stated
+# bound holds" -- the difference between no verdict and a clean one.
+NO_BOUNDS_VERDICT = object()
+
+def bounds_verdicts(problem, oracle_src: str, inputs: list, *, workdir: str, timeout_s: float) -> list:
+    """The oracle's bounds() over `inputs`: None where every stated bound holds, a short string
+    naming the first violated bound, NO_BOUNDS_VERDICT where there is no answer.
+
+    validate() is the literal reference (see _VALIDATE_TEMPLATE), so it cannot finish on a max-size
+    input and every real one is `unjudged` -- which costs the run its timing evidence, on exactly the
+    problems where timing decides the score. The STATED BOUNDS, though -- counts, lengths, value
+    ranges, nesting or reference depth -- are what a linear parser can check on any input, whatever
+    its size. That is strictly less than validate() checks (nothing here simulates the operations, so
+    a state precondition like "must currently exist" goes unchecked), so an input it clears is
+    recorded as `bounds_checked` rather than `accepted`.
+
+    Anything falsy (None, "", False) counts as "within bounds": the prompt asks for None, and a model
+    that answers False must not have its input thrown away for it."""
+    if timeout_s <= 0 or not inputs:
+        return [NO_BOUNDS_VERDICT] * len(inputs)
+    res = run_python_cases(oracle_src, "bounds", [_ref_args(problem, i) for i in inputs], workdir=workdir, timeout_s=timeout_s)
+    return [NO_BOUNDS_VERDICT if not r.ok else (None if not r.output else str(r.output)[:200]) for r in res]
+
 def _input_size(v) -> int:
     """Bytes of one gate input, for the log line -- generic over a Python argument tuple and a Rust
     stdin string without knowing the problem's shape."""
     return len((v if isinstance(v, str) else repr(v)).encode("utf-8", "replace"))
 
-def _accept_stress_input(problem, gi: GateInputs, oracle_src: str, value, source: str, *, workdir: str, budget) -> bool:
+def _accept_stress_input(problem, gi: GateInputs, oracle_src: str, value, source: str, *, workdir: str, budget, log=None) -> bool:
     """Take `value` as the max-size stress input unless the oracle's own validate() rejects it, and
     record which of the three verdicts it got: accepted, rejected, or unjudged.
 
@@ -812,7 +836,14 @@ def _accept_stress_input(problem, gi: GateInputs, oracle_src: str, value, source
     -- were killed at the timing cap by an input the statement forbids. The input is still USED (a
     timing measurement on a doubtful input is better than none), but everything it produces is
     degraded: see stress(). Generic over every problem whose constraints include a bound the literal
-    oracle cannot evaluate, which is precisely the class where timing matters most."""
+    oracle cannot evaluate, which is precisely the class where timing matters most.
+
+    `bounds()` is what recovers the common case: it is linear, so it CAN answer on a max-size input
+    where the literal reference cannot. An input it clears is `bounds_checked` -- weaker than
+    `accepted` (no state precondition was simulated) but strong enough that its timing counts, which
+    is the difference between a real max-size measurement and none at all. An input it names a
+    violated bound for is rejected outright: a stated bound is a fact about the input, not about the
+    candidate."""
     value = _clean_stdin(problem, value)
     verdicts = None
     if gi.validate_trusted:
@@ -823,10 +854,22 @@ def _accept_stress_input(problem, gi: GateInputs, oracle_src: str, value, source
     if verdict == "rejected":
         gi.notes.append(f"{source} output rejected by validate(); not used")
         return False
+    if verdict == "unjudged":
+        b = bounds_verdicts(problem, oracle_src, [value], workdir=os.path.join(workdir, f"{source}_bounds"),
+                            timeout_s=budget.step_timeout(20.0, reserve_s=20.0))[0]
+        if isinstance(b, str):
+            gi.notes.append(f"{source} output rejected by bounds(): {b}; not used")
+            if log: log(f"stress.input source={source} rejected_by=bounds reason={b}")
+            return False
+        if b is None:
+            verdict = "bounds_checked"
     gi.stress_input, gi.stress_source, gi.stress_validity = value, source, verdict
     if verdict == "unjudged":
         gi.notes.append(f"{source} output could not be validated (the reference gave no verdict on it); "
                         "its timing is indicative only")
+    elif verdict == "bounds_checked":
+        gi.notes.append(f"{source} output was checked against the statement's stated bounds only (the "
+                        "reference could not finish on it); state preconditions were not simulated")
     return True
 
 def prepare_oracle_tiers(problem, oracle_src: str, limits: dict, *, workdir: str, budget, log) -> GateInputs:
@@ -933,13 +976,13 @@ def _respell_edges(problem, gi: GateInputs, oracle_src: str, edges: list, limits
 STRESS_SOURCES = ("gen_max", "gen_large", "medium_degraded")
 
 
-def _try_gen_large(problem, gi: GateInputs, *, workdir: str, budget) -> bool:
+def _try_gen_large(problem, gi: GateInputs, *, workdir: str, budget, log=None) -> bool:
     gi.stress_tried.append("gen_large")
     lg = run_python_cases(gi.oracle_src, "gen", [(1, "large")], workdir=os.path.join(workdir, "gen_large"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
     if not (lg and lg[0].ok):
         gi.notes.append("gen(large) failed: " + ((lg[0].error[-200:] if lg else "") or "no output"))
         return False
-    if not _accept_stress_input(problem, gi, gi.oracle_src, lg[0].output, "gen_large", workdir=workdir, budget=budget):
+    if not _accept_stress_input(problem, gi, gi.oracle_src, lg[0].output, "gen_large", workdir=workdir, budget=budget, log=log):
         return False
     # An oracle whose gen() ignores its mode argument answers "large" with a small input, and timing a
     # candidate on a small input is not a timing check. To count as max-size it has to be bigger than
@@ -982,7 +1025,7 @@ def next_stress_source(problem, gi: GateInputs, *, workdir: str, budget, log) ->
     if gi.stress_source not in STRESS_SOURCES:
         return False   # an input that did not come from the chain: there is no position to advance from
     before = (gi.stress_input, gi.stress_source, gi.stress_degraded, gi.stress_validity)
-    for name, attempt in (("gen_large", lambda: _try_gen_large(problem, gi, workdir=workdir, budget=budget)),
+    for name, attempt in (("gen_large", lambda: _try_gen_large(problem, gi, workdir=workdir, budget=budget, log=log)),
                           ("medium_degraded", lambda: _try_medium_degraded(problem, gi))):
         if name in gi.stress_tried:
             continue
@@ -1007,19 +1050,28 @@ def prepare_stress_inputs(problem, gi: GateInputs, stress_src: str, limits: dict
         if edges and edges[0].ok and isinstance(edges[0].output, list):
             cleaned_edges = [_clean_stdin(problem, s) for s in edges[0].output]
             _respell_edges(problem, gi, oracle_src, cleaned_edges, limits, workdir=workdir, budget=budget, log=log)
+            # The same linear check over the hand-written edges. The reference rejects an
+            # out-of-bounds edge anyway (it raises ValueError and make_cases drops it), so this buys
+            # no coverage -- only a note that names the bound instead of a bare "dropped".
+            bad = {i: b for i, b in enumerate(bounds_verdicts(problem, oracle_src, cleaned_edges, workdir=os.path.join(workdir, "bounds_edges"),
+                                                              timeout_s=budget.step_timeout(20.0, reserve_s=20.0))) if isinstance(b, str)}
+            if bad:
+                gi.notes.append(f"{len(bad)} edge case(s) dropped by bounds(): " + "; ".join(list(bad.values())[:2]))
+                log(f"oracle.edge dropped_by_bounds={len(bad)}")
+                cleaned_edges = [v for i, v in enumerate(cleaned_edges) if i not in bad]
             gi.cases_edge, ev = make_cases(problem, oracle_src, cleaned_edges, "edge", workdir=os.path.join(workdir, "ref_edge"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0),
                                            per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
             _log_and_note_validation(gi, ev, "edge", log)
         gi.stress_tried.append("gen_max")
         mx = run_python_cases(stress_src, "gen_max", [(1,)], workdir=os.path.join(workdir, "genmax"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         if mx and mx[0].ok:
-            _accept_stress_input(problem, gi, oracle_src, mx[0].output, "gen_max", workdir=workdir, budget=budget)
+            _accept_stress_input(problem, gi, oracle_src, mx[0].output, "gen_max", workdir=workdir, budget=budget, log=log)
         else:
             gi.notes.append("gen_max failed: " + (mx[0].error[-200:] if mx else ""))
     else:
         gi.notes.append("no stress source")
     if gi.stress_input is None:
-        _try_gen_large(problem, gi, workdir=workdir, budget=budget)
+        _try_gen_large(problem, gi, workdir=workdir, budget=budget, log=log)
     if gi.stress_input is None:
         _try_medium_degraded(problem, gi)
     if gi.stress_input is not None:
@@ -1036,7 +1088,7 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
 UNJUDGED_STRESS_REASON = ("max-size input could not be validated (reference did not finish); "
                           "timing is indicative only")
 
-def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, mem_mb: int, degraded: bool = False, min_plausible_s: float = 0.0, unjudged: bool = False) -> Evidence:
+def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, mem_mb: int, degraded: bool = False, min_plausible_s: float = 0.0, unjudged: bool = False, validity: str = "") -> Evidence:
     if stress_input is None:
         return Evidence("stress", True, 0, 0.0, {"skipped": "no stress input"}, skipped=True)
     t0 = time.monotonic()
@@ -1057,6 +1109,11 @@ def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, 
     # where r.ok is still in hand.
     detail = {"duration_s": round(dur, 3), "limit_s": limit_s, "timed_out": r.timed_out,
               "too_slow": bool(r.timed_out or (r.ok and dur > limit_s)), "error": r.error[-400:]}
+    # What the run could say about the input this timing was measured on. `bounds_checked` is the
+    # one that has to reach the report: the stated bounds hold, so the measurement counts, but no
+    # state precondition was simulated and the report must not claim one was.
+    if validity:
+        detail["validity"] = validity
     if unjudged:
         # Nothing in the run could say whether this input is legal (see _accept_stress_input), so
         # neither direction of the measurement is evidence: a pass is not proof the candidate is fast
@@ -1242,7 +1299,7 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         e = Evidence("stress", True, 0, 0.0, {"skipped": "no budget"}, skipped=True)
     else:
         e = stress(problem, source, gi.stress_input, workdir=os.path.join(workdir, "stress"), limit_s=min(limit, avail), mem_mb=limits["mem_mb"], degraded=gi.stress_degraded,
-                   min_plausible_s=limits.get("stress_min_plausible_s", 0.0), unjudged=gi.stress_validity == "unjudged")
+                   min_plausible_s=limits.get("stress_min_plausible_s", 0.0), unjudged=gi.stress_validity == "unjudged", validity=gi.stress_validity)
         # A suspicious measurement is no measurement, and the suspect is the INPUT: the candidate
         # answered before any real work could have happened. The chain has more sources (§5.4), and
         # until now a suspicious first one ended the timing check for the whole run. Try the next one
@@ -1252,7 +1309,7 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         avail2 = budget.step_timeout(limit, reserve_s=reserve)
         if e.detail.get("suspicious") and avail2 > 0 and next_stress_source(problem, gi, workdir=os.path.join(workdir, "stress2"), budget=budget, log=log):
             e2 = stress(problem, source, gi.stress_input, workdir=os.path.join(workdir, "stress2"), limit_s=min(limit, avail2), mem_mb=limits["mem_mb"], degraded=gi.stress_degraded,
-                        min_plausible_s=limits.get("stress_min_plausible_s", 0.0), unjudged=gi.stress_validity == "unjudged")
+                        min_plausible_s=limits.get("stress_min_plausible_s", 0.0), unjudged=gi.stress_validity == "unjudged", validity=gi.stress_validity)
             if not e2.detail.get("suspicious"):
                 e = e2
     ev.append(e); log(_gate_line(e, f"duration={e.detail.get('duration_s')}"))

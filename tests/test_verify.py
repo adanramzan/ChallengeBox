@@ -1005,3 +1005,63 @@ def test_with_no_further_source_a_suspicious_stress_run_is_what_it_was(tmp_path)
     assert not any("stress.fallthrough" in l for l in lines)
     assert gi.stress_source == "gen_max" and gi.stress_input == (-1, 0)
     assert ev["stress"].passed and ev["stress"].skipped and ev["stress"].detail.get("suspicious")
+
+
+# --- round 14 batch 8: a linear bounds() lets a real max-size input count ---
+
+# validate() cannot finish on a max-size input, so every real one is unjudged and its timing never
+# counts. bounds() is the linear half of the same question: the STATED bounds of the input.
+BOUNDS_OK = "def bounds(a, b):\n    return None if a <= 10**18 and b <= 10**18 else 'a value exceeds 10^18'\n"
+BOUNDS_VIOLATED = "def bounds(a, b):\n    return 'a = %d exceeds the stated maximum 10' % a\n"
+BOUNDS_RAISES = "def bounds(a, b):\n    raise RuntimeError('boom')\n"
+
+def _prep(tmp_path, oracle_extra, stress_src=STRESS_HUGE):
+    return V.prepare_gate_inputs(PY, ORACLE_NO_VERDICT_ON_BIG + oracle_extra, stress_src,
+                                 {"cases_small": 3, "cases_medium": 1}, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+
+def test_a_bounds_checked_max_size_input_counts_as_a_real_check(tmp_path):
+    gi = _prep(tmp_path, BOUNDS_OK)
+    assert gi.stress_source == "gen_max" and gi.stress_validity == "bounds_checked"
+    assert any("stated bounds only" in n for n in gi.notes)
+    limits = {"cases_small": 3, "cases_medium": 1, "mem_mb": 2048, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0}
+    e = {x.kind: x for x in V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lambda m: None)}["stress"]
+    assert e.passed and not e.skipped and "degraded" not in e.detail       # it is evidence, not a note
+    assert e.detail["validity"] == "bounds_checked"                        # ...and the report says how far it goes
+
+def test_a_violated_bound_rejects_the_input_and_the_chain_moves_on(tmp_path):
+    gi = _prep(tmp_path, BOUNDS_VIOLATED)
+    assert gi.stress_source != "gen_max"          # gen_max's 10**18 input named a violated bound
+    assert any("rejected by bounds()" in n and "stated maximum 10" in n for n in gi.notes)
+
+def test_an_oracle_with_no_bounds_leaves_the_input_unjudged(tmp_path):
+    gi = _prep(tmp_path, "")
+    assert gi.stress_source == "gen_max" and gi.stress_validity == "unjudged"
+
+def test_a_bounds_that_raises_leaves_the_input_unjudged(tmp_path):
+    gi = _prep(tmp_path, BOUNDS_RAISES)
+    assert gi.stress_source == "gen_max" and gi.stress_validity == "unjudged"
+
+def test_a_timing_failure_on_a_bounds_checked_input_is_a_real_failure(tmp_path):
+    # ...which is what routes it to the fresh-solve path in solve(): a real max-size measurement.
+    p = Problem("p", "python", "s", "f", [], 300.0)
+    slow = "def f(n):\n    t = 0\n    for i in range(n):\n        t += i\n    return t\n"
+    gi = V.GateInputs(oracle_src=ORACLE, stress_input=(3_000_000,), stress_validity="bounds_checked")
+    limits = {"cases_small": 3, "cases_medium": 1, "mem_mb": 2048, "stress_limit_python_s": 0.05, "stress_limit_rust_s": 2.0}
+    e = {x.kind: x for x in V.run_gate(p, slow, gi, workdir=str(tmp_path), budget=FakeBudget(), limits=limits, log=lambda m: None)}["stress"]
+    assert not e.passed and not e.skipped and e.detail["too_slow"] and "degraded" not in e.detail
+
+def test_an_edge_outside_the_stated_bounds_is_dropped_with_the_bound_named(tmp_path):
+    stress_src = "def gen_max(seed):\n    return (1, 1)\nEDGES = [(0, 0), (99, 0)]\n"
+    lines = []
+    bounds_10 = "def bounds(a, b):\n    return None if a <= 10 else 'a = %d exceeds the stated maximum 10' % a\n"
+    gi = V.prepare_gate_inputs(PY, ORACLE + bounds_10, stress_src, {"cases_small": 3, "cases_medium": 1},
+                               workdir=str(tmp_path), budget=FakeBudget(), log=lines.append)
+    assert [c.input for c in gi.cases_edge] == [(0, 0)]
+    assert any("dropped by bounds()" in n and "stated maximum 10" in n for n in gi.notes)
+    assert any("oracle.edge dropped_by_bounds=1" in l for l in lines)
+
+def test_bounds_verdicts_reads_a_falsy_answer_as_within_bounds(tmp_path):
+    src = ORACLE + "def bounds(a, b):\n    return False if a == 0 else ''\n"
+    out = V.bounds_verdicts(PY, src, [(0, 0), (1, 1)], workdir=str(tmp_path), timeout_s=20)
+    assert out == [None, None]
+    assert V.bounds_verdicts(PY, ORACLE, [(0, 0)], workdir=str(tmp_path / "x"), timeout_s=20) == [V.NO_BOUNDS_VERDICT]
