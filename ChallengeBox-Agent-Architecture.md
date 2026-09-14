@@ -137,15 +137,24 @@ Serious reasoning calls take 20 to 90 seconds each. A sequential analyzer → ar
 
 ### 5.2 SOLVE call (strong model, one call)
 
-One structured response with five sections. Merging analysis and code into one call halves latency and keeps the analysis in the same context that writes the code, which is where it matters.
+One structured response with six sections. Merging analysis and code into one call halves latency and keeps the analysis in the same context that writes the code, which is where it matters.
 
 Required sections:
 
-1. **Rules** — a numbered restatement of every behavioral sentence in the statement, quoting the text. Ambiguities listed separately with the chosen reading.
-2. **Traps** — for each constraint, what a naive approach would do and why it fails. The prompt lists the trap classes from §2.1 as a checklist the model must address one by one.
-3. **Algorithm** — data structures, complexity against the stated maximum sizes, overflow treatment, recursion treatment.
-4. **Code** — in a fenced block with a fixed marker. The orchestrator extracts by marker, never by trusting prose.
-5. **Examples** — 3–5 hand-traced `(args, expected)` pairs, machine-readable (§5.2.1).
+In the order the prompt asks for them:
+
+1. **Rules** — a numbered restatement of every behavioral sentence in the statement, quoting the text, capped at about 25 lines. Ambiguities listed separately with the chosen reading.
+2. **Design** — state representation, the invariant per operation, complexity at the stated maxima, one hand trace of the hardest boundary, and an explicit rejection of any approach that iterates a huge bounded count or materializes an enormous structure.
+3. **Code** — in a fenced block with a fixed marker. The orchestrator extracts by marker, never by trusting prose.
+4. **Examples** — 3–5 hand-traced `(args, expected)` pairs, machine-readable (§5.2.1).
+5. **Traps** — for each constraint, what a naive approach would do and why it fails. The prompt lists the trap classes from §2.1 as a checklist the model must address one by one.
+6. **Algorithm** — data structures, complexity against the stated maximum sizes, overflow treatment, recursion treatment.
+
+RULES comes *before* CODE. The earlier "code first" ordering was measured against reasoning models that
+filled the token budget with prose before reaching the code; the configured strong model returns 2–4k
+tokens with no reasoning block, so a short quoted restatement first is affordable — and it is the
+restatement, not the code, that catches a misreading of the statement. The orchestrator parses by
+marker, so the order is a prompt decision only.
 
 Language-specific instructions baked into the prompt:
 

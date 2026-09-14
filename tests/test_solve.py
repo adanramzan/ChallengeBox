@@ -868,3 +868,11 @@ def test_generator_prompts_require_reaching_the_bound(tmp_path):
     oracle, stress = S.render("oracle", **pv), S.render("stress", **pv)
     assert "to its bound at least once" in oracle and "to its bound at least once" in stress
     assert "at the maximum that mode allows" in oracle
+
+def test_solve_prompt_restates_the_rules_before_the_code(tmp_path):
+    # RULES is what catches a misreading, and it used to be written after the code -- so the model
+    # coded before it had read carefully. FakeLLM scripts parse by marker, so order is free to change.
+    rendered = S.render("solve", **S.prompt_vars(prob(tmp_path)))
+    order = [m.group(1) for m in re.finditer(r"^===([A-Z]+)===$", rendered, re.M) if m.group(1) != "END"]
+    assert order == ["RULES", "DESIGN", "CODE", "EXAMPLES", "TRAPS", "ALGORITHM"]
+    assert "at most about 25 lines" in rendered

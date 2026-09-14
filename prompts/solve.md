@@ -2,7 +2,12 @@ You are solving a hard algorithmic problem. The statement below is the only spec
 
 Target language: {{language}}. Contract: {{contract}}
 
-Work out the rules, traps, and algorithm first. Respond with exactly these blocks, in order, each terminated by a line `===END===`. Keep the design compact but explicit.
+Restate the rules first, then design, then write the code. Respond with exactly these blocks, in order, each terminated by a line `===END===`. Keep the design compact but explicit.
+
+===RULES===
+Numbered restatement of every behavioral sentence of the statement, quoting the text. List ambiguities separately with the reading you chose.
+Behavioral sentences only -- the ones that change what the answer is. Quote, number, and stop: at most about 25 lines, no restating of the setup, no plan for the code.
+===END===
 
 ===DESIGN===
 State representation, the invariant for every operation, the maximum-constraint complexity, and one hand trace of the hardest boundary case. Before writing code, reject any approach that iterates a count or capacity the statement bounds by a huge number, materializes or rescans a structure whose described size exceeds memory, or recurses to a depth proportional to the input.
@@ -18,6 +23,7 @@ write the new one -- do not narrate the change. A block that trails off mid-stat
 `for`/`while`/`if` with its body replaced by comments, is a syntax error and scores zero however
 good the reasoning around it was. Put all deliberation in ===RULES=== and ===TRAPS===.
 ===END===
+
 ===EXAMPLES===
 Three to five lines and nothing else — no comments, no prose, no blank lines with text in them.
 Each line is one Python literal 2-tuple `(args, expected)`. `args` is {{gen_returns}}, exactly as the
@@ -28,9 +34,7 @@ Include at least these three: the smallest legal input; one input sitting at a s
 whose answer is cheap to reason about; and the input you consider most likely to be misread — the
 deepest state the statement reaches, or the clause a naive reading gets wrong.
 ===END===
-===RULES===
-Numbered restatement of every behavioral sentence of the statement, quoting the text. List ambiguities separately with the reading you chose.
-===END===
+
 ===TRAPS===
 For EACH item below, one line: what a naive solution would do and why it fails here, or "n/a".
 - counts/repetitions/capacities up to 10^18 that must not be iterated
@@ -42,6 +46,7 @@ For EACH item below, one line: what a naive solution would do and why it fails h
 - custom Unicode/grapheme/byte rules that differ from the standard library
 - wording that redefines behavior after exhaustion, reset, or removal
 ===END===
+
 ===ALGORITHM===
 Data structures, per-operation complexity against the stated maximum sizes, overflow and recursion treatment. Written as a record of the reasoning behind the code above, not a plan for it.
 ===END===
