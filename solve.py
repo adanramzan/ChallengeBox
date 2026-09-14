@@ -1,7 +1,7 @@
 """CLI, orchestrator, budget controller, finalizer, report."""
 from __future__ import annotations
 import argparse, json, os, pathlib, re, sys, threading, time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 
 
@@ -259,6 +259,134 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     limits = cfg["limits"]
     oracle_dir = os.path.join(run_dir, "oracle")
     gi = V.GateInputs()
+    prep_error = None
+    repairs = 0
+    syntax_repairs = 0
+    fresh_solves = 0
+    gate_crashed = False
+    selfrepaired = False          # the one oracle self-repair this run is allowed has been spent
+    oracle_checked = False        # the accumulating example check has run for at least one candidate
+    settled: set[str] = set()     # example disagreements the dispute decision has already seen
+    no_repair: set[str] = set()   # lineages a regression closed: another patch there is the same losing bet
+
+    def build_candidate(r_solve, attempt: int) -> "Candidate | None":
+        blocks = parse_blocks(r_solve.text)
+        code = blocks.get("CODE", "")
+        if not code.strip() and r_solve.text.strip():
+            code = r_solve.text.strip()   # no ===CODE=== block parsed at all: fall back to the raw reply so a file is still emitted
+            run.log(f"solve.no_code_block attempt={attempt} using raw reply text")
+        if not code.strip():
+            return None
+        # Identical attempts are one candidate: gating a duplicate costs a full gate pass and can
+        # only reach the same verdict. Sampling at temperature > 0 usually differs, but not always.
+        if any(c.source.strip() == code.strip() for c in run.cands):
+            run.log(f"solve.duplicate attempt={attempt} identical to an earlier attempt, dropped")
+            return None
+        cand = run.add_candidate(code, None); cand.evidence.append(static_evidence(problem, code))
+        # The author's own hand trace of the statement: checked against this candidate (gate step
+        # diff_examples) and against the oracle (check_oracle_examples), which never saw it.
+        ex_block = blocks.get("EXAMPLES", "")
+        cand.examples = V.parse_examples(problem, ex_block)
+        cand.examples_dropped = max(0, V.example_line_count(ex_block) - len(cand.examples))
+        cand.algorithm = blocks.get("ALGORITHM") or blocks.get("DESIGN", "")
+        run.log(f"solve.examples id={cand.id} parsed={len(cand.examples)} dropped={cand.examples_dropped}")
+        return cand
+
+    def gate_candidate(cand) -> None:
+        """One full gate pass over a candidate that has only its static evidence, plus the two things
+        that have to happen immediately after one: adopting the source the Rust compile step patched,
+        and noticing that a repaired child came out worse than its parent."""
+        cand.evidence = [cand.evidence[0]] + V.run_gate(problem, cand.source, gi, workdir=os.path.join(run_dir, cand.id), budget=run.budget, limits=cfg["limits"], log=run.log, examples=cand.examples)
+        # The Rust compile step may have added the imports rustc asked for; the gate ran that
+        # patched source, so it is the one that must be emitted and re-gated from here on.
+        patched = next((e.detail["patched_source"] for e in cand.evidence if "patched_source" in e.detail), None)
+        if patched:
+            cand.source = patched
+            with open(os.path.join(run.dir, "candidates", f"{cand.id}.{run.ext()}"), "w", encoding="utf-8") as f: f.write(patched)
+            run.log(f"candidate.imports_added id={cand.id}")
+        # A repaired child that now scores below the parent it came from is a regression: the
+        # repair made the candidate worse, and another patch down the same lineage is the
+        # same losing bet (round-10 L1). The parent already wins emission on score; what has
+        # to stop is repairing this lineage.
+        parent = next((c for c in run.cands if c.id == cand.parent), None)
+        if parent is not None and regression_score(cand) < regression_score(parent):
+            run.log(f"repair.regressed child={cand.id} parent={parent.id}")
+            no_repair.update({cand.id, parent.id})
+
+    def check_oracle_against_examples() -> None:
+        """Every candidate's hand-traced examples against the oracle, then the dispute decision.
+
+        Candidates are gated as they arrive, so this runs once per arriving candidate over the
+        examples of ALL of them -- the check accumulates, and re-running it over the earlier
+        candidate's handful of tiny inputs costs one subprocess batch. The dispute decision, however,
+        is made once: a verdict reached on the first candidate is not re-opened by the second unless
+        that second candidate contributed a value disagreement nobody had seen."""
+        nonlocal oracle_checked
+        V.check_oracle_examples(problem, gi, limits, workdir=oracle_dir, budget=run.budget, log=run.log,
+                                examples={c.id: c.examples for c in run.cands if c.examples})
+        bad = [repr(d["input"]) for d in ((gi.example_checks or {}).get("disagreements") or [])]
+        if oracle_checked and not [k for k in bad if k not in settled]:
+            return
+        settled.update(bad)
+        oracle_checked = True
+        adjudicate_oracle()
+
+    def adjudicate_oracle() -> None:
+        # The oracle CALL can succeed while the CODE it wrote crashes at runtime -- reference() raising on
+        # every input, gen() raising while unpacking its own tuple -- leaving zero usable cases in every
+        # tier even though prepare_gate_inputs ran to completion. That's silent: no gate step fails (there's
+        # nothing to check), so the run would ship unverified. Recover once, the same way adjudication
+        # does (regenerate_oracle, reusing the fast model with the collected failure notes as context), but
+        # through its OWN one-shot counter (gi.oracle_selfrepairs) so this can fire and the unrelated
+        # adjudication regeneration (gi.oracle_regens, in the repair loop below) can still fire later in
+        # the same run -- one broken-oracle recovery must never spend the other's budget.
+        # Second trigger, same one-shot path: the oracle ran, but its own validate() threw out most of what
+        # its own gen() produced (30 of 32 small inputs on bench8/2beff58fa923). gen and validate are then
+        # two readings of the same preconditions and one of them is wrong, so the survivors are either too
+        # few to be coverage or inputs one half of the oracle calls illegal -- either way, rewriting both
+        # from one precondition list beats gating on them.
+        # Third trigger, same one-shot path: the oracle contradicts most of the inputs the SOLVE authors
+        # hand-traced from the statement. Two independent readings that far apart cannot both be right,
+        # and the oracle is the side this system can rewrite -- blaming the candidate here would spend a
+        # repair attempt making correct code agree with a wrong reference.
+        nonlocal gi, selfrepaired
+        if selfrepaired:
+            return
+        selfrepair_why = ""
+        disputed = False
+        if V.oracle_unusable(gi):
+            selfrepair_why = "no usable case in any tier"
+        elif gi.validate_reject_frac >= cfg["limits"]["validate_reject_frac_regen"]:
+            selfrepair_why = f"validate() rejected {gi.validate_reject_frac:.0%} of its own gen() inputs"
+        elif V.examples_disputed(gi):
+            ec = gi.example_checks
+            disputed = True
+            selfrepair_why = f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {V.examples_nonrejected(ec)}"
+            run.log(f"oracle.disputed {selfrepair_why}")
+        if selfrepair_why and run.budget.can_afford(cfg["limits"]["oracle_selfrepair_afford_s"]) and not run.over_cost():
+            run.log(f"oracle.selfrepair triggered: {selfrepair_why}; notes={'; '.join(gi.notes)[:300]}")
+            prev = gi
+            selfrepaired = True
+            extra = V.examples_dispute_extra(gi) if disputed else V.selfrepair_extra(gi)
+            try:
+                gi = V.regenerate_oracle(run, gi, extra, pv, counter="oracle_selfrepairs", workdir_tag="oracle_selfrepair")
+            except Exception as e:
+                run.log(f"oracle.selfrepair crashed {type(e).__name__}: {e}")
+            # The replacement was asked specifically about these inputs; if it still contradicts half of
+            # them, no reference in this run is ground truth and no diff_* step against it is full evidence.
+            if disputed and V.examples_disputed(gi):
+                ec = gi.example_checks
+                gi.diff_degraded = f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {V.examples_nonrejected(ec)}"
+                run.log(f"oracle.disputed after regeneration: {gi.diff_degraded}")
+            # Coming from the rejection trigger there was a working-but-inconsistent oracle to lose: keep it
+            # unless the replacement is actually better. (The crash trigger has nothing to fall back to.)
+            if prev.validate_reject_frac and gi is not prev and not gi.regen_failed \
+                    and (V.oracle_unusable(gi) or gi.validate_reject_frac > prev.validate_reject_frac):
+                run.log(f"oracle.selfrepair kept the original oracle: regenerated reject_frac={gi.validate_reject_frac:.2f} small={len(gi.cases_small)}")
+                prev.notes.append("oracle self-repair discarded: the regenerated oracle rejected at least as much of its own gen() output")
+                prev.oracle_selfrepairs = gi.oracle_selfrepairs
+                gi = prev
+
     with ThreadPoolExecutor(max_workers=attempts + 2) as ex:
         # All of these run concurrently, so the generate phase costs max(), not sum() —
         # each call can therefore have the whole generate budget rather than a share of it.
@@ -297,7 +425,6 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
         pending = sum(1 for f in f_solves if not f.done())
         run.log(f"prep.overlap solve_pending={pending}")
-        prep_error = None
         try:
             gi = V.prepare_oracle_tiers(problem, oracle_src, limits, workdir=oracle_dir, budget=run.budget, log=run.log)
         except Exception as e:
@@ -309,33 +436,34 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
                 V.prepare_stress_inputs(problem, gi, stress_src, limits, workdir=oracle_dir, budget=run.budget, log=run.log)
             except Exception as e:
                 prep_error = e
-        r_solves = [f.result() for f in f_solves]
-    for i, r_solve in enumerate(r_solves):
-        blocks = parse_blocks(r_solve.text)
-        code = blocks.get("CODE", "")
-        if not code.strip() and r_solve.text.strip():
-            code = r_solve.text.strip()   # no ===CODE=== block parsed at all: fall back to the raw reply so a file is still emitted
-            run.log(f"solve.no_code_block attempt={i + 1} using raw reply text")
-        if not code.strip():
-            continue
-        # Identical attempts are one candidate: gating a duplicate costs a full gate pass and can
-        # only reach the same verdict. Sampling at temperature > 0 usually differs, but not always.
-        if any(c.source.strip() == code.strip() for c in run.cands):
-            run.log(f"solve.duplicate attempt={i + 1} identical to an earlier attempt, dropped")
-            continue
-        cand = run.add_candidate(code, None); cand.evidence.append(static_evidence(problem, code))
-        # The author's own hand trace of the statement: checked against this candidate (gate step
-        # diff_examples) and against the oracle (check_oracle_examples), which never saw it.
-        ex_block = blocks.get("EXAMPLES", "")
-        cand.examples = V.parse_examples(problem, ex_block)
-        cand.examples_dropped = max(0, V.example_line_count(ex_block) - len(cand.examples))
-        cand.algorithm = blocks.get("ALGORITHM") or blocks.get("DESIGN", "")
-        run.log(f"solve.examples id={cand.id} parsed={len(cand.examples)} dropped={cand.examples_dropped}")
-    # The examples only exist once the SOLVE replies are in, so this is the last piece of preparation.
-    if prep_error is None:
+        # Each SOLVE reply is built into a candidate and gated the moment it lands, while the other
+        # attempt is still running. Joining on every attempt first cost bench15 43 s and bench16 31 s
+        # of dead time: with a thinking model in the strong role the second reply can be 40 s behind
+        # the first or run all the way into its cap and return nothing. The gate inputs are ready by
+        # now (the oracle was waited for first and its preparation has already run), so nothing here
+        # is waiting on anything but the candidate itself.
+        attempt_no = {f: i + 1 for i, f in enumerate(f_solves)}
+        r_solves = []
+        for f in as_completed(f_solves):
+            r_solves.append(f.result())
+            cand = build_candidate(r_solves[-1], attempt_no[f])
+            if cand is None or prep_error is not None or gate_crashed:
+                continue   # a timed-out or empty reply produces no candidate; a crashed prep gates nothing
+            try:
+                check_oracle_against_examples()
+            except Exception as e:
+                prep_error = e; continue
+            run.log(f"gate.early cand={cand.id} solve_pending={sum(1 for g in f_solves if not g.done())}")
+            try:
+                gate_candidate(cand)
+            except Exception as e:
+                run.log(f"gate.crashed {type(e).__name__}: {e}")
+                cand.evidence.append(V.Evidence("gate_error", False, detail={"error": f"{type(e).__name__}: {e}"}))
+                gate_crashed = True
+    # No candidate carried examples (or none was built at all): the oracle's own triggers still apply.
+    if prep_error is None and not oracle_checked:
         try:
-            V.check_oracle_examples(problem, gi, limits, workdir=oracle_dir, budget=run.budget, log=run.log,
-                                    examples={c.id: c.examples for c in run.cands if c.examples})
+            check_oracle_against_examples()
         except Exception as e:
             prep_error = e
     if prep_error is not None:
@@ -344,61 +472,9 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         if run.cands:
             run.cands[-1].evidence.append(V.Evidence("gate_error", False, detail={"error": f"{type(e).__name__}: {e}"}))
         gi = V.GateInputs(oracle_src=oracle_src, notes=[f"prepare_gate_inputs crashed: {type(e).__name__}: {e}"])
-    # The oracle CALL can succeed while the CODE it wrote crashes at runtime -- reference() raising on
-    # every input, gen() raising while unpacking its own tuple -- leaving zero usable cases in every
-    # tier even though prepare_gate_inputs ran to completion. That's silent: no gate step fails (there's
-    # nothing to check), so the run would ship unverified. Recover once, the same way adjudication
-    # does (regenerate_oracle, reusing the fast model with the collected failure notes as context), but
-    # through its OWN one-shot counter (gi.oracle_selfrepairs) so this can fire and the unrelated
-    # adjudication regeneration (gi.oracle_regens, in the repair loop below) can still fire later in
-    # the same run -- one broken-oracle recovery must never spend the other's budget.
-    # Second trigger, same one-shot path: the oracle ran, but its own validate() threw out most of what
-    # its own gen() produced (30 of 32 small inputs on bench8/2beff58fa923). gen and validate are then
-    # two readings of the same preconditions and one of them is wrong, so the survivors are either too
-    # few to be coverage or inputs one half of the oracle calls illegal -- either way, rewriting both
-    # from one precondition list beats gating on them.
-    # Third trigger, same one-shot path: the oracle contradicts most of the inputs the SOLVE authors
-    # hand-traced from the statement. Two independent readings that far apart cannot both be right,
-    # and the oracle is the side this system can rewrite -- blaming the candidate here would spend a
-    # repair attempt making correct code agree with a wrong reference.
-    selfrepair_why = ""
-    disputed = False
-    if V.oracle_unusable(gi):
-        selfrepair_why = "no usable case in any tier"
-    elif gi.validate_reject_frac >= cfg["limits"]["validate_reject_frac_regen"]:
-        selfrepair_why = f"validate() rejected {gi.validate_reject_frac:.0%} of its own gen() inputs"
-    elif V.examples_disputed(gi):
-        ec = gi.example_checks
-        disputed = True
-        selfrepair_why = f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {V.examples_nonrejected(ec)}"
-        run.log(f"oracle.disputed {selfrepair_why}")
-    if selfrepair_why and run.budget.can_afford(cfg["limits"]["oracle_selfrepair_afford_s"]) and not run.over_cost():
-        run.log(f"oracle.selfrepair triggered: {selfrepair_why}; notes={'; '.join(gi.notes)[:300]}")
-        prev = gi
-        extra = V.examples_dispute_extra(gi) if disputed else V.selfrepair_extra(gi)
-        try:
-            gi = V.regenerate_oracle(run, gi, extra, pv, counter="oracle_selfrepairs", workdir_tag="oracle_selfrepair")
-        except Exception as e:
-            run.log(f"oracle.selfrepair crashed {type(e).__name__}: {e}")
-        # The replacement was asked specifically about these inputs; if it still contradicts half of
-        # them, no reference in this run is ground truth and no diff_* step against it is full evidence.
-        if disputed and V.examples_disputed(gi):
-            ec = gi.example_checks
-            gi.diff_degraded = f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {V.examples_nonrejected(ec)}"
-            run.log(f"oracle.disputed after regeneration: {gi.diff_degraded}")
-        # Coming from the rejection trigger there was a working-but-inconsistent oracle to lose: keep it
-        # unless the replacement is actually better. (The crash trigger has nothing to fall back to.)
-        if prev.validate_reject_frac and gi is not prev and not gi.regen_failed \
-                and (V.oracle_unusable(gi) or gi.validate_reject_frac > prev.validate_reject_frac):
-            run.log(f"oracle.selfrepair kept the original oracle: regenerated reject_frac={gi.validate_reject_frac:.2f} small={len(gi.cases_small)}")
-            prev.notes.append("oracle self-repair discarded: the regenerated oracle rejected at least as much of its own gen() output")
-            prev.oracle_selfrepairs = gi.oracle_selfrepairs
-            gi = prev
-    repairs = 0
-    syntax_repairs = 0
-    fresh_solves = 0
-    no_repair: set[str] = set()   # lineages a regression closed: another patch there is the same losing bet
-
+        # A crashed preparation leaves an oracle with no usable case in any tier, which is the
+        # self-repair path's own first trigger: give the run its one recovery attempt here too.
+        adjudicate_oracle()
     def can_fresh_solve() -> bool:
         """A fresh solve costs one strong call plus a gate pass on its result, so it is only started
         while the budget still covers both (and the cost cap and the per-run count allow it)."""
@@ -406,31 +482,16 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
                 and run.budget.can_afford(cfg["limits"]["repair_afford_s"] + GATE_PASS_ESTIMATE_S)
                 and not run.over_cost())
 
-    while run.cands:
-        # Gate every attempt that still has only its static evidence before spending a repair: a
-        # second independent attempt is cheaper than a repair and often already correct. Once all
-        # are gated, work on whichever passed the most gates (best_candidate's ranking), which is
-        # also the one that gets emitted.
+    while run.cands and not gate_crashed:
+        # Every attempt that arrived was already gated as it landed; what is left here are the
+        # children a repair or a fresh solve mints, which carry only their static evidence. Once
+        # nothing is ungated, work on whichever passed the most gates (best_candidate's ranking),
+        # which is also the one that gets emitted.
         ungated = [c for c in run.cands if len(c.evidence) == 1 and c.evidence[0].passed]
         cand = ungated[0] if ungated else best_candidate(run.cands)
         try:
             if len(cand.evidence) == 1 and cand.evidence[0].passed:
-                cand.evidence = [cand.evidence[0]] + V.run_gate(problem, cand.source, gi, workdir=os.path.join(run_dir, cand.id), budget=run.budget, limits=cfg["limits"], log=run.log, examples=cand.examples)
-                # The Rust compile step may have added the imports rustc asked for; the gate ran that
-                # patched source, so it is the one that must be emitted and re-gated from here on.
-                patched = next((e.detail["patched_source"] for e in cand.evidence if "patched_source" in e.detail), None)
-                if patched:
-                    cand.source = patched
-                    with open(os.path.join(run.dir, "candidates", f"{cand.id}.{run.ext()}"), "w", encoding="utf-8") as f: f.write(patched)
-                    run.log(f"candidate.imports_added id={cand.id}")
-                # A repaired child that now scores below the parent it came from is a regression: the
-                # repair made the candidate worse, and another patch down the same lineage is the
-                # same losing bet (round-10 L1). The parent already wins emission on score; what has
-                # to stop is repairing this lineage.
-                parent = next((c for c in run.cands if c.id == cand.parent), None)
-                if parent is not None and regression_score(cand) < regression_score(parent):
-                    run.log(f"repair.regressed child={cand.id} parent={parent.id}")
-                    no_repair.update({cand.id, parent.id})
+                gate_candidate(cand)
             if cand.all_passed():
                 # "static"/"compile" are pre-flight checks, not verification against the oracle; if
                 # everything past them was skipped, nothing was actually checked -- don't log this as
@@ -450,14 +511,15 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             if len(ungated) > 1 and run.budget.can_afford(cfg["limits"]["repair_afford_s"]):
                 run.log(f"gate.next_attempt {len(ungated) - 1} attempt(s) still ungated, trying before repair")
                 continue
-            # Every attempt is now gated, and `cand` is merely the one gated last -- repair the one
-            # that got furthest instead, which is also the candidate that would be emitted.
+            # Every attempt is now gated, and `cand` is merely the one this iteration picked up --
+            # repair the one that got furthest instead, which is also the candidate that would be
+            # emitted.
             cand = best_candidate(run.cands)
             failed = next((e for e in cand.evidence if not e.passed), None)
             if failed is None:
                 run.log("gate.passed"); break
-            if ungated and cand.id != ungated[0].id:
-                run.log(f"repair.target {cand.id} (best of {len(run.cands)} candidates), not the last gated")
+            if len(run.cands) > 1:
+                run.log(f"repair.target {cand.id} (best of {len(run.cands)} candidates)")
             # Two failures a patch cannot fix, both routed to a fresh solution from a different
             # algorithm instead of to the patch-style repair: a timing failure on a real max-size
             # input (a smaller edit does not change an approach's complexity -- round-10 L2, round-13

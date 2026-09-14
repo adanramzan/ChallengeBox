@@ -595,7 +595,9 @@ def test_best_of_n_prefers_a_passing_attempt_over_repairing_a_failing_one(tmp_pa
     rep = S.solve(prob(tmp_path), llm, cfg_n(2), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert rep["repairs"] == 0, "a second attempt is cheaper than a repair and must be tried first"
     assert not any(c["tag"] == "repair" for c in rep["calls"])
-    assert rep["status"] == "passed_all_gates" and rep["final_candidate"] == "c2"
+    # candidates are numbered in the order their replies land, not in submission order (each is
+    # gated as it arrives), so the correct attempt is identified by what was emitted, not by its id.
+    assert rep["status"] == "passed_all_gates"
     assert (tmp_path / "s.py").read_text().strip() == "def add(a, b):\n    return a + b"
 
 
@@ -621,16 +623,18 @@ def test_single_attempt_remains_the_default_behaviour(tmp_path):
 
 
 def test_repair_targets_the_best_attempt_not_the_last_gated(tmp_path):
-    # Attempt 1 fails only the LAST differential tier; attempt 2 fails an earlier one, so attempt 1
-    # got further. Once both are gated the repair must be spent on attempt 1 (c1), not on whichever
-    # happened to be gated last.
+    # One attempt fails only the LAST differential tier; the other fails an earlier one, so the
+    # first got further. Once both are gated the repair must be spent on that one, not on whichever
+    # happened to be gated last. Which id it carries depends on which reply landed first.
     ok_small_bad_medium = SOLVE_OK.replace("return a + b", "return a + b if a < 10**4 else a + b + 1")
     bad_small = SOLVE_OK.replace("return a + b", "return a + b if a < 15 else a + b + 1")
     llm = FakeLLM({"solve": [ok_small_bad_medium, bad_small], "oracle": [ORACLE_MED], "stress": [STRESS_OK],
                    "repair": ["===VERDICT===\ncandidate\n===END===\n===CODE===\ndef add(a, b):\n    return a + b\n===END===\n"]})
     rep = S.solve(prob(tmp_path), llm, cfg_n(2), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
-    assert rep["parents"].get("c3") == "c1", f"repair should build on the better attempt, got {rep['parents']}"
-    assert any("repair.target c1" in e for e in rep["events"])
+    best = next(cid for cid, ev in rep["evidence"].items()
+                if all(e["passed"] for e in ev if e["kind"] == "diff_small"))   # the one that got past diff_small
+    assert rep["parents"].get("c3") == best, f"repair should build on the better attempt, got {rep['parents']}"
+    assert any(f"repair.target {best}" in e for e in rep["events"])
 
 
 # --- round 6: the max-size stress input must pass the oracle's validate() too ---
@@ -1121,3 +1125,52 @@ def test_two_all_passing_candidates_are_ranked_by_measured_stress_time(tmp_path)
     degraded.evidence[-1].detail["degraded"] = "not a true max-size input"
     assert S.measured_stress_s(degraded) is None
     assert S.best_candidate([slow, degraded]) is slow
+
+
+# --- round 14: each candidate is gated as its own reply arrives ---
+
+class _SecondSolveLatch(FakeLLM):
+    """FakeLLM that holds the SECOND solve reply until an Event is set, so the test can assert the
+    first candidate was gated while the other attempt was still outstanding."""
+    def __init__(self, script, gate):
+        super().__init__(script)
+        self.gate, self.n = gate, 0
+    def chat(self, role, system, user, *, timeout_s, max_tokens=None, tag=""):
+        if tag == "solve":
+            with self._lock:
+                self.n += 1
+                mine = self.n
+            if mine == 2:
+                self.gate.wait(timeout=20)
+        return super().chat(role, system, user, timeout_s=timeout_s, max_tokens=max_tokens, tag=tag)
+
+def test_the_first_candidate_is_gated_while_the_other_attempt_is_still_running(tmp_path, monkeypatch):
+    # bench15 idled 43 s and bench16 31 s waiting for the slowest solve attempt before gating any
+    # candidate. With a thinking strong model that wait is the whole repair budget.
+    import threading
+    gate_done = threading.Event()
+    _spy_on(monkeypatch, "run_gate", after=gate_done.set)   # the second reply is released only once a gate pass has run
+    llm = _SecondSolveLatch({"solve": [SOLVE_OK, SOLVE_BUGGY], "oracle": [ORACLE_OK], "stress": [STRESS_OK]}, gate_done)
+    rep = S.solve(prob(tmp_path), llm, cfg_n(2), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    early = [l for l in rep["events"] if "gate.early" in l]
+    assert len(early) == 2 and "cand=c1 solve_pending=1" in early[0] and "cand=c2 solve_pending=0" in early[1]
+    first_gate = rep["events"].index(early[0])
+    second_reply = [i for i, l in enumerate(rep["events"]) if "solve.done" in l][1]
+    assert first_gate < second_reply, "the first candidate must be gated before the second reply lands"
+    # both attempts are still gated against the same fully prepared inputs
+    assert len(rep["evidence"]) == 2
+    assert all(any(e["kind"] == "diff_small" and e["cases"] for e in ev) for ev in rep["evidence"].values())
+    assert rep["status"] == "passed_all_gates" and rep["repairs"] == 0
+
+def test_the_example_check_accumulates_and_the_dispute_is_decided_once(tmp_path):
+    # The oracle is wrong about a >= 15, which both attempts' hand traces contradict. The dispute
+    # must fire once, on the first candidate that supplies the evidence -- not once per candidate.
+    ex15 = "===EXAMPLES===\n((15, 0), 15)\n((16, 0), 16)\n((17, 0), 17)\n===END===\n"
+    solve_a = SOLVE_NO_EXAMPLES + ex15
+    solve_b = SOLVE_NO_EXAMPLES.replace("return a + b", "return b + a") + ex15
+    llm = FakeLLM({"solve": [solve_a, solve_b], "oracle": [ORACLE_WRONG, ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg_n(2), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 1
+    assert sum("oracle.selfrepair triggered" in e for e in rep["events"]) == 1
+    assert len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 2   # the one regeneration, not one per candidate
+    assert sum("oracle.examples cases=" in e for e in rep["events"]) >= 2   # the check itself does accumulate
