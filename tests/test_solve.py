@@ -1424,6 +1424,57 @@ def test_a_regenerated_tier_that_is_still_weak_stays_degraded_and_is_not_regener
     assert ev["diff_small"]["passed"] and "weak" in ev["diff_small"]["detail"]["degraded"]
     assert rep["status"] != "passed_all_gates"
 
+# --- round 14 batch 9: a regeneration carries every defect that was detected, not the first one ---
+
+def cfg_both():
+    c = cfg(); c["limits"]["cases_small"] = 40; return c
+
+# bench19's oracle, in miniature: half of what gen() produces its own validate() throws out, and
+# every input that survives has the same answer. The elif chain sent only the rejection paragraph.
+ORACLE_WEAK_AND_REJECTING = ("===ORACLE===\ndef reference(a, b):\n    return a + b\n"
+                             "def gen(seed, mode):\n    return (0, 0) if seed % 2 == 0 else (1, 1)\n"
+                             "def validate(a, b):\n    return (a, b) == (0, 0)\n===END===\n")
+
+def test_a_regeneration_carries_every_detected_defect(tmp_path):
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_WEAK_AND_REJECTING, ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg_both(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 1
+    trig = next(e for e in rep["events"] if "oracle.selfrepair reasons=" in e)
+    assert "validate() rejected" in trig and "small tier weak" in trig
+    prompt = [u for c, (r, s_, u) in zip(llm.calls, llm.prompts) if c["tag"] == "oracle"][1]
+    assert "rejected as invalid, or crashed on" in prompt   # the self-rejection paragraph
+    assert "answers VARY" in prompt                          # ... and the weak-tier one, which used to be lost
+    assert "def add(" not in prompt                          # still never any candidate material
+
+# reference() has no path for odd inputs and raises KeyError, not ValueError -- a bug in the
+# reference, not an invalid input. validate() accepts them, so the crash reaches make_cases.
+ORACLE_CRASHES_ON_ITS_OWN_GEN = ("===ORACLE===\ndef reference(a, b):\n"
+                                 "    if a != 0:\n        raise KeyError('no path for this case')\n"
+                                 "    return a + b\n"
+                                 "def gen(seed, mode):\n    return (seed, 1)\n"
+                                 "def validate(a, b):\n    return True\n===END===\n")
+
+def test_the_regeneration_shows_the_exception_the_reference_raised(tmp_path):
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_CRASHES_ON_ITS_OWN_GEN, ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 1
+    prompt = [u for c, (r, s_, u) in zip(llm.calls, llm.prompts) if c["tag"] == "oracle"][1]
+    assert "raised an exception other than ValueError" in prompt
+    assert "KeyError:" in prompt and "no path for this case" in prompt
+
+# Varied answers, but it throws out almost everything its own gen() produces: better on the weak
+# tier, worse on the rejection fraction, so the original stands.
+ORACLE_VARIED_BUT_REJECTING = ("===ORACLE===\ndef reference(a, b):\n    return a + b\n"
+                               "def gen(seed, mode):\n    return (seed, 1)\n"
+                               "def validate(a, b):\n    return a == 0\n===END===\n")
+
+def test_a_replacement_worse_on_one_defect_is_discarded(tmp_path):
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_WEAK_AND_REJECTING, ORACLE_VARIED_BUT_REJECTING], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg_both(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 1
+    assert any("kept the original oracle" in e and "regenerated reject_frac" in e for e in rep["events"])
+    assert rep["gate_inputs"]["weak_tiers"].get("small")   # the original's tier, still there and still degraded
+
 def test_a_varied_tier_triggers_no_weak_regeneration(tmp_path):
     llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
     rep = S.solve(prob(tmp_path), llm, cfg_weak(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))

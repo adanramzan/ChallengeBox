@@ -459,36 +459,53 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         # hand-traced from the statement. Two independent readings that far apart cannot both be right,
         # and the oracle is the side this system can rewrite -- blaming the candidate here would spend a
         # repair attempt making correct code agree with a wrong reference.
+        # An oracle is rarely broken in exactly one way, and the triggers were an elif chain: ONE
+        # reason was picked and ONE paragraph sent. bench19's oracle was self-rejecting AND produced
+        # 75 of 75 identical answers AND had no code path for a whole family of operations; the
+        # rejection paragraph won, the one that addresses answer variety never went out, and the
+        # crashes were counted but never shown. Every reason that holds is collected, and the
+        # regeneration carries every matching paragraph.
         nonlocal gi, selfrepaired
         if selfrepaired:
             return
-        selfrepair_why = ""
-        disputed = False
-        weak = False
-        if V.oracle_unusable(gi):
-            selfrepair_why = "no usable case in any tier"
-        elif gi.validate_reject_frac >= cfg["limits"]["validate_reject_frac_regen"]:
-            selfrepair_why = f"validate() rejected {gi.validate_reject_frac:.0%} of its own gen() inputs"
-        elif not health_only and V.examples_disputed(gi):
+        reasons, extras = [], []
+        disputed = weak = False
+        unusable = V.oracle_unusable(gi)
+        rejecting = gi.validate_reject_frac >= cfg["limits"]["validate_reject_frac_regen"]
+        if unusable:
+            reasons.append("no usable case in any tier")
+        if rejecting:
+            reasons.append(f"validate() rejected {gi.validate_reject_frac:.0%} of its own gen() inputs")
+        if not health_only and V.examples_disputed(gi):
             ec = gi.example_checks
             disputed = True
-            selfrepair_why = f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {V.examples_nonrejected(ec)}"
-            run.log(f"oracle.disputed {selfrepair_why}")
+            reasons.append(f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {V.examples_nonrejected(ec)}")
+            run.log(f"oracle.disputed {reasons[-1]}")
         # Fourth trigger, same one-shot path: the oracle ran and its small tier agreed on 200 cases, but
         # almost every one of them has the same expected answer, because gen() never reaches the state the
         # statement is about (bench18: 195 of 200 small answers were "1", "operation 1 is invalid"). The
         # tier is degraded either way (run_gate); regenerating is the only way to get real coverage back,
         # and the extra tells the model exactly what varies and how to make it vary.
-        elif gi.weak_tiers.get("small"):
+        if gi.weak_tiers.get("small"):
             weak = True
-            selfrepair_why = gi.weak_tiers["small"]["note"]
+            reasons.append(gi.weak_tiers["small"]["note"])
+        selfrepair_why = "; ".join(reasons)
         if selfrepair_why and run.budget.can_afford(oracle_afford_s(run, "oracle_selfrepair_afford_s")) and not run.over_cost():
+            run.log(f"oracle.selfrepair reasons={reasons}")
             run.log(f"oracle.selfrepair triggered: {selfrepair_why}; solve_pending={solve_pending()}; "
                     f"notes={'; '.join(gi.notes)[:300]}")
             prev = gi
             selfrepaired = True
-            extra = (V.examples_dispute_extra(gi) if disputed else
-                     V.weak_tier_extra(gi) if weak else V.selfrepair_extra(gi))
+            # selfrepair_extra is the paragraph for the two reasons it was written for and switches
+            # shape between them; the other three are independent and simply concatenate.
+            if unusable or rejecting:
+                extras.append(V.selfrepair_extra(gi))
+            extras.append(V.crash_extra(gi))   # "" unless reference() raised something other than ValueError
+            if weak:
+                extras.append(V.weak_tier_extra(gi))
+            if disputed:
+                extras.append(V.examples_dispute_extra(gi))
+            extra = "".join(extras)
             try:
                 gi = V.regenerate_oracle(run, gi, extra, pv, counter="oracle_selfrepairs", workdir_tag="oracle_selfrepair")
             except Exception as e:
@@ -499,26 +516,27 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
                 ec = gi.example_checks
                 gi.diff_degraded = f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {V.examples_nonrejected(ec)}"
                 run.log(f"oracle.disputed after regeneration: {gi.diff_degraded}")
-            # Coming from the weak-tier trigger there is a working oracle to lose too: keep whichever of
-            # the two has the LOWER share of identical answers. Either way the tier stays degraded -- a
-            # regeneration that is still weak has not restored the evidence, only maybe improved it.
-            if weak and gi is not prev and not gi.regen_failed:
+            # Keep the replacement only if it is no worse on EVERY defect the original had. The
+            # regeneration was asked about all of them at once, so it can fix one and break another:
+            # a prompt that wins back answer variety by loosening gen() can also start producing
+            # inputs its own validate() throws out. Each measure is checked only where the original
+            # had something to lose -- an oracle that was already unusable has no fall-back, so a
+            # replacement is taken whatever it is.
+            if gi is not prev and not gi.regen_failed:
+                worse = []
+                if V.oracle_unusable(gi) and not unusable:
+                    worse.append("the regenerated oracle produced no usable case")
+                if prev.validate_reject_frac and gi.validate_reject_frac > prev.validate_reject_frac:
+                    worse.append(f"regenerated reject_frac={gi.validate_reject_frac:.2f} small={len(gi.cases_small)}")
+                old_share = (prev.weak_tiers.get("small") or {}).get("share")
                 new_share = (gi.weak_tiers.get("small") or {}).get("share")
-                old_share = (prev.weak_tiers.get("small") or {}).get("share", 1.0)
-                if V.oracle_unusable(gi) or (new_share is not None and new_share >= old_share):
-                    run.log(f"oracle.selfrepair kept the original oracle: regenerated small tier is no more varied "
-                            f"({new_share if new_share is not None else 'unusable'} vs {old_share})")
-                    prev.notes.append("oracle self-repair discarded: the regenerated oracle's small tier is no more varied than the original's")
+                if old_share is not None and new_share is not None and new_share >= old_share:
+                    worse.append(f"regenerated small tier is no more varied ({new_share} vs {old_share})")
+                if worse:
+                    run.log("oracle.selfrepair kept the original oracle: " + "; ".join(worse))
+                    prev.notes.append("oracle self-repair discarded, the regenerated oracle was no better: " + "; ".join(worse))
                     prev.oracle_selfrepairs = gi.oracle_selfrepairs
                     gi = prev
-            # Coming from the rejection trigger there was a working-but-inconsistent oracle to lose: keep it
-            # unless the replacement is actually better. (The crash trigger has nothing to fall back to.)
-            if prev.validate_reject_frac and gi is not prev and not gi.regen_failed \
-                    and (V.oracle_unusable(gi) or gi.validate_reject_frac > prev.validate_reject_frac):
-                run.log(f"oracle.selfrepair kept the original oracle: regenerated reject_frac={gi.validate_reject_frac:.2f} small={len(gi.cases_small)}")
-                prev.notes.append("oracle self-repair discarded: the regenerated oracle rejected at least as much of its own gen() output")
-                prev.oracle_selfrepairs = gi.oracle_selfrepairs
-                gi = prev
 
     with ThreadPoolExecutor(max_workers=attempts + 2) as ex:
         # All of these run concurrently, so the generate phase costs max(), not sum() —

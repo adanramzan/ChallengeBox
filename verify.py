@@ -58,6 +58,7 @@ class GateInputs:
     input_skeleton: object = None   # the container shape the oracle's own gen() produces, per argument (see input_skeleton)
     validate_reject_frac: float = 0.0   # rejected/checked over small+medium: how far the oracle's validate() and gen() disagree
     validate_rejects: dict = field(default_factory=dict)   # tier -> (checked, rejected, up to two rejected inputs), for the self-repair prompt
+    reference_crashes: dict = field(default_factory=dict)   # tier -> (count, up to three exception lines): reference() raised something other than ValueError
     weak_tiers: dict = field(default_factory=dict)   # tier -> {share, count, total, value, note}: its answers barely vary, so its agreement is weak evidence
     diff_degraded: str = ""   # why every diff_* evidence against this oracle is weaker than it looks (set by regenerate_oracle)
     example_checks: dict = field(default_factory=dict)   # this oracle's reference() vs the SOLVE authors' hand-traced examples
@@ -211,6 +212,11 @@ def example_line_count(block_text: str) -> int:
     not the ones past the cap."""
     return len(split_examples(block_text)[:MAX_EXAMPLES])
 
+def _exception_line(err: str) -> str:
+    """`ExceptionType: message` out of a harness traceback -- its last non-blank line."""
+    lines = [l.strip() for l in (err or "").strip().splitlines() if l.strip()]
+    return lines[-1][:200] if lines else "(no message)"
+
 def _ref_args(problem, inp) -> tuple:
     if problem.language != "python":
         return (inp,)
@@ -258,9 +264,16 @@ def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str
     # "reference did not raise ValueError"). Counted alongside validate's rejections so a crashing
     # reference can push the reject fraction over the regeneration threshold, which it could not do
     # while these were only "errors".
-    crashes = sum(1 for r in res if not r.ok and "ValueError" not in r.error)
+    crash_errors = [r.error for r in res if not r.ok and "ValueError" not in r.error]
     detail = {"dropped": len(dropped), "errors": dropped[:3], "checked": checked, "invalid_dropped": invalid_dropped,
-              "inputs": len(inputs), "reference_crashes": crashes}
+              "inputs": len(inputs), "reference_crashes": len(crash_errors),
+              # The exception line itself, not just the count. A crashing input gets verdict None,
+              # which feeds validate_reject_frac but was excluded from `rejected_examples` (those are
+              # the False ones) -- so a regeneration prompt described the fraction without a single
+              # exception to show. bench19's deepest oracle defect, a reference() with no code path
+              # for a whole family of the statement's operations, lived entirely in this class:
+              # 33 inputs died with `KeyError: 'flattened'` and no prompt ever said so.
+              "crash_errors": [_exception_line(e) for e in crash_errors[:3]]}
     if rejected_examples:
         detail["rejected_examples"] = rejected_examples
     if validation_skipped:
@@ -419,6 +432,8 @@ def _log_and_note_validation(gi: GateInputs, ev: Evidence, mode: str, log) -> No
     checked = ev.detail.get("checked") or ev.detail.get("inputs", 0)
     if checked and (not skip or crashes):
         gi.validate_rejects[mode] = (checked, invalid + crashes, ev.detail.get("rejected_examples", []))
+    if crashes:
+        gi.reference_crashes[mode] = (crashes, ev.detail.get("crash_errors", []))
     if invalid:
         gi.notes.append(f"{mode}: dropped {invalid} of {ev.detail.get('checked', 0)} generated inputs as invalid (failed validate())")
     if ev.detail.get("unusable"):
@@ -714,6 +729,29 @@ def selfrepair_extra(gi: GateInputs) -> str:
             "are the actual errors your code produced when executed on real inputs. Fix these specific "
             "problems (undefined names, unpacking errors, exceptions) and follow the statement "
             f"literally:\n{notes}\n")
+
+def crash_extra(gi: GateInputs) -> str:
+    """Extra context for regenerate_oracle naming the exceptions the previous reference() raised on
+    its own gen() inputs. "" when there were none.
+
+    A raise other than ValueError is a bug in the reference, not an invalid input -- the oracle prompt
+    defines validate() as "reference() did not raise ValueError" -- and it is the signature of the
+    worst kind of oracle: one with no code path at all for a whole family of the statement's cases,
+    rather than one that merely computes the wrong answer. Those inputs get verdict None, which is
+    counted in validate_reject_frac but was never SHOWN to the regeneration, so the prompt could say
+    "you rejected 52% of your own inputs" while the actual `KeyError: 'flattened'` went unmentioned
+    (bench19 §7.3). Never any candidate material: the oracle never sees the candidate."""
+    tiers = [v for t, v in gi.reference_crashes.items() if t in ("small", "medium")]
+    n = sum(c for c, _ in tiers)
+    if not n:
+        return ""
+    shown = "\n".join(f"- {e}" for e in [e for _, errs in tiers for e in errs][:3])
+    return (f"\n\nYour reference() raised an exception other than ValueError on {n} of its own gen() inputs. "
+            "An invalid input is one the reference rejects by raising ValueError; ANY other exception is a "
+            "bug in the reference itself -- most often a family of the statement's cases it has no code path "
+            f"for at all -- and every input that hits it is lost, legal or not. The first three:\n{shown}\n"
+            "Find which case of the statement each of these lands in, implement that case literally, and "
+            "raise ValueError only for inputs the statement's preconditions forbid.\n")
 
 def weak_tier_extra(gi: GateInputs) -> str:
     """Extra context for regenerate_oracle when the oracle is being reissued because its own gen()
