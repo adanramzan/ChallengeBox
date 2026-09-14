@@ -494,3 +494,16 @@ def test_medium_tier_yields_to_repair_when_the_budget_is_already_late(tmp_path):
     assert any("medium tier skipped" in n for n in gi.notes)
     gi2 = V.prepare_gate_inputs(PY, ORACLE, "", limits, workdir=str(tmp_path / "gi2"), budget=FakeBudget(), log=lambda m: None)
     assert len(gi2.cases_medium) == 3
+
+
+def test_repairing_a_root_again_shows_the_failed_childs_diff():
+    # Repairing c1 a second time (its first repair produced c2, which did not fix the case) must not
+    # look like a first attempt: the model has to see the change that already failed.
+    import solve as S
+    root = S.Candidate("c1", GOOD, None, [V.Evidence("diff_small", False, detail={"input": (1, 2)})])
+    child = S.Candidate("c2", BUG, "c1", [])
+    run = type("R", (), {"cands": [root, child]})()
+    note = V._previous_attempt_note(run, root, root.evidence[0])
+    assert "a + b + 1" in note and "did NOT fix" in note
+    # a root with no child at all is still a first attempt
+    assert V._previous_attempt_note(type("R", (), {"cands": [root]})(), root, root.evidence[0]) == ""

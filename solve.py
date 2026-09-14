@@ -158,9 +158,15 @@ def static_evidence(p: Problem, source: str) -> "V.Evidence":
     return V.Evidence("static", not probs, detail={"problems": probs})
 
 
+def candidate_score(c: Candidate) -> tuple:
+    mismatches = sum(int(e.detail.get("mismatches", 0)) for e in c.evidence)
+    failures = sum(1 for e in c.evidence if not e.passed and not e.skipped)
+    return (c.passed_count(), -mismatches, -failures, -int(c.id[1:]))
+
+
 def best_candidate(cands: list[Candidate]) -> Candidate | None:
     if not cands: return None
-    return max(cands, key=lambda c: (c.passed_count(), int(c.id[1:])))
+    return max(cands, key=candidate_score)
 
 
 def write_solution(out_path: str, source: str):
@@ -335,6 +341,9 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     # report.json's `events` too, not just the in-memory list mutated after the file was written.
     best = best_candidate(run.cands)
     status = "no_candidate"
+    solver_status = ("candidate" if run.cands else
+                     "timeout" if any(r.error == "timeout" for r in r_solves) else
+                     "malformed")
     if best is not None:
         # Python's "overflow" evidence is always skipped -- Python ints are arbitrary precision, so
         # the check is definitionally not applicable, not a coverage gap -- and must not by itself
@@ -355,6 +364,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         run.log(f"emit candidate={best.id} status={status}")
     report = {"problem_id": problem.problem_id, "language": problem.language, "profile": cfg.get("profile"), "deadline_s": problem.deadline_s,
               "deadline_scale": deadline_scale, "elapsed_s": round(run.budget.elapsed(), 1), "status": status,
+              "solver_status": solver_status,
               "final_candidate": best.id if best else None, "repairs": repairs, "syntax_repairs": syntax_repairs, "oracle_regenerated": gi.oracle_regens,
               "oracle_selfrepaired": gi.oracle_selfrepairs,
               "evidence": {c.id: [asdict(e) for e in c.evidence] for c in run.cands}, "parents": {c.id: c.parent for c in run.cands},

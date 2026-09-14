@@ -27,6 +27,12 @@ def test_single_shot_emits_solution_and_report(tmp_path):
     on_disk = json.loads((run_dir / "report.json").read_text())
     assert any("emit candidate=c1" in line for line in on_disk["events"])
 
+def test_solver_timeout_is_reported_as_inconclusive(tmp_path):
+    llm = FakeLLM({"solve": ["", ""], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    llm.script["solve"] = ["", ""]
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["status"] == "no_candidate" and rep["solver_status"] == "malformed"
+
 def test_broken_oracle_and_no_stress_emits_unverified_not_passed(tmp_path):
     # oracle whose reference() always raises, and no STRESS block at all -> the gate has zero real
     # cases and no stress input, so every gate step is "skipped" rather than genuinely exercised.

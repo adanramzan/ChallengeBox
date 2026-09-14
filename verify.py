@@ -607,7 +607,12 @@ def _previous_attempt_note(run, cand, failed: Evidence) -> str:
     given, what it changed, and that the candidate above still fails -- so the model doesn't repeat a
     change that already didn't work. Empty string when there is no earlier repair (first attempt)."""
     if not cand.parent:
-        return ""
+        child = next((c for c in run.cands if c.parent == cand.id), None)
+        if child is None:
+            return ""
+        diff = "\n".join(difflib.unified_diff(cand.source.splitlines(), child.source.splitlines(), lineterm="", n=1))
+        return ("\nA previous repair already ran from this candidate and made this change:\n"
+                f"{_fmt(diff, 1500)}\nThat change did NOT fix the case. Do not repeat it.\n")
     parent = next((c for c in run.cands if c.id == cand.parent), None)
     if parent is None:
         return ""
