@@ -2,7 +2,11 @@ You are solving a hard algorithmic problem. The statement below is the only spec
 
 Target language: {{language}}. Contract: {{contract}}
 
-Work out the rules, traps, and algorithm in your head first, but write the CODE block first in your response — output tokens are limited, and code cut off by the budget is worse than analysis cut off by it. Respond with exactly these blocks, in order, each terminated by a line `===END===`. Keep reasoning brief; the budget is small.
+Work out the rules, traps, and algorithm first. Respond with exactly these blocks, in order, each terminated by a line `===END===`. Keep the design compact but explicit.
+
+===DESIGN===
+State representation, the invariant for every operation, the maximum-constraint complexity, and one hand trace of the hardest boundary case. Before writing code, reject any approach that iterates a count or capacity the statement bounds by a huge number, materializes or rescans a structure whose described size exceeds memory, or recurses to a depth proportional to the input.
+===END===
 
 ===CODE===
 The complete solution, and nothing else. {{language_rules}}

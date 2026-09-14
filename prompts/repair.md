@@ -22,6 +22,8 @@ input. Then change only what that sentence names. A rewrite of the whole approac
 right response to a single failing input; if you believe the approach itself is fundamentally wrong,
 say so plainly before ===VERDICT=== instead of silently rewriting it.
 
+If the approach cannot meet the stated maximum constraints, say so plainly in one sentence before ===VERDICT===, and still return the best correction you can. Do not patch one output while keeping an approach that iterates a count the statement bounds by a huge number, or rescans the whole structure once per operation.
+
 Then hand-trace the statement on this input, and decide which side is actually wrong.
 
 Both sides were written by a model from the same prose, so either can be the one at fault. Measured

@@ -21,9 +21,13 @@ This is the most common way this task is failed, and an invalid input makes ever
 * Get distinctness by construction: draw from a pool without replacement, rather than sampling and hoping for no collision.
 * Assert the invariants you relied on just before returning. A generator that raises is far better than one that quietly returns something invalid.
 
+When the statement describes a state machine, initialize the complete initial state before the first operation, and apply every transition the statement describes in BOTH `reference()` and `validate()`. An operation the statement calls invalid is still a valid test input: `reference()` must return the result the statement specifies for an invalid operation, while `validate()` accepts the input as long as its argument shapes and stated limits are valid.
+
+Before answering, hand-trace one sequence that covers the initial state, each kind of operation once, and one invalid operation, and check the trace against both functions.
+
 ## Python pitfalls that have broken this exact task
 
-* Never assign to a name you also read inside the same function, and never to an imported module name. Both `random = random.Random(seed)` and `tabs = [t for t in tabs if ...]` raise `UnboundLocalError`. Bind the generator to a fresh name such as `rng`.
+* Never assign to a name you also read inside the same function, and never to an imported module name. Both `random = random.Random(seed)` and `items = [x for x in items if ...]` raise `UnboundLocalError`. Bind the generator to a fresh name such as `rng`.
 * Never draw from a possibly-empty range. Guard every `randrange`, `randint`, `choice` and `sample` so the range or sequence is non-empty, and skip that step when it is not.
 * Return exactly the shape described above and nothing else.
 

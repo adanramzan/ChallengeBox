@@ -33,6 +33,8 @@ An invalid input makes every later comparison meaningless, and it is the most co
 * Nothing runs at import time except `import` statements, `def`s, and the `EDGES = [...]` literal. No module-level loops, asserts, or calls — a single failing assert at import discards both `gen_max` and `EDGES`. If you want to check `EDGES`, do it by hand before answering, not in code.
 * Never indent the contents of a multi-line string literal (e.g. a `"""..."""` block spanning several lines) to match the surrounding code. Every line after the first becomes part of the value verbatim, so indenting it adds leading whitespace the real input never has. Start continuation lines at column 0, or build the string with `"\n".join([...])` instead.
 
+The architecture will validate `gen_max()` and `EDGES` before timing a candidate. Build them from a running state model and ensure they satisfy argument preconditions; do not discard an operation merely because its specified result is the statement's invalid-operation result.
+
 Respond with exactly one block:
 
 ===STRESS===
