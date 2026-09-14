@@ -15,6 +15,6 @@ def test_config_has_openrouter_roles_and_cost_cap():
     # pointed at the strong model when the cheaper one cannot write a usable oracle inside the cap
     # (round 13). Independence of oracle and candidate is then bought by the prompts and the
     # SOLVE-authored examples, not by the model slug.
-    assert 0 < cfg["limits"]["max_cost_usd_per_problem"] <= 1.0
+    assert 0 < cfg["limits"]["max_cost_usd_per_problem"] <= 2.0
     assert cfg["limits"]["safety_margin_s"] > 0
     assert cfg["phases"]["generate_until"] < cfg["phases"]["repair_until"] < cfg["phases"]["settle_until"] < 1

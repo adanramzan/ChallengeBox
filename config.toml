@@ -23,9 +23,10 @@ stress_min_plausible_s = 0.01
 max_repairs = 2
 # Independent SOLVE attempts, gated against the same oracle; best_candidate() keeps whichever
 # passes the most gates. They are issued concurrently, so N costs max() latency, not sum -- the
-# strong model returns in ~10-20s of a ~157s generate allowance, so the spare time buys extra
-# shots at a correct solution rather than a slower model (no reasoning model on OpenRouter
-# returns inside a 300s deadline at this prompt size; see BENCHMARK-FINDINGS-ROUND2.md).
+# strong model's latency is what this trades against: with a thinking model in that role the two
+# attempts still cost max() rather than sum(), so the spare time buys a second independent shot at
+# a correct solution. (The round-2 note that no reasoning model fits a 300s deadline was measured
+# with max_tokens too small for the reasoning -- see the [profiles.openrouter.strong] comment.)
 # Each attempt costs one strong call plus, if it is reached, one gate pass -- gating is the
 # scarcer resource, so raise this only with the measured elapsed headroom to spend.
 solve_attempts = 2
@@ -62,7 +63,11 @@ shrink_budget_s = 3.0
 # with time still on the clock. A box bounds the cost without ever silently dropping the tier: if the
 # generator alone spends it, medium ships 0 cases with the note "medium tier: time box exhausted".
 medium_tier_budget_s = 20.0
-max_cost_usd_per_problem = 0.50
+# A thinking strong model at $5/$25 per 1M costs far more per problem than the coder model it
+# replaces: two concurrent solves plus up to two repairs, each carrying the statement and up to
+# 24000 tokens of thinking and answer. Raised from 0.50 so the cap bounds a runaway rather than
+# stopping the second repair of an ordinary run.
+max_cost_usd_per_problem = 1.50
 # Fraction of the old small inputs on which a REGENERATED oracle may disagree with the oracle it
 # replaces before its differential evidence is marked degraded. Two references written from the same
 # prose that disagree on more than half of tiny inputs cannot both be near-correct, so the run has no
@@ -87,7 +92,8 @@ oracle_retry_afford_s = 130.0
 # Minimum remaining budget (seconds) required to start another repair-loop iteration (a syntax or
 # semantic repair call plus re-gating). Generous headroom over the measured repair-call latency
 # (~20s max against current models) so a repair attempt is never started only to be starved by
-# step_timeout's reserve; raise if a slower model is configured for the "strong" role.
+# step_timeout's reserve. The strong role is now a thinking model, whose repair latency is
+# unmeasured; raise this if a live run shows repairs starting and then being starved.
 repair_afford_s = 60.0
 
 # Minimum remaining budget (seconds) required to trigger one oracle self-repair regeneration when
@@ -120,26 +126,42 @@ generate_call_share = 0.70
 repair_call_share = 0.25
 
 # Any OpenAI-compatible endpoint can be added as another [profiles.<name>.<role>] table.
+# A THINKING model in the strong role. Rounds 10-14 settle what the cheap coder model cannot do:
+# qwen3-coder read the semantics of 5cb294c18288 correctly in round 14 -- c4 matched an independent
+# reference on 8 366 differential cases -- and never once read the complexity. Four candidates for
+# that one statement, two independent solves and two repairs, all materialized a layout the
+# statement calls "enormous" and all iterated a count the statement bounds by 10^18; the emitted
+# solution needs ~10^11 s at the stated limits. No prompt or gate change reaches that: connecting
+# "enormous" to "do not build the list" is the reasoning the strong role exists to buy.
+#
+# The earlier note here -- "no reasoning model on OpenRouter returns inside a 300s deadline at this
+# prompt size" -- was measured with max_tokens at 12000, which the reasoning tokens spend before any
+# ===CODE=== block is written; the call then runs to its cap and returns nothing. Reasoning tokens
+# count against max_tokens, so the budget has to cover the thinking AND the answer: 24000 here, with
+# effort = "medium" rather than high so the thinking does not eat the deadline either.
 [profiles.openrouter.strong]
 base_url = "https://openrouter.ai/api/v1"
-model = "qwen/qwen3-coder"
+model = "anthropic/claude-opus-5"
 api_key_env = "OPENROUTER_API_KEY"
-max_tokens = 12000
+max_tokens = 24000
 max_concurrent = 3
-timeout_cap_s = 120.0
-extra = {}   # non-reasoning models: reasoning params are ignored and burn the whole budget
+timeout_cap_s = 210.0   # thinking + answer; the generate share (0.70 of ~285s usable) is what binds first
+stall_timeout_s = 45.0  # time-to-first-token is longer with thinking; only a real stall should abort
+price_in_per_m = 5.0
+price_out_per_m = 25.0  # OpenRouter reports usage.cost and the client prefers it; these are the fallback
+omit_temperature = true  # Claude 5 takes no sampling temperature once thinking is on (same reason as [profiles.anthropic.strong])
+extra = { reasoning = { effort = "medium" } }
 
 [profiles.openrouter.fast]
 base_url = "https://openrouter.ai/api/v1"
-# Same model as the strong role. deepseek produced three unusable oracles for one problem across
-# rounds 10 and 13 -- constant-answer or 45% wrong against an independent reference -- at 106-128s
-# per call, so most oracle calls were lost to the cap and the ones that arrived were not ground
-# truth. qwen3-coder returns in 17-24s and read the same statement correctly.
-# The cost: one model authoring both the candidate and the oracle can share a misreading, and two
-# sides that agree because they misread identically are no evidence at all. The check for that is
-# the SOLVE-authored examples (next batch), run against candidate and oracle alike; until those
-# exist, an oracle from the same model is still worth more than no oracle, which is what the
-# previous configuration delivered.
+# The oracle and the stress generator are measurement, not invention: they need a model that reads
+# a statement literally and returns fast, not one that reasons. deepseek produced three unusable
+# oracles for one problem across rounds 10 and 13 -- constant-answer or 45% wrong against an
+# independent reference -- at 106-128s per call, so most oracle calls were lost to the cap and the
+# ones that arrived were not ground truth. qwen3-coder returns in 17-24s and read the same
+# statement correctly, including on 5cb294c18288 in round 14.
+# It was briefly the strong role's model too, which risked candidate and oracle sharing one
+# misreading; with a thinking model now in the strong role the two sides are again independent.
 model = "qwen/qwen3-coder"
 api_key_env = "OPENROUTER_API_KEY"
 max_tokens = 8000
