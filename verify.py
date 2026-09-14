@@ -244,11 +244,17 @@ def _shrink_value(v):
     elif isinstance(v, (list, tuple)):
         n = len(v)
         if n == 0: return
+        # Never empty a sequence that started non-empty (round-10 L6): on 6e43a08ec05a the shrinker
+        # reduced `edits` to [] and the repair model, shown a counterexample where nothing was ever
+        # edited, deleted edit handling outright. A one-element witness still reproduces the failure
+        # and still shows the model what the operation is; ordering (halves first, then single
+        # deletions) keeps this the SMALLEST non-empty witness the greedy loop can reach.
         half = v[: n // 2], v[n // 2 :]
         for c in half:
-            if len(c) < n: yield type(v)(c)
-        for i in range(n):
-            yield type(v)(list(v[:i]) + list(v[i + 1 :]))
+            if 0 < len(c) < n: yield type(v)(c)
+        if n > 1:
+            for i in range(n):
+                yield type(v)(list(v[:i]) + list(v[i + 1 :]))
         for i, e in enumerate(v):
             for se in _shrink_value(e):
                 yield type(v)(list(v[:i]) + [se] + list(v[i + 1 :]))

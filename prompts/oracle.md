@@ -27,6 +27,8 @@ Also define `gen(seed: int, mode: str)` using only `random.Random(seed)` for ran
 
 * `mode == "small"`: sizes at most 6, values at most 20. Include boundary shapes — the empty case where the statement allows one, a single element, repeated or tied values, and first, last and adjacent positions.
 * `mode == "medium"`: sizes at most 12, but push any count, repetition, capacity, demand or multiplier that the statement bounds by a huge number up to roughly 10^4–10^5, so closed-form arithmetic gets exercised while your literal loops still finish in seconds.
+* Both modes: **at least half of the inputs you return must stay valid all the way to the end and drive every bounded quantity the statement names — a depth, a count of live items, a repetition, a capacity, a length — to its bound at least once.** An input that keeps the structure small, or that goes invalid before the deep state is reached, tests nothing: a solution that is wrong about a whole clause of the statement then disagrees on one input in a hundred and reads as a boundary bug. If reaching the bound needs a specific order of operations, build that order deliberately instead of sampling and hoping. The one mode of the statement you think is most likely to be implemented wrongly must appear within the first few seeds, not somewhere in the tail.
+* `medium` must include at least one input where the largest bounded quantity is at the maximum that mode allows.
 
 ## Generate only inputs the statement calls valid
 

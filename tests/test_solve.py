@@ -860,3 +860,11 @@ def test_oracle_prompt_defines_validate_as_the_reference_not_raising(tmp_path):
     assert "raise ValueError" in rendered
     assert "def validate(*args):" in rendered and "except ValueError:" in rendered
     assert "is a bug in your reference, not an invalid input" in rendered
+
+def test_generator_prompts_require_reaching_the_bound(tmp_path):
+    # G5: randomly built sequences go invalid before the deep state is reached, so a candidate wrong
+    # about a whole clause shows a 1% mismatch. Both generators must be told to reach the bound.
+    pv = S.prompt_vars(prob(tmp_path))
+    oracle, stress = S.render("oracle", **pv), S.render("stress", **pv)
+    assert "to its bound at least once" in oracle and "to its bound at least once" in stress
+    assert "at the maximum that mode allows" in oracle

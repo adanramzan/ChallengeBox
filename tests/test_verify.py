@@ -610,3 +610,21 @@ def test_a_reference_crashing_on_its_own_gen_inputs_counts_toward_the_reject_fra
     assert gi.cases_small and not V.oracle_unusable(gi)   # seed 0 survives: not the "no usable case" trigger
     assert gi.validate_reject_frac > 0.5                  # a KeyError is a broken reference, not an invalid input
     assert any("crashed on" in n for n in gi.notes)
+
+
+# --- round 13: the shrinker must not empty a list that started non-empty ---
+
+def test_shrink_keeps_a_non_empty_witness_for_a_list_dimension(tmp_path):
+    # round-10 L6: the failure reproduces even with edits=[], and the shrinker used to hand the repair
+    # model exactly that -- which then deleted the edit handling. A one-element witness is required.
+    p = Problem("p", "python", "s", "f", [], 300.0)
+    oracle = "def reference(xs, edits):\n    return len(xs) + len(edits)\ndef gen(seed, mode):\n    return ([1], [1])\n"
+    bug = "def f(xs, edits):\n    return len(xs)\n"   # wrong for every input, including edits == []
+    out = V.shrink(p, bug, oracle, V.Case(([1, 2, 3], [4, 5, 6]), 6, "small"), workdir=str(tmp_path), budget_s=5.0)
+    assert out.input[1] != [] and out.input[0] != []
+    assert len(out.input[1]) < 3   # still shrunk, just never to empty
+
+def test_shrink_value_never_yields_an_empty_sequence():
+    assert all(len(c) > 0 for c in V._shrink_value([1, 2, 3, 4]) if isinstance(c, list))
+    assert all(c != [] for c in V._shrink_value([7]))   # a one-element list shrinks its element, never to []
+    assert all(len(c) > 0 for c in V._shrink_value((1, 2)) if isinstance(c, tuple))
