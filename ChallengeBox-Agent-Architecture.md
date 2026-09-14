@@ -283,6 +283,24 @@ If both generators fail and at least one `medium`-tier case exists, the stress i
 
 The same `detail.degraded` marker covers thin coverage. A `diff_small` or `diff_medium` step that passed on fewer cases than `[limits] min_cases_small` / `min_cases_medium` (config.toml; defaults 30 and 5 against the 200/20 targets) is marked degraded by `run_gate`: agreement on a handful of inputs means the oracle's `gen()` mostly crashed or its `validate()` rejected most of what it produced, and one run was observed shipping as a full pass on 48 small and 4 medium cases. An empty tier is `skipped`, not degraded. In the finalizer, any evidence carrying `detail.degraded` counts exactly like a skipped step: the status becomes `emitted_unverified` rather than `passed_all_gates`, and `benchmark.md` shows the cell as `degraded`. The gate order and the repair loop are unaffected — degraded evidence still *passed*; it is only weaker than the name of the step claims. A third source of `detail.degraded` is an oracle regeneration that disagrees with the oracle it replaced (§5.7): that marks every `diff_*` step of the run.
 
+The same marker covers thin *discrimination*, which the case count hides completely. A tier of at least 20 cases
+in which one expected value (compared by `repr`) covers 90% or more of them is marked `weak` by `verify.make_cases`
+(`small tier weak: 195 of 200 expected values are identical`), recorded in `gate_inputs.weak_tiers`, and degrades
+its `diff_*` step. On bench18 the small tier's 200 answers were 195 × `1` and 5 × `2` — every case asserting only
+"operation 1 is invalid", because the oracle's `gen()` invented identifiers instead of reading them out of the
+state it had just built — and the gate reported `diff_small passed=True cases=200`, the same headline a genuinely
+discriminating 200-case tier gets. The pre-existing "validate rejected everything AND reference gave one answer"
+signal is the stronger form of the same defect and still empties the tier outright; this one degrades rather than
+deletes. It is generic over every problem with non-trivial preconditions, where a naive generator lands on
+"invalid" / "no solution" / "empty output" almost every time.
+
+A **weak small tier is also a regeneration trigger** — the fourth on the one-shot self-repair path of §5.3.1, with
+the same budget and cost rules as the others. The extra context names the value almost every input produced and
+gives the rule that fixes it: every identifier, name, key, index or position an operation refers to must be drawn
+from what the generator itself created earlier in that same input. If the replacement's tier is still weak, the run
+keeps whichever of the two has the lower share of identical answers and stays degraded either way. `prompts/oracle.md`
+carries the same rule for the first attempt.
+
 A fourth source is a stress run that finished faster than any real work could. The timing gate times the candidate but never checked that the candidate actually *consumed* the input: on bench14 `gen_max`'s first operation named an identifier its own input never created, so the candidate discarded a 476 KB input at operation 1 and the gate recorded a pass for a solution needing ~10^11 s at the stated limits. A *passing* `stress` whose measured duration is below `[limits] stress_min_plausible_s` (default 0.01 s) now records `detail.suspicious` (`finished in <d> s on a <n>-byte input; the input may not exercise the candidate`), carries it as `detail.degraded` and is recorded as `skipped` — never as a pass. It is generic over every early-exit shape (first-invalid-index answers, validators, short-circuiting searches) and costs no tokens; its one known false positive is a genuinely O(1) closed-form answer, which loses "pass" for "degraded" and nothing else.
 
 For this to mean anything, `duration_s` had to become the candidate's own time. The Python harness started its clock before `ast.literal_eval` and `copy.deepcopy` of the arguments, which cost ~0.10 s on a 50 000-element input and are identical for every candidate — so a candidate doing no work at all and one doing all of it read as 0.103 s and 0.105 s, and `duration_s` measured input size rather than work. The clock now starts immediately before the call. The judge hands the function real objects, so that setup was never part of what is being timed.

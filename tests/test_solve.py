@@ -1367,3 +1367,45 @@ def test_config_ships_a_gate_reserve_for_the_solve_call():
     assert 0 < reserve < cfg_toml["limits"]["safety_margin_s"] * 10
     # the role cap must sit above the measured solve latency, not below it
     assert cfg_toml["profiles"]["openrouter"]["strong"]["timeout_cap_s"] == 240.0
+
+
+# --- round 14 batch 7: a small tier whose answers barely vary regenerates the oracle ---
+
+def cfg_weak():
+    c = cfg(); c["limits"]["cases_small"] = 20; return c
+
+# reference() is correct, but its gen() puts 19 of 20 inputs on the same answer: 20 agreements that
+# assert one fact (bench18: 195 of 200 small answers were "operation 1 is invalid").
+ORACLE_WEAK_TIER = ("===ORACLE===\ndef reference(a, b):\n    return a + b\n"
+                    "def gen(seed, mode):\n    return (0, 0) if seed < 19 else (1, 0)\n===END===\n")
+
+def test_a_weak_small_tier_degrades_the_evidence_and_regenerates_the_oracle_once(tmp_path):
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_WEAK_TIER, ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg_weak(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 1 and rep["oracle_regenerated"] == 0
+    assert len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 2
+    assert any("oracle.selfrepair triggered: small tier weak: 19 of 20" in e for e in rep["events"])
+    # the regeneration prompt says what varies and how, and never shows the candidate
+    oracle_prompts = [u for c, (r, s_, u) in zip(llm.calls, llm.prompts) if c["tag"] == "oracle"]
+    assert "answers VARY" in oracle_prompts[1] and "def add(" not in oracle_prompts[1]
+    # the replacement's tier is varied, so the evidence it produces is not degraded
+    ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
+    assert ev["diff_small"]["passed"] and not (ev["diff_small"]["detail"].get("degraded") or "")
+    assert rep["gate_inputs"]["weak_tiers"] == {}
+
+def test_a_regenerated_tier_that_is_still_weak_stays_degraded_and_is_not_regenerated_again(tmp_path):
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_WEAK_TIER, ORACLE_WEAK_TIER], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg_weak(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 1
+    assert len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 2   # one regeneration, never two
+    assert sum("oracle.selfrepair triggered" in e for e in rep["events"]) == 1
+    assert any("regenerated small tier is no more varied" in e for e in rep["events"])
+    ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
+    assert ev["diff_small"]["passed"] and "weak" in ev["diff_small"]["detail"]["degraded"]
+    assert rep["status"] != "passed_all_gates"
+
+def test_a_varied_tier_triggers_no_weak_regeneration(tmp_path):
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg_weak(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 0 and rep["gate_inputs"]["weak_tiers"] == {}
+    assert rep["status"] == "passed_all_gates"

@@ -926,3 +926,37 @@ def test_without_a_skeleton_respelling_is_exactly_what_it_was(tmp_path):
     assert gi.input_skeleton is None
     assert not any("oracle.edge respelled" in l for l in lines)
     assert V._respellings(PYT, [[1, 2], [3]], None) == [((1, 2), (3,))]
+
+
+# --- round 14 batch 7: a tier whose answers barely vary is weak evidence ---
+
+# reference() answers 1 for every input but one: 200 cases, 199 of them asserting the same fact.
+ORACLE_CONSTANTISH = "def reference(a, b):\n    return 0 if a == 7 else 1\ndef gen(seed, mode):\n    return (seed, 0)\n"
+CONSTANTISH = "def add(a, b):\n    return 0 if a == 7 else 1\n"
+WEAK_LIMITS = {"cases_small": 200, "cases_medium": 2, "mem_mb": 2048, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0}
+
+def test_a_tier_whose_answers_barely_vary_is_weak_and_degrades_its_gate_step(tmp_path):
+    lines = []
+    gi = V.prepare_oracle_tiers(PY, ORACLE_CONSTANTISH, WEAK_LIMITS, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lines.append)
+    assert len(gi.cases_small) == 200
+    w = gi.weak_tiers["small"]
+    assert w["count"] == 199 and w["total"] == 200 and w["share"] == 199 / 200 and w["value"] == "1"
+    assert w["note"] == "small tier weak: 199 of 200 expected values are identical"
+    assert any("weak" in n for n in gi.notes)
+    # the candidate agrees on all 200 -- and that agreement is still not evidence
+    ev = {e.kind: e for e in V.run_gate(PY, CONSTANTISH, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=WEAK_LIMITS, log=lambda m: None)}
+    assert ev["diff_small"].passed and ev["diff_small"].cases == 200
+    assert ev["diff_small"].detail["degraded"] == w["note"]
+    assert "weak" not in (ev["diff_medium"].detail.get("degraded") or "")   # 2 cases: below the floor, never judged
+
+def test_a_tier_whose_answers_vary_is_not_weak(tmp_path):
+    varied = "def reference(a, b):\n    return a + b\ndef gen(seed, mode):\n    return (seed, 0)\n"
+    gi = V.prepare_oracle_tiers(PY, varied, WEAK_LIMITS, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None)
+    assert len(gi.cases_small) == 200 and gi.weak_tiers == {}
+    ev = {e.kind: e for e in V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=WEAK_LIMITS, log=lambda m: None)}
+    assert ev["diff_small"].passed and not ev["diff_small"].detail.get("degraded")
+
+def test_the_weak_tier_regeneration_prompt_names_the_value_and_the_rule():
+    gi = V.GateInputs(weak_tiers={"small": {"share": 0.95, "count": 190, "total": 200, "value": "1", "note": "n"}})
+    x = V.weak_tier_extra(gi)
+    assert "190 of 200" in x and "returned 1" in x and "drawn from what the generator itself created" in x

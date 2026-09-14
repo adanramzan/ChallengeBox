@@ -57,6 +57,7 @@ class GateInputs:
     input_skeleton: object = None   # the container shape the oracle's own gen() produces, per argument (see input_skeleton)
     validate_reject_frac: float = 0.0   # rejected/checked over small+medium: how far the oracle's validate() and gen() disagree
     validate_rejects: dict = field(default_factory=dict)   # tier -> (checked, rejected, up to two rejected inputs), for the self-repair prompt
+    weak_tiers: dict = field(default_factory=dict)   # tier -> {share, count, total, value, note}: its answers barely vary, so its agreement is weak evidence
     diff_degraded: str = ""   # why every diff_* evidence against this oracle is weaker than it looks (set by regenerate_oracle)
     example_checks: dict = field(default_factory=dict)   # this oracle's reference() vs the SOLVE authors' hand-traced examples
     oracle_src: str = ""
@@ -70,6 +71,7 @@ class GateInputs:
                 "public": len(self.cases_public), "stress": self.stress_input is not None,
                 "stress_source": self.stress_source, "stress_degraded": self.stress_degraded,
                 "stress_validity": self.stress_validity, "input_skeleton": self.input_skeleton,
+                "weak_tiers": self.weak_tiers,
                 "notes": self.notes, "example_checks": self.example_checks}
 
 @dataclass
@@ -79,6 +81,12 @@ class Case:
     tag: str = ""
 
 MAX_EXAMPLES = 8
+
+# When a differential tier stops being evidence: at least this many cases, of which at least this
+# share share one expected value. Not config knobs -- they describe what "the answers do not vary"
+# means, not a budget. 20 is the floor below which a run of identical answers is ordinary luck.
+WEAK_TIER_MIN_CASES = 20
+WEAK_TIER_SHARE = 0.9
 
 # A hand-traced example that sits "at a stated numeric limit" is naturally spelled 10**18, which is
 # an ast.BinOp and not a literal: ast.literal_eval raises on it and the line was silently dropped.
@@ -227,6 +235,19 @@ def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str
         detail["unusable"] = (f"{tag}: validate rejected every input and reference gave one answer for all "
                               "-- oracle cannot parse this format")
         cases = []
+    # A tier whose answers barely vary counts cases, not coverage. On bench18 the small tier's 200
+    # expected values were 195 x "1" and 5 x "2" -- every case asserting only "operation 1 is
+    # invalid", because gen() invented identifiers instead of reading them out of the state it had
+    # just built -- and the gate reported `diff_small passed=True cases=200`, the same headline a
+    # genuinely discriminating 200-case tier gets. The signal above catches only the stronger form
+    # (validate ALSO rejected everything, so the tier is emptied); this one is the general case and
+    # it degrades rather than deletes. Generic over every problem with non-trivial preconditions,
+    # where a naive generator lands on "invalid" / "no solution" / "empty output" almost every time.
+    if len(cases) >= WEAK_TIER_MIN_CASES:
+        value, n = collections.Counter(repr(c.expected) for c in cases).most_common(1)[0]
+        if n / len(cases) >= WEAK_TIER_SHARE:
+            detail["weak"] = f"{tag} tier weak: {n} of {len(cases)} expected values are identical"
+            detail["weak_detail"] = {"share": n / len(cases), "count": n, "total": len(cases), "value": value}
     return cases, Evidence(f"oracle_{tag}", bool(cases), len(cases), time.monotonic() - t0, detail)
 
 def run_candidate(problem, source: str, inputs: list, *, workdir: str, timeout_s: float, binary: str | None = None, overflow_checks: bool = True, mem_mb: int = 4096, per_case_s: float = 0.0, deadline_s: float | None = None, max_consec_timeouts: int = 0) -> list[CaseResult]:
@@ -361,6 +382,9 @@ def _log_and_note_validation(gi: GateInputs, ev: Evidence, mode: str, log) -> No
         gi.notes.append(f"{mode}: dropped {invalid} of {ev.detail.get('checked', 0)} generated inputs as invalid (failed validate())")
     if ev.detail.get("unusable"):
         gi.notes.append(ev.detail["unusable"])
+    if ev.detail.get("weak"):
+        gi.weak_tiers[mode] = {**ev.detail["weak_detail"], "note": ev.detail["weak"]}
+        gi.notes.append(ev.detail["weak"])
 
 def _clean_stdin(problem, s):
     # Model-written Rust stdin fixtures (EDGES entries, gen_max's output) are Python triple-quoted
@@ -649,6 +673,21 @@ def selfrepair_extra(gi: GateInputs) -> str:
             "are the actual errors your code produced when executed on real inputs. Fix these specific "
             "problems (undefined names, unpacking errors, exceptions) and follow the statement "
             f"literally:\n{notes}\n")
+
+def weak_tier_extra(gi: GateInputs) -> str:
+    """Extra context for regenerate_oracle when the oracle is being reissued because its own gen()
+    produced a tier whose answers barely vary (see make_cases). Never any candidate material: the
+    oracle is generated in its own context and never sees the candidate."""
+    w = gi.weak_tiers.get("small") or {}
+    return ("\n\nThe inputs your previous gen() produced almost all have the SAME answer: "
+            f"{w.get('count', 0)} of {w.get('total', 0)} of them returned {w.get('value', '')}. "
+            "A tier of identical answers proves nothing -- every comparison it produces asserts one "
+            "and the same fact, and a solution that is wrong about a whole clause of the statement "
+            "passes all of it. Generate inputs whose answers VARY: every identifier, name, key, index "
+            "or position an operation refers to must be drawn from what the generator itself created "
+            "earlier in that same input, so that most operations are valid, the deep state the "
+            "statement describes is actually reached, and the interesting answers occur. Keep "
+            "reference() exactly as literal as before.\n")
 
 def _examples_paragraph(gi: GateInputs) -> str:
     """The hand-traced examples this oracle's reference() contradicts, as inputs and expected values
@@ -1139,6 +1178,10 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         m = 0 if e.skipped else limits.get(f"min_cases_{kind[5:]}", 0)
         if e.passed and e.cases < m:
             e.detail["degraded"] = f"only {e.cases} {kind[5:]} cases (min {m})"
+        # ... and a tier whose expected values barely vary is thin evidence for the same reason a
+        # tiny one is: agreement on 200 cases that all assert the same fact is agreement on one fact.
+        if gi.weak_tiers.get(kind[5:]):
+            e.detail["degraded"] = gi.weak_tiers[kind[5:]]["note"]
         if gi.diff_degraded:
             e.detail["degraded"] = gi.diff_degraded
         ev.append(e); log(_gate_line(e, f"cases={e.cases}"))

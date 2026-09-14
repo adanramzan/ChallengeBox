@@ -407,6 +407,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             return
         selfrepair_why = ""
         disputed = False
+        weak = False
         if V.oracle_unusable(gi):
             selfrepair_why = "no usable case in any tier"
         elif gi.validate_reject_frac >= cfg["limits"]["validate_reject_frac_regen"]:
@@ -416,11 +417,20 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             disputed = True
             selfrepair_why = f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {V.examples_nonrejected(ec)}"
             run.log(f"oracle.disputed {selfrepair_why}")
+        # Fourth trigger, same one-shot path: the oracle ran and its small tier agreed on 200 cases, but
+        # almost every one of them has the same expected answer, because gen() never reaches the state the
+        # statement is about (bench18: 195 of 200 small answers were "1", "operation 1 is invalid"). The
+        # tier is degraded either way (run_gate); regenerating is the only way to get real coverage back,
+        # and the extra tells the model exactly what varies and how to make it vary.
+        elif gi.weak_tiers.get("small"):
+            weak = True
+            selfrepair_why = gi.weak_tiers["small"]["note"]
         if selfrepair_why and run.budget.can_afford(cfg["limits"]["oracle_selfrepair_afford_s"]) and not run.over_cost():
             run.log(f"oracle.selfrepair triggered: {selfrepair_why}; notes={'; '.join(gi.notes)[:300]}")
             prev = gi
             selfrepaired = True
-            extra = V.examples_dispute_extra(gi) if disputed else V.selfrepair_extra(gi)
+            extra = (V.examples_dispute_extra(gi) if disputed else
+                     V.weak_tier_extra(gi) if weak else V.selfrepair_extra(gi))
             try:
                 gi = V.regenerate_oracle(run, gi, extra, pv, counter="oracle_selfrepairs", workdir_tag="oracle_selfrepair")
             except Exception as e:
@@ -431,6 +441,18 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
                 ec = gi.example_checks
                 gi.diff_degraded = f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {V.examples_nonrejected(ec)}"
                 run.log(f"oracle.disputed after regeneration: {gi.diff_degraded}")
+            # Coming from the weak-tier trigger there is a working oracle to lose too: keep whichever of
+            # the two has the LOWER share of identical answers. Either way the tier stays degraded -- a
+            # regeneration that is still weak has not restored the evidence, only maybe improved it.
+            if weak and gi is not prev and not gi.regen_failed:
+                new_share = (gi.weak_tiers.get("small") or {}).get("share")
+                old_share = (prev.weak_tiers.get("small") or {}).get("share", 1.0)
+                if V.oracle_unusable(gi) or (new_share is not None and new_share >= old_share):
+                    run.log(f"oracle.selfrepair kept the original oracle: regenerated small tier is no more varied "
+                            f"({new_share if new_share is not None else 'unusable'} vs {old_share})")
+                    prev.notes.append("oracle self-repair discarded: the regenerated oracle's small tier is no more varied than the original's")
+                    prev.oracle_selfrepairs = gi.oracle_selfrepairs
+                    gi = prev
             # Coming from the rejection trigger there was a working-but-inconsistent oracle to lose: keep it
             # unless the replacement is actually better. (The crash trigger has nothing to fall back to.)
             if prev.validate_reject_frac and gi is not prev and not gi.regen_failed \
