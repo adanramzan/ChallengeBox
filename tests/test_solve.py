@@ -35,6 +35,21 @@ def test_single_shot_emits_solution_and_report(tmp_path):
     on_disk = json.loads((run_dir / "report.json").read_text())
     assert any("emit candidate=c1" in line for line in on_disk["events"])
 
+def test_raw_prompts_and_replies_are_kept_in_the_run_dir(tmp_path, monkeypatch):
+    # bench19 dropped two example lines and nothing could say which: only the parsed ===CODE=== block
+    # survives a run. Both sides of every call are now on disk, and no API key can reach them.
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-not-a-real-key-0123456789")
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    run_dir = tmp_path / "run"
+    S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "solution.py"), run_dir=str(run_dir))
+    d = run_dir / "replies"
+    assert {p.name for p in d.iterdir()} == {"solve-1.txt", "solve-1.prompt.txt", "oracle-1.txt",
+                                             "oracle-1.prompt.txt", "stress-1.txt", "stress-1.prompt.txt"}
+    assert (d / "solve-1.txt").read_text() == SOLVE_OK
+    assert (d / "oracle-1.txt").read_text() == ORACLE_OK
+    assert "===EXAMPLES===" in (d / "solve-1.prompt.txt").read_text()   # the prompt, not the reply
+    assert not any("not-a-real-key" in p.read_text() for p in d.iterdir())
+
 def test_solver_timeout_is_reported_as_inconclusive(tmp_path):
     llm = FakeLLM({"solve": ["", ""], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
     llm.script["solve"] = ["", ""]

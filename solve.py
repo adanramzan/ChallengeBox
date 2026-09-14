@@ -129,6 +129,7 @@ class Run:
         self.salvaged_partial = False
         self._log_lock = threading.Lock()
         self._cost_logged = False
+        self._reply_seq: dict[str, int] = {}
         os.makedirs(os.path.join(run_dir, "candidates"), exist_ok=True)
 
     def log(self, msg: str):
@@ -161,6 +162,25 @@ class Run:
         self.log(f"candidate.added id={c.id} parent={parent}")
         return c
 
+    def save_reply(self, tag: str, prompt: str, r) -> None:
+        """Both sides of every model call, verbatim, as <run_dir>/replies/<tag>-<n>.prompt.txt and
+        <tag>-<n>.txt (n counts that tag's calls in this run).
+
+        Only the PARSED product of a reply survives a run today -- candidates/c1.py is the ===CODE===
+        block and nothing else -- so anything the parser dropped is gone. Two adjudications could not
+        say which example lines bench19's SOLVE reply actually carried, because the drop is logged as
+        a count (`parsed=3 dropped=2`) and the text no longer existed anywhere; the fix for that drop
+        had to be inferred rather than read. Salvaged partial replies are written too: those are
+        precisely the ones whose parse is most in doubt. No secret can reach these files -- the API
+        key is a request header in llm.chat, never part of a rendered prompt or of a completion."""
+        with self._log_lock:
+            n = self._reply_seq[tag] = self._reply_seq.get(tag, 0) + 1
+        d = os.path.join(self.dir, "replies")
+        os.makedirs(d, exist_ok=True)
+        text = r.text or (f"(no reply: {r.error})" if r.error else "")
+        for name, body in ((f"{tag}-{n}.prompt.txt", prompt), (f"{tag}-{n}.txt", text)):
+            with open(os.path.join(d, name), "w", encoding="utf-8") as f: f.write(body)
+
     def role(self, prompt_name: str) -> str:
         """Which model role a prompt is sent to. Pure config: config.toml's [roles] table, with
         PROMPT_ROLES as the mapping a config that does not carry the table gets."""
@@ -174,7 +194,9 @@ class Run:
         tag = tag or prompt_name
         timeout = self.budget.step_timeout(min(cap_s, self.llm.roles[role].timeout_cap_s if hasattr(self.llm, "roles") else cap_s), reserve_s=10.0)
         self.log(f"{tag}.sent role={role} timeout={timeout:.0f}")
-        r = self.llm.chat(role, "You are a precise competitive-programming engineer.", render(prompt_name, **vars), timeout_s=timeout, tag=tag)
+        prompt = render(prompt_name, **vars)
+        r = self.llm.chat(role, "You are a precise competitive-programming engineer.", prompt, timeout_s=timeout, tag=tag)
+        self.save_reply(tag, prompt, r)
         self.log(f"{tag}.done error={r.error} latency={r.latency_s:.1f} usage={r.usage}")
         if getattr(r, "cost_lookup", None):
             self.log(f"cost.lookup id={r.cost_lookup['id']} cost={r.cost_lookup.get('cost')}")

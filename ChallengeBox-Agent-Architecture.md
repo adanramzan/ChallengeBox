@@ -593,6 +593,8 @@ Exit codes: 0 solution emitted and passed all gates; 1 solution emitted but with
 
 `runs/<problem_id>/report.json` contains: the normalized problem, every candidate source with its parent, every model call's role, model, latency, and token usage, every gate step's evidence, the shrunk counterexamples, the regression cases, the phase timeline, and the final status. No API keys or environment contents are persisted.
 
+`runs/<problem_id>/replies/` holds both sides of every model call verbatim — `<tag>-<n>.prompt.txt` and `<tag>-<n>.txt`, `n` counting that tag's calls — salvaged partial replies included. Everything else in a run directory is the *parsed* product of a reply (`candidates/c1.py` is the `===CODE===` block and nothing else), so whatever a parser dropped used to be unrecoverable: bench19 logged `parsed=3 dropped=2` example lines and two adjudications could only infer which two and why. The API key is a request header in `llm.chat` and is never part of a rendered prompt or a completion, so nothing secret reaches these files.
+
 A run also emits a one-line-per-event log:
 
 ```text
