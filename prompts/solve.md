@@ -18,6 +18,16 @@ write the new one -- do not narrate the change. A block that trails off mid-stat
 `for`/`while`/`if` with its body replaced by comments, is a syntax error and scores zero however
 good the reasoning around it was. Put all deliberation in ===RULES=== and ===TRAPS===.
 ===END===
+===EXAMPLES===
+Three to five lines and nothing else — no comments, no prose, no blank lines with text in them.
+Each line is one Python literal 2-tuple `(args, expected)`. `args` is {{gen_returns}}, exactly as the
+entrypoint will be called with it; `expected` is exactly what must come back — the return value for a
+Python function, the complete stdout text for a Rust program.
+Hand-trace every one of them from the statement. Never obtain them by running the code above.
+Include at least these three: the smallest legal input; one input sitting at a stated numeric limit
+whose answer is cheap to reason about; and the input you consider most likely to be misread — the
+deepest state the statement reaches, or the clause a naive reading gets wrong.
+===END===
 ===RULES===
 Numbered restatement of every behavioral sentence of the statement, quoting the text. List ambiguities separately with the reading you chose.
 ===END===

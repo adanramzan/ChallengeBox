@@ -40,10 +40,11 @@ def test_prepare_gate_inputs_and_run_gate(tmp_path):
     gi = V.prepare_gate_inputs(PY, ORACLE, stress, limits, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None)
     assert len(gi.cases_small) == 20 and len(gi.cases_medium) == 5 and len(gi.cases_edge) == 2 and gi.stress_input == (10**18, 10**18)
     ev = V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "g1"), budget=FakeBudget(), limits=limits, log=lambda m: None)
-    assert all(e.passed for e in ev) and [e.kind for e in ev][:4] == ["compile", "diff_edge", "diff_small", "diff_medium"]
+    assert all(e.passed for e in ev) and [e.kind for e in ev][:5] == ["compile", "diff_examples", "diff_edge", "diff_small", "diff_medium"]
     ev = V.run_gate(PY, BUG, gi, workdir=str(tmp_path / "g2"), budget=FakeBudget(), limits=limits, log=lambda m: None)
     assert ev[0].kind == "compile" and ev[0].passed
-    assert ev[1].kind == "diff_edge" and not ev[1].passed and ev[1].detail["input"] == (15, 0)
+    assert ev[1].kind == "diff_examples" and ev[1].skipped   # no candidate examples: skipped, never failed
+    assert ev[2].kind == "diff_edge" and not ev[2].passed and ev[2].detail["input"] == (15, 0)
 
 def test_thin_tier_passes_but_is_marked_degraded(tmp_path):
     limits = {"cases_small": 5, "cases_medium": 2, "min_cases_small": 30, "min_cases_medium": 5,
@@ -87,7 +88,7 @@ def test_run_gate_includes_behavior_and_stress(tmp_path):
     stress = "def gen_max(seed):\n    return (10**18, 10**18)\nEDGES = [(0, 0)]\n"
     gi = V.prepare_gate_inputs(PY, ORACLE, stress, limits, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None)
     ev = V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lambda m: None)
-    assert [e.kind for e in ev] == ["compile", "diff_edge", "diff_small", "diff_medium", "behavior", "stress", "overflow"] and all(e.passed for e in ev)
+    assert [e.kind for e in ev] == ["compile", "diff_examples", "diff_edge", "diff_small", "diff_medium", "behavior", "stress", "overflow"] and all(e.passed for e in ev)
     assert ev[-1].skipped and "arbitrary precision" in ev[-1].detail["skipped"]
 
 # --- fix round 1 ---
@@ -381,9 +382,9 @@ def test_public_examples_run_as_own_gate_step_before_generated_tiers_and_fail_a_
     ev = V.run_gate(p, WRONG_ON_PUBLIC, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lambda m: None)
     # diff_public is its own evidence kind and runs right after compile, before any generated tier --
     # the gate stops here, never reaching diff_small/diff_medium against the model-written oracle.
-    assert [e.kind for e in ev] == ["compile", "diff_public"]
-    assert not ev[1].passed
-    assert ev[1].detail["input"] == (2, 3) and ev[1].detail["expected"] == 5 and ev[1].detail["actual"] == 6
+    assert [e.kind for e in ev] == ["compile", "diff_examples", "diff_public"]
+    assert not ev[2].passed
+    assert ev[2].detail["input"] == (2, 3) and ev[2].detail["expected"] == 5 and ev[2].detail["actual"] == 6
 
 def test_public_example_disagreeing_with_oracle_reference_is_kept_and_recorded(tmp_path):
     p = Problem("p", "python", "s", "add", [{"input": [2, 3], "output": 5}], 300.0)
@@ -412,7 +413,7 @@ def test_no_public_examples_behaves_exactly_as_before(tmp_path):
     gi = V.prepare_gate_inputs(PY, ORACLE, stress, limits, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None)
     assert gi.cases_public == [] and gi.public_disagreements == []
     ev = V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lambda m: None)
-    assert [e.kind for e in ev] == ["compile", "diff_edge", "diff_small", "diff_medium", "behavior", "stress", "overflow"]
+    assert [e.kind for e in ev] == ["compile", "diff_examples", "diff_edge", "diff_small", "diff_medium", "behavior", "stress", "overflow"]
 
 
 def test_oracle_unusable_ignores_edge_cases(tmp_path):
@@ -507,3 +508,68 @@ def test_repairing_a_root_again_shows_the_failed_childs_diff():
     assert "a + b + 1" in note and "did NOT fix" in note
     # a root with no child at all is still a first attempt
     assert V._previous_attempt_note(type("R", (), {"cands": [root]})(), root, root.evidence[0]) == ""
+
+
+# --- round 13: the SOLVE author's hand-traced examples, checked against candidate and oracle ---
+
+def test_parse_examples_keeps_well_formed_pairs_and_drops_the_rest():
+    block = ("((0, 0), 0)\n"
+             "((1, 2), 3)\n"
+             "not a tuple at all\n"
+             "(1, 2, 3)\n"          # not a 2-tuple
+             "\n"
+             "(5, 5)\n")            # args 5 is not a tuple -> wrapped as (5,)
+    cases = V.parse_examples(PY, block)
+    assert [(c.input, c.expected) for c in cases] == [((0, 0), 0), ((1, 2), 3), ((5,), 5)]
+    assert V.example_line_count(block) - len(cases) == 2   # the two malformed lines
+    assert all(c.tag == "example" for c in cases)
+
+def test_parse_examples_caps_at_eight_and_takes_rust_stdin_strings():
+    many = "\n".join(f"(({i}, 0), {i})" for i in range(20))
+    assert len(V.parse_examples(PY, many)) == 8
+    rust = V.parse_examples(RUST, '("3\\n1 2 3\\n", "6")\n((1, 2), 3)\n')
+    assert [(c.input, c.expected) for c in rust] == [("3\n1 2 3\n", "6")]   # non-str args dropped for rust
+
+def test_diff_examples_fails_a_candidate_that_contradicts_its_own_trace(tmp_path):
+    limits = {"cases_small": 3, "cases_medium": 1, "mem_mb": 2048}
+    gi = V.prepare_gate_inputs(PY, ORACLE, "", limits, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None)
+    examples = [V.Case((15, 0), 15, "example")]   # BUG returns 16 here
+    ev = V.run_gate(PY, BUG, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lambda m: None, examples=examples)
+    assert [e.kind for e in ev] == ["compile", "diff_examples"]
+    assert not ev[1].passed and ev[1].detail["input"] == (15, 0) and ev[1].detail["actual"] == 16
+
+def test_rust_examples_run_as_stdin_and_stdout(tmp_path):
+    # Rust path: args is the whole stdin, expected the whole stdout, compared as token lists.
+    captured = {}
+    def fake_run_candidate(problem, source, inputs, *, workdir, timeout_s, binary=None, overflow_checks=True, mem_mb=4096, per_case_s=0.0, deadline_s=None, max_consec_timeouts=0):
+        captured["inputs"] = list(inputs)
+        return [V.CaseResult(True, output="6\n") for _ in inputs]
+    import verify
+    old = verify.run_candidate
+    verify.run_candidate = fake_run_candidate
+    try:
+        cases = V.parse_examples(RUST, '("3\\n1 2 3\\n", "6")\n')
+        ev = V.differential(RUST, "src", cases, "diff_examples", workdir=str(tmp_path), timeout_s=10.0, binary="bin")
+    finally:
+        verify.run_candidate = old
+    assert ev.passed and captured["inputs"] == ["3\n1 2 3\n"]
+
+def test_oracle_checked_against_every_candidates_examples(tmp_path):
+    limits = {"cases_small": 3, "cases_medium": 1, "mem_mb": 2048}
+    examples = {"c1": [V.Case((1, 2), 3, "example"), V.Case((5, 5), 10, "example")],
+                "c2": [V.Case((1, 2), 3, "example")]}   # deduped by repr(args)
+    wrong = "def reference(a, b):\n    return a + b + 100\ndef gen(seed, mode):\n    return (seed, seed)\n"
+    lines = []
+    gi = V.prepare_gate_inputs(PY, wrong, "", limits, workdir=str(tmp_path / "a"), budget=FakeBudget(), log=lines.append, examples=examples)
+    ec = gi.example_checks
+    assert ec["cases"] == 2 and len(ec["disagreements"]) == 2 and ec["errors"] == 0
+    assert sorted(ec["disagreements"][0]["authors"]) == ["c1", "c2"]
+    assert V.examples_disputed(gi)
+    assert any("oracle.examples cases=2 disagreements=2" in l for l in lines)
+    # the dispute context carries inputs and expected values, never candidate code
+    extra = V.examples_dispute_extra(gi)
+    assert "Hand-traced expected: 3" in extra and "Your reference returned: 103" in extra
+    # an oracle that agrees disputes nothing
+    ok = V.prepare_gate_inputs(PY, ORACLE, "", limits, workdir=str(tmp_path / "b"), budget=FakeBudget(), log=lambda m: None, examples=examples)
+    assert ok.example_checks["disagreements"] == [] and not V.examples_disputed(ok)
+    assert not V.examples_disputed(V.GateInputs())   # no examples at all: never disputed

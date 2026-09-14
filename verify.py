@@ -1,6 +1,6 @@
 """Verification: cases from the oracle, differential, behavior, stress, shrink, repair glue."""
 from __future__ import annotations
-import difflib, os, re, time
+import ast, difflib, os, re, time
 from dataclasses import dataclass, field
 from sandbox import CaseResult, run_python_cases, compile_rust, compile_rust_with_imports, run_rust_cases, tokens
 from llm import parse_blocks
@@ -37,6 +37,7 @@ class GateInputs:
     validate_reject_frac: float = 0.0   # rejected/checked over small+medium: how far the oracle's validate() and gen() disagree
     validate_rejects: dict = field(default_factory=dict)   # tier -> (checked, rejected, up to two rejected inputs), for the self-repair prompt
     diff_degraded: str = ""   # why every diff_* evidence against this oracle is weaker than it looks (set by regenerate_oracle)
+    example_checks: dict = field(default_factory=dict)   # this oracle's reference() vs the SOLVE authors' hand-traced examples
     oracle_src: str = ""
     oracle_regens: int = 0        # adjudication: repair blamed the oracle for a wrong answer
     oracle_selfrepairs: int = 0   # this module noticed its own oracle crashed and produced zero usable cases
@@ -45,13 +46,48 @@ class GateInputs:
     regen_failed: bool = False
     def summary(self) -> dict:
         return {"small": len(self.cases_small), "medium": len(self.cases_medium), "edge": len(self.cases_edge),
-                "public": len(self.cases_public), "stress": self.stress_input is not None, "notes": self.notes}
+                "public": len(self.cases_public), "stress": self.stress_input is not None, "notes": self.notes,
+                "example_checks": self.example_checks}
 
 @dataclass
 class Case:
     input: object
     expected: object
     tag: str = ""
+
+MAX_EXAMPLES = 8
+
+def parse_examples(problem, block_text: str) -> list[Case]:
+    """The ===EXAMPLES=== block of a SOLVE reply: input/expected pairs the solution's author
+    hand-traced from the statement. This is the only ground truth in the run besides the oracle that
+    was not produced by running code, and it is a SECOND reading of the statement -- so it checks the
+    candidate against its own author's trace, and the oracle against a reading it did not write.
+
+    One ast.literal_eval per non-blank line (never exec: this is model output). A line that does not
+    evaluate to a 2-tuple is dropped; the caller counts the drops by comparing against the line count.
+    Python args that are not a tuple are wrapped as a 1-tuple (a single-argument entrypoint); Rust args
+    must be the stdin text, so anything but a str is dropped."""
+    cases: list[Case] = []
+    for line in [l for l in block_text.splitlines() if l.strip()][:MAX_EXAMPLES]:
+        try:
+            v = ast.literal_eval(line.strip())
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            continue
+        if not isinstance(v, tuple) or len(v) != 2:
+            continue
+        args, expected = v
+        if problem.language == "python":
+            if not isinstance(args, tuple):
+                args = (args,)
+        elif not isinstance(args, str):
+            continue
+        cases.append(Case(args, expected, "example"))
+    return cases
+
+def example_line_count(block_text: str) -> int:
+    """How many lines parse_examples actually looked at -- so `dropped` counts malformed lines, not
+    the ones past the cap."""
+    return len([l for l in block_text.splitlines() if l.strip()][:MAX_EXAMPLES])
 
 def _ref_args(problem, inp) -> tuple:
     if problem.language != "python":
@@ -292,6 +328,54 @@ def _check_public_against_oracle(problem, gi: GateInputs, oracle_src: str, *, wo
                          f"input={_fmt(c.input, 200)} public_expected={_fmt(c.expected, 200)} oracle_returned={_fmt(oracle_output, 200)}")
         log(f"oracle.disagrees_with_public input={_fmt(c.input, 120)}")
 
+def _check_examples_against_oracle(problem, gi: GateInputs, oracle_src: str, examples: dict, limits: dict, *, workdir: str, budget, log) -> None:
+    """Run the oracle's validate() and reference() over every distinct input the SOLVE authors
+    hand-traced, and record where the reference disagrees with them. Neither side is ground truth --
+    both are readings of the same prose by a model -- so this never drops an example and never drops
+    a case; it only measures how far the two readings are apart, which is what decides whether the
+    oracle is disputed (see examples_disputed)."""
+    seen: dict[str, Case] = {}
+    authors: dict[str, list[str]] = {}
+    for cid, cases in (examples or {}).items():
+        for c in cases:
+            k = repr(c.input)
+            seen.setdefault(k, c)
+            authors.setdefault(k, []).append(cid)
+    cases = list(seen.values())
+    if not cases:
+        return
+    per_case = limits.get("per_case_limit_s", 0.0)
+    consec = limits.get("max_consecutive_case_timeouts", 0)
+    verdicts, _ = _validate_inputs(problem, oracle_src, [c.input for c in cases], workdir=os.path.join(workdir, "validate_examples"),
+                                   timeout_s=budget.step_timeout(30.0, reserve_s=20.0), per_case_s=per_case, max_consec_timeouts=consec)
+    res = run_python_cases(oracle_src, "reference", [_ref_args(problem, c.input) for c in cases], workdir=os.path.join(workdir, "ref_examples"),
+                           timeout_s=budget.step_timeout(30.0, reserve_s=20.0), per_case_s=per_case, max_consec_timeouts=consec)
+    disagreements, errors = [], 0
+    for i, c in enumerate(cases):
+        who = authors[repr(c.input)]
+        if verdicts is not None and verdicts[i] is False:
+            # An input a human-readable statement plainly allows, rejected by the oracle's own
+            # precondition check, is the same disagreement in a different place.
+            disagreements.append({"input": c.input, "expected": c.expected, "reference": "validate() rejected this input", "authors": who})
+            continue
+        r = res[i]
+        if not r.ok:
+            errors += 1
+            continue
+        if same(problem, r, c.expected):
+            continue
+        disagreements.append({"input": c.input, "expected": c.expected, "reference": r.output, "authors": who})
+    gi.example_checks = {"cases": len(cases), "disagreements": disagreements, "errors": errors}
+    log(f"oracle.examples cases={len(cases)} disagreements={len(disagreements)} errors={errors}")
+
+def examples_disputed(gi: GateInputs) -> bool:
+    """The oracle contradicts at least half of the hand-traced examples. Two independent readings of
+    the statement that far apart cannot both be right, and the oracle is the one this system can
+    rewrite -- so this is a regeneration trigger, not a candidate failure."""
+    ec = gi.example_checks or {}
+    n = ec.get("cases", 0)
+    return n >= 2 and 2 * len(ec.get("disagreements") or []) >= n
+
 def oracle_unusable(gi: GateInputs) -> bool:
     """True when the oracle's own gen()/reference() produced nothing across BOTH generated tiers,
     so there is no real differential coverage (its code crashed, or it produced no ===ORACLE===
@@ -329,6 +413,26 @@ def selfrepair_extra(gi: GateInputs) -> str:
             "problems (undefined names, unpacking errors, exceptions) and follow the statement "
             f"literally:\n{notes}\n")
 
+def _examples_paragraph(gi: GateInputs) -> str:
+    """The hand-traced examples this oracle's reference() contradicts, as inputs and expected values
+    only. Never any candidate code: the oracle is generated in its own context and never sees it."""
+    ec = gi.example_checks or {}
+    bad = ec.get("disagreements") or []
+    if not bad:
+        return ""
+    shown = "\n".join(f"- Input: {_fmt(d['input'], 800)}\n  Hand-traced expected: {_fmt(d['expected'], 800)}\n"
+                      f"  Your reference returned: {_fmt(d['reference'], 800)}" for d in bad[:3])
+    return (f"\n\nAn independent reader hand-traced {ec.get('cases', 0)} inputs from this statement. Your "
+            f"reference disagrees with {len(bad)} of them. The first three:\n{shown}\n"
+            "Re-derive each of these from the statement's own words before writing the new reference.\n")
+
+def examples_dispute_extra(gi: GateInputs) -> str:
+    """Extra context for regenerate_oracle when the oracle is being reissued because it contradicts
+    most of the hand-traced examples (examples_disputed). Inputs and expected values only."""
+    return _examples_paragraph(gi) or (
+        "\n\nYour reference disagreed with inputs hand-traced from this statement. Re-derive the "
+        "expected output from the statement alone, sentence by sentence, before writing the new reference.\n")
+
 def dispute_extra(gi: GateInputs, failed: Evidence) -> str:
     """Extra context for regenerate_oracle when a repair call adjudicated candidate vs. oracle and
     blamed the oracle for a wrong answer on a specific input.
@@ -341,9 +445,10 @@ def dispute_extra(gi: GateInputs, failed: Evidence) -> str:
     return ("\n\nA previous reference produced this output on this input:\n"
             f"Input: {_fmt(failed.detail.get('input'))}\nPrevious reference output: {_fmt(failed.detail.get('expected'))}\n"
             "An independent review believes the reference's output on this input does not follow the statement. "
-            "Re-derive the expected output from the statement alone, sentence by sentence, before writing the new reference.\n")
+            "Re-derive the expected output from the statement alone, sentence by sentence, before writing the new reference.\n"
+            + _examples_paragraph(gi))
 
-def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict, *, workdir: str, budget, log) -> GateInputs:
+def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict, *, workdir: str, budget, log, examples: dict | None = None) -> GateInputs:
     gi = GateInputs(oracle_src=oracle_src)
     gi.cases_public, parse_notes = _parse_public_examples(problem)
     gi.notes.extend(parse_notes)
@@ -355,6 +460,7 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
     gi.oracle_src = oracle_src
     if gi.cases_public:
         _check_public_against_oracle(problem, gi, oracle_src, workdir=workdir, budget=budget, log=log)
+    _check_examples_against_oracle(problem, gi, oracle_src, examples or {}, limits, workdir=workdir, budget=budget, log=log)
     for mode, n in (("small", limits["cases_small"]), ("medium", limits["cases_medium"])):
         # The medium tier is the most expensive evidence per second (literal loops over 10^4-10^5
         # multipliers) and the least decisive: small already catches most logic bugs. When the oracle
@@ -530,7 +636,7 @@ def _gate_line(e: Evidence, extra: str = "") -> str:
         return f"gate.{e.kind} skipped=True reason={e.detail.get('skipped', 'unspecified')}"
     return f"gate.{e.kind} passed={e.passed}" + (f" {extra}" if extra else "")
 
-def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limits: dict, log) -> list[Evidence]:
+def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limits: dict, log, examples: list | None = None) -> list[Evidence]:
     ev: list[Evidence] = []
     binary = None
     if problem.language == "rust":
@@ -548,6 +654,14 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         e = python_import_check(source, problem.entrypoint, gi, workdir=os.path.join(workdir, "compile"), timeout_s=budget.step_timeout(30.0, reserve_s=20.0), mem_mb=limits["mem_mb"])
         ev.append(e); log(_gate_line(e))
         if not e.passed: return ev
+    # The candidate against its own author's hand trace: no oracle involved, so it is the one
+    # differential step that cannot be poisoned by a wrong reference. Skipped when this candidate
+    # has no examples (an older candidate, a reply with no ===EXAMPLES=== block).
+    e = differential(problem, source, examples or [], "diff_examples", workdir=os.path.join(workdir, "diff_examples"),
+                     timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"],
+                     per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
+    ev.append(e); log(_gate_line(e, f"cases={e.cases}"))
+    if not e.passed: return ev
     # Public examples (ground truth from the problem itself, not the model-written oracle) run first,
     # before any generated tier -- a candidate that fails real ground truth fails fast on the most
     # trustworthy evidence available. Absent entirely (the common case), this step is not added at
@@ -642,7 +756,7 @@ def _agreement_note(run, cand, failed: Evidence, gi: GateInputs, detail: dict) -
     workdir so a Rust candidate is not recompiled."""
     if detail.get("cases") and failed.kind in ("diff_small", "diff_medium"):
         return f"disagrees with the reference on {detail.get('mismatches', 0)} of {detail['cases']} {failed.kind[5:]} inputs"
-    if failed.kind in ("diff_edge", "diff_public") and gi.cases_small:
+    if failed.kind in ("diff_edge", "diff_public", "diff_examples") and gi.cases_small:
         e = differential(run.p, cand.source, gi.cases_small, "agreement", workdir=os.path.join(run.dir, cand.id),
                          timeout_s=run.budget.step_timeout(30.0, reserve_s=20.0), mem_mb=run.cfg["limits"]["mem_mb"],
                          per_case_s=run.cfg["limits"].get("per_case_limit_s", 0.0))
@@ -654,7 +768,9 @@ def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, 
     problem = run.p
     previous_attempt = _previous_attempt_note(run, cand, failed)
     detail = dict(failed.detail)
-    if failed.kind.startswith("diff_") and "input" in detail:
+    # diff_examples is excluded: its expected value is the author's hand trace, and shrink re-derives
+    # the expectation from the ORACLE, which would silently swap one ground truth for the other.
+    if failed.kind.startswith("diff_") and failed.kind != "diff_examples" and "input" in detail:
         case = Case(detail["input"], detail["expected"], failed.kind)
         if problem.language == "python" and gi.oracle_src:
             case = shrink(problem, cand.source, gi.oracle_src, case, workdir=os.path.join(run.dir, cand.id, "shrink"),
@@ -675,7 +791,11 @@ def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, 
     # what goes wrong when a phase cap is hardcoded instead (raising the config knob then does
     # nothing because the hardcoded fraction still wins the min() in Run.chat/step_timeout).
     repair_cap = run.cfg["phases"]["repair_call_share"] * run.budget.usable_s
-    r = run.chat("strong", "repair", repair_cap, kind=failed.kind, input=_fmt_typed(detail.get("input")), expected=_fmt_typed(detail.get("expected")),
+    expected_source = ("from the solution author's own hand trace of the statement, which may itself be wrong"
+                       if failed.kind == "diff_examples" else
+                       "from an independent literal reference, which may itself be wrong")
+    r = run.chat("strong", "repair", repair_cap, kind=failed.kind, expected_source=expected_source,
+                 input=_fmt_typed(detail.get("input")), expected=_fmt_typed(detail.get("expected")),
                  actual=_fmt_typed(detail.get("actual")), details=_fmt({k: v for k, v in detail.items() if k not in ("input", "expected", "actual")}),
                  code=_fmt(cand.source), previous_attempt=previous_attempt, agreement=agreement,
                  reference=_fmt(gi.oracle_src, 8000) if gi.oracle_src.strip() else "(no reference available)", **pv_repair)
@@ -715,7 +835,8 @@ def regenerate_oracle(run, gi: GateInputs, extra: str, pv: dict, *, counter: str
         setattr(gi, counter, getattr(gi, counter) + 1)
         gi.regen_failed = True
         return gi
-    new = prepare_gate_inputs(run.p, src, "", run.cfg["limits"], workdir=os.path.join(run.dir, workdir_tag), budget=run.budget, log=run.log)
+    examples = {c.id: getattr(c, "examples", []) for c in run.cands if getattr(c, "examples", None)}
+    new = prepare_gate_inputs(run.p, src, "", run.cfg["limits"], workdir=os.path.join(run.dir, workdir_tag), budget=run.budget, log=run.log, examples=examples)
     new.stress_input, new.cases_edge, new.regressions = gi.stress_input, gi.cases_edge, []
     new.oracle_regens, new.oracle_selfrepairs = gi.oracle_regens, gi.oracle_selfrepairs
     setattr(new, counter, getattr(new, counter) + 1)
@@ -736,7 +857,16 @@ def regenerate_oracle(run, gi: GateInputs, extra: str, pv: dict, *, counter: str
         run.log(f"oracle.{label} disagreement={k}/{n}")
         new.notes.append(f"regenerated oracle disagrees with the one it replaces on {k}/{n} small inputs")
         if k / n > run.cfg["limits"].get("oracle_regen_max_disagreement", 0.5):
-            new.diff_degraded = (f"the oracle was regenerated and disagrees with the one it replaces on {k}/{n} small inputs; "
-                                 "neither reference can be trusted as ground truth")
+            # "Neither reference can be trusted" holds only while nothing outside the two can say
+            # which is right. Hand-traced examples can: if the old reference contradicted half of
+            # them and the new one contradicts none, the wholesale disagreement is the old one's
+            # error being corrected, not two references of unknown quality.
+            if examples_disputed(gi) and new.example_checks and not (new.example_checks.get("disagreements") or []):
+                run.log(f"oracle.{label} disagreement resolved by the hand-traced examples")
+                new.notes.append("the replacement agrees with every hand-traced example and the one it replaces did not, "
+                                 "so their disagreement is not evidence that both are untrustworthy")
+            else:
+                new.diff_degraded = (f"the oracle was regenerated and disagrees with the one it replaces on {k}/{n} small inputs; "
+                                     "neither reference can be trusted as ground truth")
     run.log(f"oracle.{label} small={len(new.cases_small)} medium={len(new.cases_medium)} edge={len(new.cases_edge)}")
     return new

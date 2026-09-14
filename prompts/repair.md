@@ -3,7 +3,7 @@ A solution failed a concrete check. Make the smallest change that fixes the demo
 Failure kind: {{kind}}
 Input:
 {{input}}
-Expected (from an independent literal reference, which may itself be wrong):
+Expected ({{expected_source}}):
 {{expected}}
 Actual:
 {{actual}}

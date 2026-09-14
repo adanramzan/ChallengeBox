@@ -50,6 +50,8 @@ class Candidate:
     source: str
     parent: str | None
     evidence: list = field(default_factory=list)
+    examples: list = field(default_factory=list)   # the author's hand-traced (input, expected) cases
+    examples_dropped: int = 0                      # lines of the ===EXAMPLES=== block that did not parse
 
     def passed_count(self) -> int:
         return sum(1 for e in self.evidence if e.passed and not e.skipped)
@@ -191,7 +193,8 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         r_solves = [f.result() for f in f_solves]
         r_oracle, r_stress = f_oracle.result(), f_stress.result()
     for i, r_solve in enumerate(r_solves):
-        code = parse_blocks(r_solve.text).get("CODE", "")
+        blocks = parse_blocks(r_solve.text)
+        code = blocks.get("CODE", "")
         if not code.strip() and r_solve.text.strip():
             code = r_solve.text.strip()   # no ===CODE=== block parsed at all: fall back to the raw reply so a file is still emitted
             run.log(f"solve.no_code_block attempt={i + 1} using raw reply text")
@@ -203,6 +206,12 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             run.log(f"solve.duplicate attempt={i + 1} identical to an earlier attempt, dropped")
             continue
         cand = run.add_candidate(code, None); cand.evidence.append(static_evidence(problem, code))
+        # The author's own hand trace of the statement: checked against this candidate (gate step
+        # diff_examples) and against the oracle (prepare_gate_inputs), which never saw it.
+        ex_block = blocks.get("EXAMPLES", "")
+        cand.examples = V.parse_examples(problem, ex_block)
+        cand.examples_dropped = max(0, V.example_line_count(ex_block) - len(cand.examples))
+        run.log(f"solve.examples id={cand.id} parsed={len(cand.examples)} dropped={cand.examples_dropped}")
     oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
     # The oracle is the single source of ground truth for every gate step, so a timeout here
     # (roughly half of them clip at a 60s median-tuned cap; see BENCHMARK-FINDINGS.md F4) costs
@@ -227,7 +236,8 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
     stress_src = parse_blocks(r_stress.text).get("STRESS", "")
     try:
-        gi = V.prepare_gate_inputs(problem, oracle_src, stress_src, cfg["limits"], workdir=os.path.join(run_dir, "oracle"), budget=run.budget, log=run.log)
+        gi = V.prepare_gate_inputs(problem, oracle_src, stress_src, cfg["limits"], workdir=os.path.join(run_dir, "oracle"), budget=run.budget, log=run.log,
+                                   examples={c.id: c.examples for c in run.cands if c.examples})
     except Exception as e:
         run.log(f"gate.crashed {type(e).__name__}: {e}")
         if run.cands:
@@ -246,18 +256,35 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     # two readings of the same preconditions and one of them is wrong, so the survivors are either too
     # few to be coverage or inputs one half of the oracle calls illegal -- either way, rewriting both
     # from one precondition list beats gating on them.
+    # Third trigger, same one-shot path: the oracle contradicts most of the inputs the SOLVE authors
+    # hand-traced from the statement. Two independent readings that far apart cannot both be right,
+    # and the oracle is the side this system can rewrite -- blaming the candidate here would spend a
+    # repair attempt making correct code agree with a wrong reference.
     selfrepair_why = ""
+    disputed = False
     if V.oracle_unusable(gi):
         selfrepair_why = "no usable case in any tier"
     elif gi.validate_reject_frac >= cfg["limits"]["validate_reject_frac_regen"]:
         selfrepair_why = f"validate() rejected {gi.validate_reject_frac:.0%} of its own gen() inputs"
+    elif V.examples_disputed(gi):
+        ec = gi.example_checks
+        disputed = True
+        selfrepair_why = f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {ec['cases']}"
+        run.log(f"oracle.disputed {selfrepair_why}")
     if selfrepair_why and run.budget.can_afford(cfg["limits"]["oracle_selfrepair_afford_s"]) and not run.over_cost():
         run.log(f"oracle.selfrepair triggered: {selfrepair_why}; notes={'; '.join(gi.notes)[:300]}")
         prev = gi
+        extra = V.examples_dispute_extra(gi) if disputed else V.selfrepair_extra(gi)
         try:
-            gi = V.regenerate_oracle(run, gi, V.selfrepair_extra(gi), pv, counter="oracle_selfrepairs", workdir_tag="oracle_selfrepair")
+            gi = V.regenerate_oracle(run, gi, extra, pv, counter="oracle_selfrepairs", workdir_tag="oracle_selfrepair")
         except Exception as e:
             run.log(f"oracle.selfrepair crashed {type(e).__name__}: {e}")
+        # The replacement was asked specifically about these inputs; if it still contradicts half of
+        # them, no reference in this run is ground truth and no diff_* step against it is full evidence.
+        if disputed and V.examples_disputed(gi):
+            ec = gi.example_checks
+            gi.diff_degraded = f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {ec['cases']}"
+            run.log(f"oracle.disputed after regeneration: {gi.diff_degraded}")
         # Coming from the rejection trigger there was a working-but-inconsistent oracle to lose: keep it
         # unless the replacement is actually better. (The crash trigger has nothing to fall back to.)
         if prev.validate_reject_frac and gi is not prev and not gi.regen_failed \
@@ -277,7 +304,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         cand = ungated[0] if ungated else best_candidate(run.cands)
         try:
             if len(cand.evidence) == 1 and cand.evidence[0].passed:
-                cand.evidence = [cand.evidence[0]] + V.run_gate(problem, cand.source, gi, workdir=os.path.join(run_dir, cand.id), budget=run.budget, limits=cfg["limits"], log=run.log)
+                cand.evidence = [cand.evidence[0]] + V.run_gate(problem, cand.source, gi, workdir=os.path.join(run_dir, cand.id), budget=run.budget, limits=cfg["limits"], log=run.log, examples=cand.examples)
                 # The Rust compile step may have added the imports rustc asked for; the gate ran that
                 # patched source, so it is the one that must be emitted and re-gated from here on.
                 patched = next((e.detail["patched_source"] for e in cand.evidence if "patched_source" in e.detail), None)
@@ -341,6 +368,9 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
                 continue
             if new_source.strip() and new_source.strip() != cand.source.strip():
                 nc = run.add_candidate(new_source, cand.id); nc.evidence.append(static_evidence(problem, new_source))
+                # The examples describe the problem, not the code: a repaired child inherits them and
+                # is held to the same hand trace its parent was.
+                nc.examples, nc.examples_dropped = cand.examples, cand.examples_dropped
             else:
                 break
         except Exception as e:
@@ -379,6 +409,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
               "final_candidate": best.id if best else None, "repairs": repairs, "syntax_repairs": syntax_repairs, "oracle_regenerated": gi.oracle_regens,
               "oracle_selfrepaired": gi.oracle_selfrepairs,
               "evidence": {c.id: [asdict(e) for e in c.evidence] for c in run.cands}, "parents": {c.id: c.parent for c in run.cands},
+              "examples": {c.id: {"count": len(c.examples), "dropped": c.examples_dropped} for c in run.cands},
               "calls": list(llm.calls),
               "token_usage": {"prompt": sum((c["usage"] or {}).get("prompt_tokens", 0) for c in llm.calls),
                               "completion": sum((c["usage"] or {}).get("completion_tokens", 0) for c in llm.calls)},
@@ -403,15 +434,15 @@ def bench(sample_dir: str, out_dir: str, cfg: dict, llm, deadline_scale: float) 
                 rep = solve(p, llm, cfg, out_path=os.path.join(out_dir, f"{pid}.{'py' if p.language == 'python' else 'rs'}"), run_dir=os.path.join(out_dir, pid), deadline_scale=deadline_scale)
                 ev = {e["kind"]: e for e in rep["evidence"].get(rep["final_candidate"] or "", [])}
                 mark = lambda k: "n/a" if k not in ev else "skip" if ev[k].get("skipped") else "FAIL" if not ev[k]["passed"] else ("degraded" if (ev[k].get("detail") or {}).get("degraded") else "pass")
-                rows.append({"id": pid, "lang": p.language, "compiles": mark("compile"), "public": mark("diff_public"), "edge": mark("diff_edge"), "small": mark("diff_small"),
+                rows.append({"id": pid, "lang": p.language, "compiles": mark("compile"), "examples": mark("diff_examples"), "public": mark("diff_public"), "edge": mark("diff_edge"), "small": mark("diff_small"),
                              "medium": mark("diff_medium"), "behavior": mark("behavior"), "stress": mark("stress"), "overflow": mark("overflow"), "repairs": rep["repairs"], "syntax_repairs": rep["syntax_repairs"], "calls": len(rep["calls"]),
                              "tokens": f"{rep['token_usage']['prompt']}/{rep['token_usage']['completion']}", "elapsed": rep["elapsed_s"], "cost": rep["cost_usd"], "status": rep["status"]})
             except Exception as e:
-                rows.append({"id": pid, "lang": "?", "compiles": "n/a", "public": "n/a", "edge": "n/a", "small": "n/a", "medium": "n/a", "behavior": "n/a", "stress": "n/a", "overflow": "n/a",
+                rows.append({"id": pid, "lang": "?", "compiles": "n/a", "examples": "n/a", "public": "n/a", "edge": "n/a", "small": "n/a", "medium": "n/a", "behavior": "n/a", "stress": "n/a", "overflow": "n/a",
                              "repairs": 0, "syntax_repairs": 0, "calls": 0, "tokens": "0/0", "elapsed": 0.0, "cost": None, "status": f"error: {type(e).__name__}: {str(e)[:200]}"})
     finally:
-        hdr = "| Problem | Lang | Compiles | Public | Edge | Small | Medium | Behavior | Stress | Overflow | Repairs | Syntax Repairs | Calls | Tokens in/out | Elapsed s | Cost USD | Status | Hidden tests |\n|---|---|---|---|---|---|---|---|---|---|---:|---:|---:|---|---:|---:|---|---|\n"
-        body = "".join(f"| {r['id']} | {r['lang']} | {r['compiles']} | {r['public']} | {r['edge']} | {r['small']} | {r['medium']} | {r['behavior']} | {r['stress']} | {r['overflow']} | {r['repairs']} | {r['syntax_repairs']} | {r['calls']} | {r['tokens']} | {r['elapsed']} | {r['cost'] if r['cost'] is not None else 'n/a'} | {r['status']} | unknown |\n" for r in rows)
+        hdr = "| Problem | Lang | Compiles | Examples | Public | Edge | Small | Medium | Behavior | Stress | Overflow | Repairs | Syntax Repairs | Calls | Tokens in/out | Elapsed s | Cost USD | Status | Hidden tests |\n|---|---|---|---|---|---|---|---|---|---|---|---:|---:|---:|---|---:|---:|---|---|\n"
+        body = "".join(f"| {r['id']} | {r['lang']} | {r['compiles']} | {r['examples']} | {r['public']} | {r['edge']} | {r['small']} | {r['medium']} | {r['behavior']} | {r['stress']} | {r['overflow']} | {r['repairs']} | {r['syntax_repairs']} | {r['calls']} | {r['tokens']} | {r['elapsed']} | {r['cost'] if r['cost'] is not None else 'n/a'} | {r['status']} | unknown |\n" for r in rows)
         costs = [r["cost"] for r in rows if r["cost"] is not None]
         total_cost = f"{sum(costs):.4f}" if costs else "unknown"
         note = f"\nprofile={cfg.get('profile')} deadline_scale={deadline_scale} total_cost_usd={total_cost}. 'pass' = passed local gates; hidden-test status is unknown.\n"

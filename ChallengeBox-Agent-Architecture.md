@@ -137,7 +137,7 @@ Serious reasoning calls take 20 to 90 seconds each. A sequential analyzer → ar
 
 ### 5.2 SOLVE call (strong model, one call)
 
-One structured response with four sections. Merging analysis and code into one call halves latency and keeps the analysis in the same context that writes the code, which is where it matters.
+One structured response with five sections. Merging analysis and code into one call halves latency and keeps the analysis in the same context that writes the code, which is where it matters.
 
 Required sections:
 
@@ -145,6 +145,7 @@ Required sections:
 2. **Traps** — for each constraint, what a naive approach would do and why it fails. The prompt lists the trap classes from §2.1 as a checklist the model must address one by one.
 3. **Algorithm** — data structures, complexity against the stated maximum sizes, overflow treatment, recursion treatment.
 4. **Code** — in a fenced block with a fixed marker. The orchestrator extracts by marker, never by trusting prose.
+5. **Examples** — 3–5 hand-traced `(args, expected)` pairs, machine-readable (§5.2.1).
 
 Language-specific instructions baked into the prompt:
 
@@ -152,6 +153,40 @@ Language-specific instructions baked into the prompt:
 - Rust: read all stdin into one buffer, `BufWriter` for output, `i128`/`u128` for sums of 10^18 quantities, `BTreeMap` or sorted output where iteration order reaches stdout, no `unsafe`.
 
 On top of those, one **I/O contract per language** (`solve.py`'s `io_rules`) is rendered verbatim into SOLVE, REPAIR, ORACLE and STRESS, so the candidate and the oracle cannot each pick a different, individually defensible reading of the same shape. For Rust it is the stdin token-stream rule (§5.4). For Python it is the outer container: return exactly the types the statement names — the judge compares with `==`, so `()` is not `[]` — and where the statement names none, a `list` for the returned sequence and a `tuple` only where it says tuple or pair. Three rounds running, both of 2beff58fa923's attempts returned `()` where the oracle returned `[]` on the empty input, and a repair attempt was spent on a difference the statement is silent about.
+
+#### 5.2.1 Hand-traced examples: a second reading of the statement
+
+The SOLVE reply carries one more block, `===EXAMPLES===`: three to five lines, each a Python literal
+`(args, expected)` pair (for Rust, the complete stdin and the complete stdout as strings), traced from the
+statement by hand and explicitly not obtained by running the code. The prompt asks for the smallest legal
+input, one input at a stated numeric limit, and the input the author thinks is most likely to be misread.
+
+`verify.parse_examples` reads them with one `ast.literal_eval` per line — never `exec`, this is model output —
+drops any line that is not a 2-tuple (the count is reported per candidate as `examples: {count, dropped}`),
+wraps non-tuple Python args as a 1-tuple, requires a `str` for Rust, and caps the list at 8. They are used twice:
+
+- **Against the candidate** — gate step `diff_examples` (§5.5), immediately after compile and before every
+  other differential step. A failure means the code contradicts its own author's reading of the statement, and
+  it drives the normal repair loop with `kind=diff_examples`; the repair prompt's *Expected* line then says the
+  value came from the solution author's own hand trace rather than from the reference. That failing case is
+  **not** shrunk and **not** kept as a regression: shrink re-derives the expectation from the oracle, which
+  would silently swap one ground truth for the other. A repaired child inherits its parent's examples.
+- **Against the oracle** — `prepare_gate_inputs` runs the oracle's `validate()` and `reference()` over every
+  distinct example input (the union across all candidates, deduped by `repr(args)`) and records
+  `example_checks = {cases, disagreements, errors}`, which reaches `report.json` under `gate_inputs`. The
+  oracle never sees the examples in its own prompt; this is a reading it did not write.
+
+When the oracle contradicts at least half of at least two hand-traced inputs (`verify.examples_disputed`), it
+is **disputed**: the same one-shot self-repair path §5.3.1 uses regenerates it, with the disputed inputs and
+their hand-traced expected values as the extra context — inputs and expected values only, never any candidate
+code. If the replacement still contradicts half of them, every `diff_*` step of the run is marked degraded
+(`reference disagrees with hand-traced examples on X of N`) and the status can no longer be
+`passed_all_gates`. If instead the replacement agrees with all of them, the §5.7 cross-check's "neither
+reference can be trusted" degradation is *not* applied to their wholesale disagreement: the examples are
+outside evidence saying which of the two references was wrong.
+
+This is the generic replacement for a sample-specific smoke check that briefly existed and was deleted: it
+scores on every problem rather than one, and it costs no extra model call.
 
 ### 5.3 ORACLE call (fast model, concurrent)
 
@@ -199,13 +234,14 @@ Runs in order, cheapest first, and stops at the first failure so the repair prom
 
 1. **Static contract** — §6.
 2. **Compile / import** — Rust: `rustc -O -C overflow-checks=on --edition 2021`. On a compile failure the `use ...;` lines rustc itself suggested are prepended and the compile is retried once (`sandbox.compile_rust_with_imports`, zero model tokens — two benchmark runs in a row lost a candidate to a missing `use std::io::Read;`); the patched source becomes the candidate's source, so it is what the rest of the gate, a later repair, and the emitted file all use. Python: `compile()` then import in a subprocess.
-3. **Public examples** — `problem.public_examples`, compared directly, only present if the problem shipped any (§5.4.1).
-4. **Edge cases** — the literal cases from STRESS, compared against `reference`.
-5. **Differential, small** — 200 seeded cases from `gen(seed, "small")`, candidate vs `reference`.
-6. **Differential, medium** — 20 seeded cases from `gen(seed, "medium")`.
-7. **Behavioral contract** — §6.3 checks (mutation, global state, nondeterminism), run on the same cases.
-8. **Stress** — `gen_max` input, release build (`overflow-checks=off`, for a realistic timing measurement), wall-clock limit (default Python 5 s, Rust 2 s, configurable; the real judge limits are unknown and this is recorded as an assumption).
-9. **Overflow (Rust only)** — immediately after stress, so the timing run above happens first on a warm cache and this step can't mask a stress timeout. Reruns the same `gen_max` input on the overflow-checked binary already compiled by step 2 (reused, not recompiled). This is the only place a genuinely maximum-size input meets an overflow-checked build: step 2's checked build is only ever exercised by the small/medium differential inputs, which are far too small to overflow i64. A panic here (Rust prints `attempt to add with overflow` and similar) fails the step. **This does not check the output is correct** — the oracle is a literal Python reference and cannot produce an expected answer at maximum scale in reasonable time — it only proves no arithmetic operation overflowed. Skipped (not failed) when the problem is Python (arbitrary-precision integers, nothing to overflow), when there is no stress input, or when the budget is exhausted.
+3. **Hand-traced examples** — the `===EXAMPLES===` block of the SOLVE reply: 3–5 `(args, expected)` pairs the solution's author traced from the statement by hand, run against that same candidate. No oracle is involved, so this is the one differential step a wrong reference cannot poison. Skipped (never failed) when the reply carried no parseable examples (§5.2.1).
+4. **Public examples** — `problem.public_examples`, compared directly, only present if the problem shipped any (§5.4.1).
+5. **Edge cases** — the literal cases from STRESS, compared against `reference`.
+6. **Differential, small** — 200 seeded cases from `gen(seed, "small")`, candidate vs `reference`.
+7. **Differential, medium** — 20 seeded cases from `gen(seed, "medium")`.
+8. **Behavioral contract** — §6.3 checks (mutation, global state, nondeterminism), run on the same cases.
+9. **Stress** — `gen_max` input, release build (`overflow-checks=off`, for a realistic timing measurement), wall-clock limit (default Python 5 s, Rust 2 s, configurable; the real judge limits are unknown and this is recorded as an assumption).
+10. **Overflow (Rust only)** — immediately after stress, so the timing run above happens first on a warm cache and this step can't mask a stress timeout. Reruns the same `gen_max` input on the overflow-checked binary already compiled by step 2 (reused, not recompiled). This is the only place a genuinely maximum-size input meets an overflow-checked build: step 2's checked build is only ever exercised by the small/medium differential inputs, which are far too small to overflow i64. A panic here (Rust prints `attempt to add with overflow` and similar) fails the step. **This does not check the output is correct** — the oracle is a literal Python reference and cannot produce an expected answer at maximum scale in reasonable time — it only proves no arithmetic operation overflowed. Skipped (not failed) when the problem is Python (arbitrary-precision integers, nothing to overflow), when there is no stress input, or when the budget is exhausted.
 
 #### 5.4.1 Public examples: the one non-model-generated evidence source
 
@@ -221,7 +257,7 @@ These become `GateInputs.cases_public` — and they are treated differently from
 
 With no public examples — the overwhelming common case — `cases_public` is empty and the `diff_public` step is not added to the evidence list at all; the gate is byte-for-byte what it was before this existed.
 
-**Input validation, before steps 3–5.** Every input feeding those three steps (STRESS edge cases and both `gen` tiers) is first checked against the oracle's own `validate`, batched the same way as the `reference` pass. An input `validate` rejects, or raises on, is dropped as invalid before `reference` ever computes an expected output for it, so the differential never burns a case — or a repair attempt — chasing a candidate/oracle disagreement on input the statement itself forbids. Two safety rules keep this from doing more harm than good: if `validate` would reject *every* input in a tier, it is distrusted instead — all inputs for that tier are kept exactly as before, and the report records that the validator was skipped; and an oracle with no `validate` function at all behaves exactly as it did before this feature existed, with its own distinct skip reason in the report. This buys confidence that inputs reaching the gate satisfy the preconditions the statement states; **it does not buy correctness of `reference` itself** — an oracle whose `reference` misreads the statement can still be internally consistent with its own `validate` and pass every check.
+**Input validation, before steps 5–7.** Every input feeding those three steps (STRESS edge cases and both `gen` tiers) is first checked against the oracle's own `validate`, batched the same way as the `reference` pass. An input `validate` rejects, or raises on, is dropped as invalid before `reference` ever computes an expected output for it, so the differential never burns a case — or a repair attempt — chasing a candidate/oracle disagreement on input the statement itself forbids. Two safety rules keep this from doing more harm than good: if `validate` would reject *every* input in a tier, it is distrusted instead — all inputs for that tier are kept exactly as before, and the report records that the validator was skipped; and an oracle with no `validate` function at all behaves exactly as it did before this feature existed, with its own distinct skip reason in the report. This buys confidence that inputs reaching the gate satisfy the preconditions the statement states; **it does not buy correctness of `reference` itself** — an oracle whose `reference` misreads the statement can still be internally consistent with its own `validate` and pass every check.
 
 Each step produces an `Evidence` record: kind, passed, case count, duration, and the failing input if any.
 

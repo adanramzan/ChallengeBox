@@ -10,7 +10,12 @@ def cfg():
     return {"limits": {"safety_margin_s": 15.0, "cases_small": 5, "cases_medium": 2, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0, "max_repairs": 2, "max_syntax_repairs": 2, "mem_mb": 2048, "shrink_budget_s": 1.0, "max_cost_usd_per_problem": 0.10, "oracle_retry_afford_s": 130.0, "repair_afford_s": 60.0, "oracle_selfrepair_afford_s": 130.0, "validate_reject_frac_regen": 0.5},
             "phases": {"generate_until": 0.32, "gate_until": 0.39, "repair_until": 0.81, "settle_until": 0.93, "generate_call_share": 0.45, "repair_call_share": 0.25}, "profile": "fake"}
 
-SOLVE_OK = "===RULES===\nr\n===END===\n===TRAPS===\nt\n===END===\n===ALGORITHM===\na\n===END===\n===CODE===\n```python\ndef add(a, b):\n    return a + b\n```\n===END===\n"
+# A SOLVE reply with no ===EXAMPLES=== block: the diff_examples gate step is then skipped.
+SOLVE_NO_EXAMPLES = "===RULES===\nr\n===END===\n===TRAPS===\nt\n===END===\n===ALGORITHM===\na\n===END===\n===CODE===\n```python\ndef add(a, b):\n    return a + b\n```\n===END===\n"
+# Hand-traced examples, all with a < 15 so the planted a>=15 bug below is still caught by EDGES
+# (15, 0) at diff_edge rather than short-circuiting the gate at diff_examples.
+EXAMPLES_BLOCK = "===EXAMPLES===\n((0, 0), 0)\n((1, 2), 3)\n((3, 4), 7)\n===END===\n"
+SOLVE_OK = SOLVE_NO_EXAMPLES + EXAMPLES_BLOCK
 ORACLE_OK = "===ORACLE===\nimport random\ndef reference(a, b):\n    return a + b\ndef gen(seed, mode):\n    r = random.Random(seed)\n    return (r.randint(0, 20), r.randint(0, 20))\n===END===\n"
 STRESS_OK = "===STRESS===\ndef gen_max(seed):\n    return (10**18, 10**18)\nEDGES = [(0, 0), (15, 0)]\n===END===\n"   # (15, 0) deterministically exposes the planted a>=15 bug used in later tests
 
@@ -394,7 +399,9 @@ def test_all_skipped_gate_does_not_log_gate_passed(tmp_path):
     # F4.4: a run that verified nothing (broken oracle, no stress source) must not log "gate.passed" --
     # that reads as success in the log even though every real check was skipped.
     ORACLE_BROKEN = "===ORACLE===\ndef reference(a, b):\n    raise RuntimeError('broken')\ndef gen(seed, mode):\n    return (1, 2)\n===END===\n"
-    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_BROKEN], "stress": [""]})
+    # SOLVE_NO_EXAMPLES: with hand-traced examples the candidate WOULD have been checked against
+    # them, and "gate.passed" would then be accurate even with a dead oracle.
+    llm = FakeLLM({"solve": [SOLVE_NO_EXAMPLES], "oracle": [ORACLE_BROKEN], "stress": [""]})
     rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert rep["status"] == "emitted_unverified"
     assert not any(l.endswith("gate.passed") for l in rep["events"])
@@ -492,7 +499,7 @@ def test_repair_prompt_distinguishes_tuple_from_list_via_repr_and_type(tmp_path)
     # ("both look like []" at the empty case); the repair prompt must make the type explicit so the
     # model can actually see the difference instead of rewriting unrelated code.
     ORACLE_LIST = "===ORACLE===\nimport random\ndef reference(a, b):\n    return [a, b]\ndef gen(seed, mode):\n    r = random.Random(seed)\n    return (r.randint(0, 20), r.randint(0, 20))\n===END===\n"
-    SOLVE_TUPLE = SOLVE_OK.replace("return a + b", "return (a, b)")
+    SOLVE_TUPLE = SOLVE_NO_EXAMPLES.replace("return a + b", "return (a, b)")
     fix = "===VERDICT===\ncandidate\n===END===\n===CODE===\ndef add(a, b):\n    return [a, b]\n===END===\n"
     llm = FakeLLM({"solve": [SOLVE_TUPLE], "repair": [fix], "oracle": [ORACLE_LIST], "stress": [STRESS_OK]})
     S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
@@ -647,7 +654,9 @@ def test_regenerated_oracle_disagreeing_everywhere_degrades_the_diff_evidence(tm
     assert rep["oracle_regenerated"] == 1
     assert any("disagrees with the one it replaces" in n for n in rep["gate_inputs"]["notes"])
     assert any("oracle.regen disagreement=" in e for e in rep["events"])
-    diffs = [e for evs in rep["evidence"].values() for e in evs if e["kind"].startswith("diff_")]
+    # diff_examples is excluded: it is the candidate against its author's own trace, with no oracle
+    # in it at all, so an untrustworthy reference says nothing about that step.
+    diffs = [e for evs in rep["evidence"].values() for e in evs if e["kind"].startswith("diff_") and e["kind"] != "diff_examples"]
     assert diffs and all(e["detail"].get("degraded") for e in diffs)
     assert rep["status"] != "passed_all_gates"
 
@@ -751,3 +760,82 @@ def test_python_container_rule_reaches_solve_and_oracle(tmp_path):
         assert sentence in S.render(name, **pv)
     rust = S.prompt_vars(prob(tmp_path, "rust"))
     assert sentence not in rust["io_rules"] and "whitespace-separated token stream" in rust["io_rules"]
+
+
+# --- round 13: the SOLVE author's hand-traced examples ---
+
+SOLVE_CONTRADICTS_ITSELF = SOLVE_NO_EXAMPLES + "===EXAMPLES===\n((1, 2), 4)\n===END===\n"   # code returns 3
+REPAIR_NO_CHANGE = "===VERDICT===\ncandidate\n===END===\n===CODE===\ndef add(a, b):\n    return a + b\n===END===\n"
+
+def test_examples_are_parsed_counted_and_reported_per_candidate(tmp_path):
+    malformed = SOLVE_NO_EXAMPLES + "===EXAMPLES===\n((0, 0), 0)\n((1, 2), 3)\nnot a pair\n===END===\n"
+    llm = FakeLLM({"solve": [malformed], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["examples"]["c1"] == {"count": 2, "dropped": 1}
+    assert any("solve.examples id=c1 parsed=2 dropped=1" in e for e in rep["events"])
+
+def test_a_candidate_with_no_examples_skips_the_step(tmp_path):
+    llm = FakeLLM({"solve": [SOLVE_NO_EXAMPLES], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
+    assert ev["diff_examples"]["skipped"] and ev["diff_examples"]["passed"]
+    assert rep["examples"]["c1"] == {"count": 0, "dropped": 0}
+
+def test_diff_examples_failure_reaches_repair_with_the_author_trace_wording(tmp_path):
+    llm = FakeLLM({"solve": [SOLVE_CONTRADICTS_ITSELF], "repair": [REPAIR_NO_CHANGE], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
+    assert not ev["diff_examples"]["passed"] and ev["diff_examples"]["detail"]["input"] == (1, 2)
+    prompt = next(u for r, s_, u in llm.prompts if "Failure kind" in u)
+    assert "Failure kind: diff_examples" in prompt
+    assert "solution author's own hand trace of the statement" in prompt
+    assert "independent literal reference" not in prompt.split("Actual:")[0]   # the Expected line, not the trailing reference section
+
+def test_oracle_disagreeing_with_half_the_examples_is_regenerated_once(tmp_path):
+    # ORACLE_OFF_BY_1000 contradicts all three hand-traced examples: one regeneration, and the
+    # replacement (which agrees) is what the gate then runs against.
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OFF_BY_1000, ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 1 and rep["oracle_regenerated"] == 0
+    assert len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 2
+    assert any("oracle.disputed reference disagrees with hand-traced examples on 3 of 3" in e for e in rep["events"])
+    oracle_prompts = [u for c, (r, s_, u) in zip(llm.calls, llm.prompts) if c["tag"] == "oracle"]
+    assert "Hand-traced expected" in oracle_prompts[1] and "def add(" not in oracle_prompts[1]
+    diffs = [e for e in rep["evidence"]["c1"] if e["kind"].startswith("diff_")]
+    assert not any(e["detail"].get("degraded") for e in diffs)
+
+def test_a_replacement_oracle_that_still_disagrees_degrades_the_diff_evidence(tmp_path):
+    llm = FakeLLM({"solve": [SOLVE_OK], "repair": [REPAIR_NO_CHANGE],
+                   "oracle": [ORACLE_OFF_BY_1000, ORACLE_OFF_BY_1000], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 1
+    assert any("oracle.disputed after regeneration" in e for e in rep["events"])
+    diffs = [e for evs in rep["evidence"].values() for e in evs if e["kind"].startswith("diff_") and not e["skipped"]]
+    assert diffs and all("hand-traced examples" in (e["detail"].get("degraded") or "") for e in diffs if e["kind"] != "diff_examples")
+    assert rep["status"] != "passed_all_gates"
+
+def test_an_agreeing_oracle_triggers_no_regeneration(tmp_path):
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 0 and len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 1
+    assert rep["gate_inputs"]["example_checks"]["disagreements"] == []
+    assert rep["status"] == "passed_all_gates"
+
+def test_rust_examples_are_stdin_stdout_pairs(tmp_path):
+    p = Problem("pid", "rust", "read n then n ints, print the sum", "main", [], 300.0)
+    assert V_parse_rust_examples(p) == [("3\n1 2 3\n", "6")]
+
+def V_parse_rust_examples(p):
+    import verify as V
+    block = '("3\\n1 2 3\\n", "6")\n(123, "6")\n'
+    return [(c.input, c.expected) for c in V.parse_examples(p, block)]
+
+def test_examples_alone_are_real_evidence_when_the_oracle_is_dead(tmp_path):
+    # The generic replacement for the deleted sample-specific smoke check: a dead oracle no longer
+    # means nothing was checked -- the candidate still faces its author's own hand trace.
+    ORACLE_BROKEN = "===ORACLE===\ndef reference(a, b):\n    raise RuntimeError('broken')\ndef gen(seed, mode):\n    return (1, 2)\n===END===\n"
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_BROKEN], "stress": [""]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
+    assert ev["diff_examples"]["passed"] and not ev["diff_examples"]["skipped"] and ev["diff_examples"]["cases"] == 3
+    assert not any("gate.unverifiable" in l for l in rep["events"])
