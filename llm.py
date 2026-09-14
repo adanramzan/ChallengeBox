@@ -55,6 +55,11 @@ class Reply:
     latency_s: float
     model: str
     error: str | None = None
+    # True when this is what a STREAMED call had accumulated when its own timeout_s elapsed: the
+    # request thread was abandoned mid-answer and `text` is the prefix it had sent. Everything
+    # downstream that reads such a reply has to ask which blocks actually closed (`salvageable`),
+    # because the block the cut landed in is truncated, not finished.
+    partial: bool = False
 
     @property
     def text(self) -> str:
@@ -86,14 +91,26 @@ def pick_profile(path: str) -> str:
     return next(iter(profiles))
 
 
-def _read_sse(resp) -> dict:
+def _new_acc() -> dict:
+    """The accumulator a streaming read fills. It is created by the caller and handed to the request
+    thread so that whatever arrived before the call's timeout is still readable after the thread is
+    abandoned. `content`/`reasoning` are lists because list.append and the reader's slice copy are
+    each atomic under the GIL -- that is the whole of the thread safety needed here, and one is
+    created per attempt so an abandoned thread can never write into a later call's buffer."""
+    return {"content": [], "reasoning": [], "usage": {}, "model": None}
+
+
+def _acc_text(acc: dict) -> tuple[str, str]:
+    return "".join(acc["content"][:]), "".join(acc["reasoning"][:])
+
+
+def _read_sse(resp, acc: dict) -> dict:
     """An OpenAI-compatible SSE body, folded back into the same shape a non-streamed reply has, so
     nothing downstream knows the difference. Accumulates delta.content and delta.reasoning (OpenRouter's
-    field name; reasoning_content is accepted too) and keeps whatever usage the last chunk carries --
-    OpenAI puts it in a final chunk requested with stream_options.include_usage, OpenRouter sends it
-    top-level on the last chunk. Reading line by line is what makes the socket timeout a stall
+    field name; reasoning_content is accepted too) into `acc` and keeps whatever usage the last chunk
+    carries -- OpenAI puts it in a final chunk requested with stream_options.include_usage, OpenRouter
+    sends it top-level on the last chunk. Reading line by line is what makes the socket timeout a stall
     detector: each readline is bounded by it."""
-    content, reasoning, usage, model = [], [], {}, None
     for raw in resp:
         line = raw.decode("utf-8", "replace").strip()
         if not line.startswith("data:"):
@@ -105,19 +122,28 @@ def _read_sse(resp) -> dict:
             chunk = json.loads(payload)
         except ValueError:   # a keep-alive or a malformed frame is not the answer; skip it
             continue
-        model = chunk.get("model") or model
+        acc["model"] = chunk.get("model") or acc["model"]
         if chunk.get("usage"):
-            usage = chunk["usage"]
+            acc["usage"] = chunk["usage"]
         for ch in chunk.get("choices") or []:
             d = ch.get("delta") or {}
             if d.get("content"):
-                content.append(d["content"])
+                acc["content"].append(d["content"])
             if d.get("reasoning") or d.get("reasoning_content"):
-                reasoning.append(d.get("reasoning") or d.get("reasoning_content"))
-    out = {"choices": [{"message": {"content": "".join(content), "reasoning": "".join(reasoning)}}], "usage": usage}
-    if model:
-        out["model"] = model
+                acc["reasoning"].append(d.get("reasoning") or d.get("reasoning_content"))
+    content, reasoning = _acc_text(acc)
+    out = {"choices": [{"message": {"content": content, "reasoning": reasoning}}], "usage": acc["usage"]}
+    if acc["model"]:
+        out["model"] = acc["model"]
     return out
+
+
+def _fill_cost(usage: dict, r: Role) -> dict:
+    """Only OpenRouter reports usage.cost; for any other provider the per-million prices fill it in."""
+    if usage and "cost" not in usage and (r.price_in_per_m or r.price_out_per_m):
+        usage["cost"] = (usage.get("prompt_tokens", 0) * r.price_in_per_m
+                         + usage.get("completion_tokens", 0) * r.price_out_per_m) / 1e6
+    return usage
 
 
 # The tags whose request body gets Role.repair_extra merged over Role.extra. Both are calls made
@@ -149,7 +175,7 @@ class LLM:
         if timeout_s <= 0:
             reply = Reply("", "", {}, 0.0, r.model, "timeout")
             self.calls.append({"role": role, "tag": tag, "model": reply.model, "latency_s": 0.0, "usage": {},
-                               "error": "timeout", "timed_out": True, "max_tokens": limit})
+                               "error": "timeout", "timed_out": True, "partial": False, "max_tokens": limit})
             return reply
         headers = {"Content-Type": "application/json"}
         key = os.environ.get(r.api_key_env) if r.api_key_env else None
@@ -160,16 +186,18 @@ class LLM:
         t0 = time.monotonic()
         for attempt in range(r.transport_retries + 1):
             result: dict = {}
+            acc = _new_acc()   # per attempt: an abandoned thread keeps writing into its own buffer
             sem.acquire()
 
-            def work(result=result):
+            def work(result=result, acc=acc):
                 try:
                     # Streaming: the socket timeout applies per read, so it IS the stall detector --
                     # a gap longer than stall_timeout_s between chunks raises, and the retry below
                     # treats it as any other transport error. The call's own timeout_s still bounds
-                    # the whole attempt, through the join() beneath.
+                    # the whole attempt, through the join() beneath. The `with` closes the socket
+                    # whenever this thread finally leaves, abandoned or not.
                     with urllib.request.urlopen(req, timeout=r.stall_timeout_s if r.stream else timeout_s + 5) as resp:
-                        result["data"] = _read_sse(resp) if r.stream else json.load(resp)
+                        result["data"] = _read_sse(resp, acc) if r.stream else json.load(resp)
                 except urllib.error.HTTPError as e:
                     result["error"] = f"http {e.code}: {e.read().decode('utf-8', 'replace')[:300]}"
                     result["retryable"] = e.code == 429 or e.code >= 500
@@ -188,22 +216,35 @@ class LLM:
                 break
             time.sleep(backoff)
         latency = time.monotonic() - t0
+        estimated = False
         if timed_out:
-            reply = Reply("", "", {}, latency, r.model, "timeout")
+            # The request thread is abandoned, but what it streamed before the cap is still in `acc`.
+            # A reply cut off in its last blocks can still hold a complete ===CODE=== block (see
+            # `salvageable`), and dropping it threw away runs that had already written the answer:
+            # bench17 spent 199.5 s of a 200 s cap on one Opus attempt and shipped no_candidate.
+            content, reasoning = _acc_text(acc)
+            partial = bool(content.strip() or reasoning.strip())
+            usage = dict(acc["usage"])
+            if partial and not usage:
+                # The stream never reached the usage chunk. Four characters per token is the usual
+                # rough ratio; the call record says `estimated` so no cost total reads it as measured.
+                usage, estimated = {"completion_tokens": len(content or reasoning) // 4}, True
+            reply = Reply(content, reasoning, _fill_cost(usage, r), latency, acc["model"] or r.model, "timeout", partial)
         elif "error" in result:
             reply = Reply("", "", {}, latency, r.model, result["error"])
         else:
-            d = result["data"]; msg = d["choices"][0]["message"]; usage = d.get("usage") or {}
-            if "cost" not in usage and (r.price_in_per_m or r.price_out_per_m):
-                usage["cost"] = (usage.get("prompt_tokens", 0) * r.price_in_per_m + usage.get("completion_tokens", 0) * r.price_out_per_m) / 1e6
+            d = result["data"]; msg = d["choices"][0]["message"]
             reply = Reply(msg.get("content") or "", msg.get("reasoning_content") or msg.get("reasoning") or "",
-                          usage, latency, d.get("model", r.model), None)
-        self.calls.append({"role": role, "tag": tag, "model": reply.model, "latency_s": round(latency, 2), "usage": reply.usage,
-                           "error": reply.error, "timed_out": timed_out, "max_tokens": limit})
+                          _fill_cost(d.get("usage") or {}, r), latency, d.get("model", r.model), None)
+        rec = {"role": role, "tag": tag, "model": reply.model, "latency_s": round(latency, 2), "usage": reply.usage,
+               "error": reply.error, "timed_out": timed_out, "partial": reply.partial, "max_tokens": limit}
+        if estimated:
+            rec["estimated"] = True
+        self.calls.append(rec)
         return reply
 
 
-_BLOCK = re.compile(r"===([A-Z_]+)===\s*\n(.*?)(?:\n===END===|\Z)", re.S)
+_BLOCK = re.compile(r"===([A-Z_]+)===\s*\n(.*?)(\n===END===|\Z)", re.S)
 _FENCE = re.compile(r"```[a-zA-Z0-9_+-]*[ \t]*\n(.*?)\n```", re.S)
 _OPEN_FENCE = re.compile(r"^```[a-zA-Z0-9_+-]*[ \t]*$")
 _CLOSE_FENCE = re.compile(r"^```[ \t]*$")
@@ -226,11 +267,36 @@ def _unfence(body: str) -> str:
 
 def parse_blocks(text: str) -> dict[str, str]:
     out: dict[str, str] = {}
-    for name, body in _BLOCK.findall(text):
+    for name, body, _end in _BLOCK.findall(text):
         if name == "END":
             continue
         out[name] = _unfence(body.strip())  # last occurrence wins
     return out
+
+
+def terminated_blocks(text: str) -> set[str]:
+    """The names whose block was closed by its own `===END===` line.
+
+    parse_blocks deliberately lets an unterminated block run to the end of the text, which is what
+    makes a reply that stopped mid-answer parse at all. For a reply cut off by its timeout that
+    distinction is the whole question: the block the cut landed in is truncated, not finished. Kept
+    as a companion function so parse_blocks' return type stays a plain {name: body} for its existing
+    callers, and reading last-occurrence-wins exactly as parse_blocks does, so the two always agree
+    about which body a name refers to."""
+    closed: dict[str, bool] = {}
+    for name, _body, end in _BLOCK.findall(text):
+        if name != "END":
+            closed[name] = bool(end)
+    return {n for n, ok in closed.items() if ok}
+
+
+def salvageable(reply) -> bool:
+    """Whether a reply abandoned at its timeout still carries a usable solution: it is `partial` and
+    its ===CODE=== block closed. The SOLVE prompt puts RULES and DESIGN before CODE and
+    EXAMPLES/TRAPS/ALGORITHM after it, and the REPAIR prompt puts VERDICT before CODE, so what a
+    cut-off reply loses is commentary the gate does not need. A cut that landed inside CODE leaves
+    truncated source, which is not a candidate."""
+    return bool(getattr(reply, "partial", False)) and "CODE" in terminated_blocks(reply.text)
 
 
 class FakeLLM:

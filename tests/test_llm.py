@@ -1,7 +1,7 @@
 import json, threading, time, pathlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
-from llm import LLM, Role, FakeLLM, parse_blocks, load_config, pick_profile
+from llm import LLM, Role, FakeLLM, parse_blocks, terminated_blocks, salvageable, load_config, pick_profile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -330,3 +330,75 @@ def test_config_gives_the_thinking_role_a_repair_effort_and_a_repair_cap():
     strong = load_config(str(ROOT / "config.toml"), "openrouter")["roles"]["strong"]
     assert strong.repair_extra == {"reasoning": {"effort": "low"}} and strong.repair_cap_s == 120.0
     assert load_config(str(ROOT / "config.toml"), "openai")["roles"]["strong"].repair_extra == {}
+
+
+# --- round 14 batch 6: a timed-out stream is salvaged when its CODE block closed ---
+
+class _PartialHandler(_Handler):
+    """Streams a ===CODE=== block and then goes quiet, never sending [DONE]. With close_code the
+    block is terminated first and the stream stops inside ===TRAPS===; without it the cut lands
+    inside the code itself."""
+    requests = 0; close_code = True
+    def do_POST(self):
+        json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        with _Handler.lock:
+            _PartialHandler.requests += 1
+        self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+        pieces = ["===CODE===\n", "def add(a, b):\n    return a + b\n"]
+        pieces += ["===END===\n", "===TRAPS===\nwatch out for over"] if _PartialHandler.close_code else ["    # more to come"]
+        for piece in pieces:
+            self._sse({"model": "m", "choices": [{"delta": {"content": piece}}]})
+        time.sleep(4)   # longer than any timeout_s the tests below use
+
+@pytest.fixture
+def partial_server():
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _PartialHandler); th = threading.Thread(target=srv.serve_forever, daemon=True); th.start()
+    _PartialHandler.requests = 0; _PartialHandler.close_code = True
+    yield f"http://127.0.0.1:{srv.server_port}/v1"
+    srv.shutdown(); _PartialHandler.close_code = True
+
+def test_a_timed_out_stream_keeps_what_it_streamed(partial_server):
+    role = Role("strong", partial_server, "m", "", 100, 3, 30.0, {}, transport_retries=0,
+                price_out_per_m=10.0, stall_timeout_s=10.0)
+    llm = LLM({"strong": role})
+    before = set(threading.enumerate())
+    r = llm.chat("strong", "s", "u", timeout_s=1.0)
+    assert r.error == "timeout" and r.partial and salvageable(r)
+    assert terminated_blocks(r.text) == {"CODE"} and parse_blocks(r.text)["CODE"] == "def add(a, b):\n    return a + b"
+    rec = llm.calls[-1]
+    assert rec["timed_out"] and rec["partial"] and rec["estimated"] is True
+    # no usage chunk arrived, so the tokens are estimated from the buffer and priced from the role
+    assert rec["usage"]["completion_tokens"] == len(r.text) // 4 and rec["usage"]["cost"] > 0
+    # the abandoned request thread must not keep the process alive
+    assert all(t.daemon for t in threading.enumerate() if t not in before)
+
+def test_a_stream_cut_off_inside_the_code_block_is_not_salvageable(partial_server):
+    _PartialHandler.close_code = False
+    role = Role("strong", partial_server, "m", "", 100, 3, 30.0, {}, transport_retries=0, stall_timeout_s=10.0)
+    r = LLM({"strong": role}).chat("strong", "s", "u", timeout_s=1.0)
+    # the text arrived, but ===CODE=== never closed: what parse_blocks returns for it is truncated source
+    assert r.partial and "def add" in r.text and not salvageable(r) and terminated_blocks(r.text) == set()
+
+def test_a_non_streamed_timeout_has_nothing_to_salvage(server):
+    _Handler.delay = 2.0
+    try:
+        llm = LLM({"strong": Role("strong", server, "m", "", 100, 1, 30.0, {}, stream=False)})
+        r = llm.chat("strong", "s", "u", timeout_s=0.5)
+        assert r.error == "timeout" and not r.partial and r.text == "" and llm.calls[-1]["partial"] is False
+        assert "estimated" not in llm.calls[-1]
+        assert llm.chat("strong", "s", "u", timeout_s=10).error is None   # drain the abandoned worker
+    finally:
+        _Handler.delay = 0.3
+
+def test_an_abandoned_stream_does_not_write_into_a_later_calls_buffer(partial_server):
+    role = Role("strong", partial_server, "m", "", 100, 3, 30.0, {}, transport_retries=0, stall_timeout_s=10.0)
+    llm = LLM({"strong": role})
+    r1 = llm.chat("strong", "s", "u", timeout_s=1.0)
+    r2 = llm.chat("strong", "s", "u", timeout_s=1.0)   # r1's thread is still streaming into its own buffer
+    assert r1.partial and r2.partial and r2.text == r1.text
+
+def test_terminated_blocks_reads_the_last_occurrence_like_parse_blocks():
+    t = "===CODE===\ndraft\n===END===\n===CODE===\nfinal but cut off"
+    assert parse_blocks(t)["CODE"] == "final but cut off" and terminated_blocks(t) == set()
+    t2 = "===VERDICT===\ncandidate\n===END===\n===CODE===\nx = 1\n===END===\n===NOTES===\nhalf"
+    assert terminated_blocks(t2) == {"VERDICT", "CODE"}

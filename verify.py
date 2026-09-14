@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast, collections, difflib, os, re, time
 from dataclasses import dataclass, field
 from sandbox import CaseResult, run_python_cases, compile_rust, compile_rust_with_imports, run_rust_cases, tokens
-from llm import parse_blocks
+from llm import parse_blocks, salvageable
 
 # Prepended to every generated oracle/stress source before it runs. The oracle prompt tells the
 # model to *use* random.Random(seed) but never tells it to import anything, and one live run wrote
@@ -1249,12 +1249,19 @@ def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, 
                  code=_fmt(cand.source), agreement=agreement,
                  reference=_fmt(gi.oracle_src, 8000) if gi.oracle_src.strip() else "(no reference available)", **pv_repair)
     blocks = parse_blocks(r.text)
-    # A call that never produced an answer -- a transport error, a 4xx/5xx, a timeout, a reply with
-    # no marker block in it -- adjudicated nothing, and must not be read as one. It used to fall
-    # through to the default verdict `candidate`, which says the reference is right and the
-    # candidate is wrong: on bench16 a 403 was recorded that way on a run whose oracle was in fact
-    # the wrong side. There is no verdict here, and no child to mint.
-    if r.error or not blocks:
+    # A streamed reply the cap cut off still holds the patch when its ===CODE=== block closed --
+    # repair.md puts ===VERDICT=== before it, so both blocks survive the cut. Only the timeout is
+    # salvaged this way; a transport error or a 4xx has no text at all.
+    salvaged = salvageable(r)
+    if salvaged:
+        run.salvaged_partial = True
+        run.log("repair.partial the reply was cut off after ===CODE=== closed; using it")
+    # A call that never produced an answer -- a transport error, a 4xx/5xx, a timeout with nothing
+    # complete in it, a reply with no marker block -- adjudicated nothing, and must not be read as
+    # one. It used to fall through to the default verdict `candidate`, which says the reference is
+    # right and the candidate is wrong: on bench16 a 403 was recorded that way on a run whose oracle
+    # was in fact the wrong side. There is no verdict here, and no child to mint.
+    if (r.error and not salvaged) or not blocks:
         run.log(f"repair.error {r.error or 'no marker block in the reply'}")
         return "", "error"
     # "approach": the model says no patch of this code can meet the stated limits. Its CODE block is

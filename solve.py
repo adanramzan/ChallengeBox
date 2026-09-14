@@ -37,7 +37,7 @@ class Budget:
         return self.remaining() >= seconds
 
 
-from llm import LLM, load_config, parse_blocks, pick_profile
+from llm import LLM, load_config, parse_blocks, pick_profile, salvageable, terminated_blocks
 from sandbox import Problem, python_static, rust_static
 import verify as V
 
@@ -118,6 +118,9 @@ class Run:
         self.scale = deadline_scale
         self.cands: list[Candidate] = []
         self.events: list[str] = []
+        # Set by any path that built a candidate out of a reply cut off at its timeout, so the
+        # report's solver_status says the run's answer came from a salvaged stream.
+        self.salvaged_partial = False
         self._log_lock = threading.Lock()
         self._cost_logged = False
         os.makedirs(os.path.join(run_dir, "candidates"), exist_ok=True)
@@ -163,6 +166,18 @@ class Run:
         r = self.llm.chat(role, "You are a precise competitive-programming engineer.", render(prompt_name, **vars), timeout_s=timeout, tag=tag)
         self.log(f"{tag}.done error={r.error} latency={r.latency_s:.1f} usage={r.usage}")
         return r
+
+
+# The SOLVE prompt's blocks, in the order it asks for them. Used only to name what a reply cut off
+# at its timeout kept and what it lost; CODE is the only one the gate cannot do without.
+SOLVE_BLOCKS = ("RULES", "DESIGN", "CODE", "EXAMPLES", "TRAPS", "ALGORITHM")
+
+
+def log_salvage(run, cand_id: str, text: str) -> None:
+    term = terminated_blocks(text)
+    run.salvaged_partial = True
+    run.log(f"solve.partial cand={cand_id} salvaged_blocks={[b for b in SOLVE_BLOCKS if b in term]} "
+            f"missing={[b for b in SOLVE_BLOCKS if b not in term]}")
 
 
 def static_evidence(p: Problem, source: str) -> "V.Evidence":
@@ -237,6 +252,8 @@ def fresh_solve(run, prev_cand, failed, gi, pv) -> "Candidate | None":
     gen_cap = fresh_solve_cap(run.cfg, run.budget)
     section = V.previous_attempt_section(run.p, prev_cand, failed, gi)
     r = run.chat("strong", "solve", gen_cap, tag="solve_fresh", **{**pv, "previous_attempt": section})
+    if r.partial and not salvageable(r):
+        run.log("solve.fresh the reply was cut off before ===CODE=== closed"); return None
     blocks = parse_blocks(r.text)
     code = blocks.get("CODE", "")
     if not code.strip() or any(c.source.strip() == code.strip() for c in run.cands):
@@ -250,6 +267,8 @@ def fresh_solve(run, prev_cand, failed, gi, pv) -> "Candidate | None":
     nc.examples = V.parse_examples(run.p, ex_block) or prev_cand.examples
     nc.examples_dropped = max(0, V.example_line_count(ex_block) - len(nc.examples))
     nc.algorithm = blocks.get("ALGORITHM") or blocks.get("DESIGN", "")
+    if r.partial:
+        log_salvage(run, nc.id, r.text)
     run.log(f"solve.fresh candidate={nc.id} replaces={prev_cand.id} examples={len(nc.examples)}")
     return nc
 
@@ -283,7 +302,14 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     def build_candidate(r_solve, attempt: int) -> "Candidate | None":
         blocks = parse_blocks(r_solve.text)
         code = blocks.get("CODE", "")
-        if not code.strip() and r_solve.text.strip():
+        # A reply the call's timeout cut off mid-stream is usable only if ===CODE=== closed with its
+        # own ===END===; otherwise what parse_blocks returns for it is truncated source, and the
+        # raw-reply fallback below would write that verbatim as the solution.
+        partial = bool(r_solve.partial)
+        if partial and not salvageable(r_solve):
+            run.log(f"solve.partial attempt={attempt} discarded: the reply was cut off before ===CODE=== closed")
+            return None
+        if not code.strip() and r_solve.text.strip() and not partial:
             code = r_solve.text.strip()   # no ===CODE=== block parsed at all: fall back to the raw reply so a file is still emitted
             run.log(f"solve.no_code_block attempt={attempt} using raw reply text")
         if not code.strip():
@@ -300,6 +326,8 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         cand.examples = V.parse_examples(problem, ex_block)
         cand.examples_dropped = max(0, V.example_line_count(ex_block) - len(cand.examples))
         cand.algorithm = blocks.get("ALGORITHM") or blocks.get("DESIGN", "")
+        if partial:
+            log_salvage(run, cand.id, r_solve.text)
         run.log(f"solve.examples id={cand.id} parsed={len(cand.examples)} dropped={cand.examples_dropped}")
         return cand
 
@@ -642,7 +670,10 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     # report.json's `events` too, not just the in-memory list mutated after the file was written.
     best = best_candidate(run.cands)
     status = "no_candidate"
-    solver_status = ("candidate" if run.cands else
+    # What the SOLVE call itself produced, independent of how the gate then judged it: "partial" says
+    # the candidate came out of a reply the call's timeout cut off (see log_salvage).
+    solver_status = ("partial" if run.salvaged_partial else
+                     "candidate" if run.cands else
                      "timeout" if any(r.error == "timeout" for r in r_solves) else
                      "malformed")
     if best is not None:
@@ -668,7 +699,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         checked = any(not e.skipped for e in best.evidence if e.kind not in ("static", "compile"))
         status = ("passed_all_gates" if best.all_passed() and not skipped and checked
                   else "emitted_unverified" if best.all_passed() else "emitted_with_failures")
-        run.log(f"emit candidate={best.id} status={status}")
+        run.log(f"emit candidate={best.id} status={status} solver={solver_status}")
     report = {"problem_id": problem.problem_id, "language": problem.language, "profile": cfg.get("profile"), "deadline_s": problem.deadline_s,
               "deadline_scale": deadline_scale, "elapsed_s": round(run.budget.elapsed(), 1), "status": status,
               "solver_status": solver_status,

@@ -1274,3 +1274,59 @@ def test_the_examples_block_demands_in_contract_inputs_and_the_io_convention(tmp
     assert "`()` is not" in py and "{{io_rules}}" not in py      # the python container rule, rendered
     rust = S.render("solve", **S.prompt_vars(prob(tmp_path, "rust")))
     assert "whitespace-separated token stream" in rust.split("===EXAMPLES===")[1]
+
+
+# --- round 14 batch 6: a reply cut off at its timeout is salvaged when its CODE block closed ---
+
+class _PartialReplies(FakeLLM):
+    """Delivers the scripted text the way a streamed call abandoned at its own timeout does:
+    partial=True and error='timeout', for the tags named in `partial_tags`."""
+    def __init__(self, script, partial_tags=("solve",), cost=None):
+        super().__init__(script, cost)
+        self.partial_tags = set(partial_tags)
+
+    def chat(self, role, system, user, *, timeout_s, max_tokens=None, tag=""):
+        r = super().chat(role, system, user, timeout_s=timeout_s, max_tokens=max_tokens, tag=tag)
+        if tag in self.partial_tags:
+            self.calls[-1].update(error="timeout", timed_out=True, partial=True)
+            from llm import Reply
+            return Reply(r.content, "", r.usage, r.latency_s, r.model, "timeout", True)
+        return r
+
+# The solve prompt's order: what a cut-off reply keeps is RULES/DESIGN/CODE, what it loses is
+# EXAMPLES/TRAPS/ALGORITHM -- so diff_examples is skipped and every oracle-derived step still runs.
+SOLVE_CUT_IN_TRAPS = ("===RULES===\nr\n===END===\n===DESIGN===\nd\n===END===\n"
+                      "===CODE===\ndef add(a, b):\n    return a + b\n===END===\n"
+                      "===TRAPS===\nwatch out for over")
+SOLVE_CUT_IN_CODE = "===RULES===\nr\n===END===\n===DESIGN===\nd\n===END===\n===CODE===\ndef add(a, b):\n    ret"
+
+def test_a_timed_out_solve_with_a_complete_code_block_is_gated(tmp_path):
+    llm = _PartialReplies({"solve": [SOLVE_CUT_IN_TRAPS], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    out = tmp_path / "s.py"
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(out), run_dir=str(tmp_path / "run"))
+    assert rep["solver_status"] == "partial" and rep["final_candidate"] == "c1"
+    assert out.read_text().startswith("def add")
+    line = next(e for e in rep["events"] if "solve.partial cand=c1" in e)
+    assert "'CODE'" in line.split("salvaged_blocks=")[1].split("missing=")[0]
+    assert "'TRAPS'" in line.split("missing=")[1] and "'EXAMPLES'" in line.split("missing=")[1]
+    # the run continued normally: the oracle-derived steps really ran, only the hand trace is missing
+    ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
+    assert ev["diff_small"]["detail"]["cases"] > 0 and ev["diff_examples"]["skipped"]
+    assert any("emit candidate=c1" in e and "solver=partial" in e for e in rep["events"])
+
+def test_a_timed_out_solve_cut_off_inside_the_code_block_yields_no_candidate(tmp_path):
+    llm = _PartialReplies({"solve": [SOLVE_CUT_IN_CODE], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    out = tmp_path / "s.py"
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(out), run_dir=str(tmp_path / "run"))
+    assert rep["status"] == "no_candidate" and rep["solver_status"] == "timeout" and not out.exists()
+    assert any("cut off before ===CODE=== closed" in e for e in rep["events"])
+    # the raw-reply fallback must not fire for a truncated stream
+    assert not any("solve.no_code_block" in e for e in rep["events"])
+
+def test_a_timed_out_repair_with_a_complete_code_block_is_used(tmp_path):
+    fix = "===VERDICT===\ncandidate\n===END===\n===CODE===\ndef add(a, b):\n    return a + b\n===END===\n===NOTES===\nand th"
+    llm = _PartialReplies({"solve": [BUGGY], "repair": [fix], "oracle": [ORACLE_OK], "stress": [STRESS_OK]},
+                          partial_tags=("repair",))
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert any("repair.partial" in e for e in rep["events"]) and "c2" in rep["evidence"]
+    assert rep["repairs"] == 1 and rep["solver_status"] == "partial"
