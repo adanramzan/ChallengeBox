@@ -43,6 +43,9 @@ def test_broken_oracle_and_no_stress_emits_unverified_not_passed(tmp_path):
     evs = rep["evidence"]["c1"]
     assert all(e["passed"] for e in evs)
     assert any(e.get("skipped") for e in evs)
+    # and log.txt must say so: a skipped step logged as passed=True reads as a clean sweep
+    skipped_lines = [l for l in rep["events"] if "skipped=True reason=" in l]
+    assert skipped_lines and not any("gate.diff_small passed=True cases=0" in l for l in rep["events"])
 
 def test_degraded_stress_evidence_is_not_a_full_pass(tmp_path):
     # gen_max crashes -> stress falls back to the largest medium case and marks itself degraded.
@@ -354,6 +357,38 @@ def test_oracle_retry_does_not_fire_when_budget_cannot_afford_it(tmp_path):
     assert not any("oracle.retry" in l for l in rep["events"])
     assert len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 1
     assert "no oracle source" in rep["gate_inputs"]["notes"]
+
+class _TimedOutOracle(FakeLLM):
+    """FakeLLM whose empty oracle replies carry error='timeout', as a capped call does."""
+    def chat(self, role, system, user, *, timeout_s, max_tokens=None, tag=""):
+        r = super().chat(role, system, user, timeout_s=timeout_s, max_tokens=max_tokens, tag=tag)
+        if tag == "oracle" and not r.content.strip():
+            return type(r)("", "", r.usage, r.latency_s, r.model, "timeout")
+        return r
+
+def _with_caps(llm, cap_s=150.0):
+    llm.roles = {r: type("Role", (), {"timeout_cap_s": cap_s})() for r in ("strong", "fast")}
+    return llm
+
+def test_oracle_retry_names_timeout_as_its_reason(tmp_path):
+    llm = _with_caps(_TimedOutOracle({"solve": [SOLVE_OK], "oracle": ["", ORACLE_OK], "stress": [STRESS_OK]}))
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert any("oracle.retry reason=timeout" in l for l in rep["events"])
+    assert len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 2
+
+def test_a_timed_out_oracle_is_not_retried_without_room_for_the_cap_and_a_repair(tmp_path):
+    # usable = 185 s: enough for the no_block rule (oracle_retry_afford_s = 130) but not for a second
+    # call that will run to the fast role's 150 s cap and still leave a repair's worth of time.
+    p = Problem("pid", "python", "Return a+b for ints a,b. At most 10^18.", "add", [], 200.0)
+    timed_out = _with_caps(_TimedOutOracle({"solve": [SOLVE_OK], "oracle": [""], "stress": [STRESS_OK]}))
+    rep = S.solve(p, timed_out, cfg(), out_path=str(tmp_path / "s1.py"), run_dir=str(tmp_path / "run1"))
+    assert not any("oracle.retry" in l for l in rep["events"])
+    assert len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 1
+    # same budget, but the first call answered without an ===ORACLE=== block: that retry is cheap
+    # enough to be worth making, and it must still fire.
+    no_block = _with_caps(FakeLLM({"solve": [SOLVE_OK], "oracle": ["", ORACLE_OK], "stress": [STRESS_OK]}))
+    rep2 = S.solve(p, no_block, cfg(), out_path=str(tmp_path / "s2.py"), run_dir=str(tmp_path / "run2"))
+    assert any("oracle.retry reason=no_block" in l for l in rep2["events"])
 
 def test_all_skipped_gate_does_not_log_gate_passed(tmp_path):
     # F4.4: a run that verified nothing (broken oracle, no stress source) must not log "gate.passed" --

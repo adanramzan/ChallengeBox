@@ -210,8 +210,19 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     # still afford a call as slow as the measured worst case -- config.toml's
     # limits.oracle_retry_afford_s, not a literal, since that worst case is a function of whatever
     # model is configured for the "fast" role.
-    if not oracle_src.strip() and run.budget.can_afford(cfg["limits"]["oracle_retry_afford_s"]) and not run.over_cost():
-        run.log("oracle.retry no ===ORACLE=== block in first reply, retrying once")
+    #
+    # A first call that TIMED OUT is a different bet from one that answered without the block: the
+    # retry will run to the same cap, so it is only worth making when the budget covers that cap AND
+    # still leaves a repair's worth of time to use the oracle for something. Round 13 spent 240 s of
+    # a 285 s run on two capped oracle calls and gated nothing.
+    oracle_timed_out = r_oracle.error == "timeout"
+    if oracle_timed_out:
+        fast_cap = run.llm.roles["fast"].timeout_cap_s if hasattr(run.llm, "roles") else gen_cap
+        afford = run.budget.can_afford(fast_cap + cfg["limits"]["repair_afford_s"])
+    else:
+        afford = run.budget.can_afford(cfg["limits"]["oracle_retry_afford_s"])
+    if not oracle_src.strip() and afford and not run.over_cost():
+        run.log(f"oracle.retry reason={'timeout' if oracle_timed_out else 'no_block'}, retrying once")
         r_oracle = run.chat("fast", "oracle", gen_cap, **pv)
         oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
     stress_src = parse_blocks(r_stress.text).get("STRESS", "")

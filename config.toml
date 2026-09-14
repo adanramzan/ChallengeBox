@@ -100,7 +100,7 @@ model = "openai/gpt-5.6-luna"
 api_key_env = "OPENROUTER_API_KEY"
 max_tokens = 8000
 max_concurrent = 3
-timeout_cap_s = 150.0   # oracle writes reference+gen+validate; measured max 128s, so raised above it
+timeout_cap_s = 150.0   # oracle writes reference+gen+validate; round 13 measured 106-128s, so the cap sits above it
 extra = {}
 
 # Anthropic, through its OpenAI-compatible endpoint (which Anthropic describes as a layer for testing

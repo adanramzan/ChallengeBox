@@ -522,6 +522,14 @@ def python_import_check(source: str, entrypoint: str, gi: GateInputs, *, workdir
     failed = err.startswith("IMPORT:")
     return Evidence("compile", not failed, 0, time.monotonic() - t0, {"error": err[-1500:]} if failed else {})
 
+def _gate_line(e: Evidence, extra: str = "") -> str:
+    """One log line per gate step. A skipped step carries passed=True (nothing failed) and zero
+    cases, which read in log.txt as a step that ran and passed -- so a run that checked nothing
+    looked like a clean sweep. Say skipped, with the reason the Evidence already recorded."""
+    if e.skipped:
+        return f"gate.{e.kind} skipped=True reason={e.detail.get('skipped', 'unspecified')}"
+    return f"gate.{e.kind} passed={e.passed}" + (f" {extra}" if extra else "")
+
 def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limits: dict, log) -> list[Evidence]:
     ev: list[Evidence] = []
     binary = None
@@ -538,7 +546,7 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         if binary is None: return ev
     else:
         e = python_import_check(source, problem.entrypoint, gi, workdir=os.path.join(workdir, "compile"), timeout_s=budget.step_timeout(30.0, reserve_s=20.0), mem_mb=limits["mem_mb"])
-        ev.append(e); log(f"gate.compile passed={e.passed}")
+        ev.append(e); log(_gate_line(e))
         if not e.passed: return ev
     # Public examples (ground truth from the problem itself, not the model-written oracle) run first,
     # before any generated tier -- a candidate that fails real ground truth fails fast on the most
@@ -551,7 +559,7 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
             e.detail = {**e.detail, "oracle_disagreements": gi.public_disagreements}
         if gi.diff_degraded:
             e.detail["degraded"] = gi.diff_degraded
-        ev.append(e); log(f"gate.diff_public passed={e.passed} cases={e.cases}")
+        ev.append(e); log(_gate_line(e, f"cases={e.cases}"))
         if not e.passed: return ev
     for kind, cases in (("diff_edge", gi.regressions + gi.cases_edge), ("diff_small", gi.cases_small), ("diff_medium", gi.cases_medium)):
         e = differential(problem, source, cases, kind, workdir=os.path.join(workdir, kind), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"],
@@ -564,10 +572,10 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
             e.detail["degraded"] = f"only {e.cases} {kind[5:]} cases (min {m})"
         if gi.diff_degraded:
             e.detail["degraded"] = gi.diff_degraded
-        ev.append(e); log(f"gate.{kind} passed={e.passed} cases={e.cases}")
+        ev.append(e); log(_gate_line(e, f"cases={e.cases}"))
         if not e.passed: return ev
     e = behavior(problem, source, gi.cases_small or gi.cases_edge, workdir=os.path.join(workdir, "behavior"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"], per_case_s=limits.get("per_case_limit_s", 0.0))
-    ev.append(e); log(f"gate.behavior passed={e.passed} detail={e.detail.get('check','')}")
+    ev.append(e); log(_gate_line(e, f"detail={e.detail.get('check','')}"))
     if not e.passed: return ev
     limit = limits["stress_limit_python_s"] if problem.language == "python" else limits["stress_limit_rust_s"]
     # A hung Python stress call can itself run up to limit_s + 15s (see stress() above), so reserve
@@ -578,7 +586,7 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         e = Evidence("stress", True, 0, 0.0, {"skipped": "no budget"}, skipped=True)
     else:
         e = stress(problem, source, gi.stress_input, workdir=os.path.join(workdir, "stress"), limit_s=min(limit, avail), mem_mb=limits["mem_mb"], degraded=gi.stress_degraded)
-    ev.append(e); log(f"gate.stress passed={e.passed} duration={e.detail.get('duration_s')}")
+    ev.append(e); log(_gate_line(e, f"duration={e.detail.get('duration_s')}"))
     # Placed after stress (not before) so stress's timing measurement runs first, on a warm cache,
     # unaffected by this step; and so this step's own subprocess never masks a stress timeout.
     if problem.language == "rust":
@@ -589,7 +597,7 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
             eo = overflow_check(problem, binary, gi.stress_input, limit_s=min(limits["stress_limit_rust_s"], ov_avail), mem_mb=limits["mem_mb"])
     else:
         eo = overflow_check(problem, binary, gi.stress_input, limit_s=0.0, mem_mb=limits["mem_mb"])
-    ev.append(eo); log(f"gate.overflow passed={eo.passed} skipped={eo.skipped}")
+    ev.append(eo); log(_gate_line(eo))
     return ev
 
 def _fmt(v, limit: int = 4000) -> str:
