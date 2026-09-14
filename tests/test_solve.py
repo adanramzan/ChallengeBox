@@ -17,7 +17,10 @@ SOLVE_NO_EXAMPLES = "===RULES===\nr\n===END===\n===TRAPS===\nt\n===END===\n===AL
 EXAMPLES_BLOCK = "===EXAMPLES===\n((0, 0), 0)\n((1, 2), 3)\n((3, 4), 7)\n===END===\n"
 SOLVE_OK = SOLVE_NO_EXAMPLES + EXAMPLES_BLOCK
 ORACLE_OK = "===ORACLE===\nimport random\ndef reference(a, b):\n    return a + b\ndef gen(seed, mode):\n    r = random.Random(seed)\n    return (r.randint(0, 20), r.randint(0, 20))\n===END===\n"
-STRESS_OK = "===STRESS===\ndef gen_max(seed):\n    return (10**18, 10**18)\nEDGES = [(0, 0), (15, 0)]\n===END===\n"   # (15, 0) deterministically exposes the planted a>=15 bug used in later tests
+STRESS_OK = "===STRESS===\ndef gen_max(seed):\n    return (10**18, 10**18)\nEDGES = [(0, 0), (15, 0)]\n===END===\n"
+# oracle variants for the max-size input: gen(seed, "large") is the fallback when gen_max is unusable
+ORACLE_WITH_LARGE = ORACLE_OK.replace("def gen(seed, mode):\n", "def gen(seed, mode):\n    if mode == 'large':\n        return (10**18, 10**18)\n")
+ORACLE_NO_LARGE = ORACLE_OK.replace("def gen(seed, mode):\n", "def gen(seed, mode):\n    if mode == 'large':\n        raise ValueError('no large mode')\n")   # (15, 0) deterministically exposes the planted a>=15 bug used in later tests
 
 def test_single_shot_emits_solution_and_report(tmp_path):
     llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
@@ -56,12 +59,13 @@ def test_degraded_stress_evidence_is_not_a_full_pass(tmp_path):
     # gen_max crashes -> stress falls back to the largest medium case and marks itself degraded.
     # Every gate step still "passes", but the max-size check never really happened.
     STRESS_NO_GENMAX = "===STRESS===\ndef gen_max(seed):\n    raise RuntimeError('boom')\nEDGES = [(0, 0)]\n===END===\n"
-    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_NO_GENMAX]})
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_NO_LARGE], "stress": [STRESS_NO_GENMAX]})
     rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
     # A clean run on a not-max-size input is not evidence the candidate is fast enough, so the step
     # records itself as skipped rather than as a pass.
     assert ev["stress"]["skipped"] and ev["stress"]["detail"].get("degraded")
+    assert rep["gate_inputs"]["stress_source"] == "medium_degraded"
     assert rep["status"] == "emitted_unverified"
 
 def test_static_failure_repair_reaches_cap_and_emits_best(tmp_path):
@@ -309,7 +313,10 @@ def test_bench_marks_skipped_gates_as_skip_not_pass(tmp_path):
     row = rows[0]
     assert row["compiles"] == "pass"
     assert row["edge"] == "skip" and row["small"] == "skip" and row["medium"] == "skip"
-    assert row["behavior"] == "skip" and row["stress"] == "skip"
+    # The stress input now falls back to the oracle's gen(seed, "large"), which answers here even
+    # though its reference() is dead -- but with no tier to compare its size against, nothing
+    # confirms it is max-size, so the cell says "degraded". Either way, never "pass".
+    assert row["behavior"] == "skip" and row["stress"] == "degraded"
 
 def test_bench_shows_unknown_total_cost_when_no_cost_data(tmp_path):
     sd = tmp_path / "samples"; sd.mkdir()
@@ -860,6 +867,18 @@ def test_a_failing_candidate_is_still_timed_and_repaired_from_the_first_failure(
     assert ev["diff_small"]["cases"] and ev["stress"]["cases"] == 1   # neither suppressed by the failures above
     prompt = next(u for r, s_, u in llm.prompts if "Failure kind" in u)
     assert "Failure kind: diff_examples" in prompt
+
+
+def test_a_broken_gen_max_is_replaced_by_the_oracles_large_mode(tmp_path):
+    # gen_max failed or was rejected in nine of ten round-10 runs; the oracle's own "large" mode is
+    # a second, independent max-size input, so the timing check still happens for real.
+    STRESS_NO_GENMAX = "===STRESS===\ndef gen_max(seed):\n    raise RuntimeError('boom')\nEDGES = [(0, 0)]\n===END===\n"
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_WITH_LARGE], "stress": [STRESS_NO_GENMAX]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
+    assert rep["gate_inputs"]["stress_source"] == "gen_large" and not rep["gate_inputs"]["stress_degraded"]
+    assert ev["stress"]["passed"] and not ev["stress"]["skipped"] and "degraded" not in ev["stress"]["detail"]
+    assert rep["status"] == "passed_all_gates"
 
 
 # --- round 13: validate() is "reference() did not raise ValueError" ---

@@ -51,6 +51,7 @@ class GateInputs:
     public_disagreements: list = field(default_factory=list)   # reference() vs a public example: evidence the ORACLE is wrong
     stress_input: object = None
     stress_degraded: bool = False
+    stress_source: str = ""   # gen_max | gen_large | medium_degraded -- which generator produced the timing input
     validate_trusted: bool = False   # the oracle's validate() accepted at least one generated input and was not distrusted
     validate_reject_frac: float = 0.0   # rejected/checked over small+medium: how far the oracle's validate() and gen() disagree
     validate_rejects: dict = field(default_factory=dict)   # tier -> (checked, rejected, up to two rejected inputs), for the self-repair prompt
@@ -64,8 +65,9 @@ class GateInputs:
     regen_failed: bool = False
     def summary(self) -> dict:
         return {"small": len(self.cases_small), "medium": len(self.cases_medium), "edge": len(self.cases_edge),
-                "public": len(self.cases_public), "stress": self.stress_input is not None, "notes": self.notes,
-                "example_checks": self.example_checks}
+                "public": len(self.cases_public), "stress": self.stress_input is not None,
+                "stress_source": self.stress_source, "stress_degraded": self.stress_degraded,
+                "notes": self.notes, "example_checks": self.example_checks}
 
 @dataclass
 class Case:
@@ -484,6 +486,28 @@ def dispute_extra(gi: GateInputs, failed: Evidence) -> str:
             "Re-derive the expected output from the statement alone, sentence by sentence, before writing the new reference.\n"
             + _examples_paragraph(gi))
 
+def _input_size(v) -> int:
+    """Bytes of one gate input, for the log line -- generic over a Python argument tuple and a Rust
+    stdin string without knowing the problem's shape."""
+    return len((v if isinstance(v, str) else repr(v)).encode("utf-8", "replace"))
+
+def _accept_stress_input(problem, gi: GateInputs, oracle_src: str, value, source: str, *, workdir: str, budget) -> bool:
+    """Take `value` as the max-size stress input unless the oracle's own validate() rejects it.
+
+    The stress input is the one gate input no tier validated: an invalid max-size input makes the
+    stress step meaningless -- the candidate crashes or answers nonsense on something the statement
+    forbids, and a repair attempt gets spent chasing it."""
+    value = _clean_stdin(problem, value)
+    verdicts = None
+    if gi.validate_trusted:
+        verdicts, _ = _validate_inputs(problem, oracle_src, [value], workdir=os.path.join(workdir, f"{source}_validate"),
+                                       timeout_s=budget.step_timeout(20.0, reserve_s=20.0))
+    if verdicts and verdicts[0] is False:   # None = validate crashed/timed out on it: keep the input
+        gi.notes.append(f"{source} output rejected by validate(); not used")
+        return False
+    gi.stress_input, gi.stress_source = value, source
+    return True
+
 def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict, *, workdir: str, budget, log, examples: dict | None = None) -> GateInputs:
     gi = GateInputs(oracle_src=oracle_src)
     gi.cases_public, parse_notes = _parse_public_examples(problem)
@@ -529,35 +553,43 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
             _log_and_note_validation(gi, ev, "edge", log)
         mx = run_python_cases(stress_src, "gen_max", [(1,)], workdir=os.path.join(workdir, "genmax"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         if mx and mx[0].ok:
-            candidate_input = _clean_stdin(problem, mx[0].output)
-            # The stress input is the one gate input that never went through validate(). An invalid
-            # max-size input makes the stress step meaningless: the candidate crashes or answers
-            # nonsense on something the statement forbids, and repair attempts get spent chasing it.
-            verdicts = None
-            if gi.validate_trusted:
-                verdicts, _ = _validate_inputs(problem, oracle_src, [candidate_input], workdir=os.path.join(workdir, "genmax_validate"),
-                                               timeout_s=budget.step_timeout(20.0, reserve_s=20.0))
-            if verdicts and verdicts[0] is False:   # None = validate crashed/timed out on it: keep the input
-                gi.notes.append("gen_max output rejected by validate(); not used")
-            else:
-                gi.stress_input = candidate_input
+            _accept_stress_input(problem, gi, oracle_src, mx[0].output, "gen_max", workdir=workdir, budget=budget)
         else:
             gi.notes.append("gen_max failed: " + (mx[0].error[-200:] if mx else ""))
-        if gi.stress_input is None and gi.cases_medium:
-            # gen_max is the only source of a real stress input; rather than ship a correct-but-slow
-            # solution with the timing check silently skipped, fall back to the largest medium case.
-            # "Largest" by len(str(...)): generic across a Python argument tuple (str() of the tuple
-            # scales with its total content) and a Rust stdin string (str() is the string itself), so
-            # the same one-line measure works for both without knowing the problem's shape. This is
-            # NOT a true maximum-size input -- medium is capped far below gen_max's target scale -- so
-            # it's marked degraded and stress()'s evidence records that, so the timing it produces is
-            # never mistaken for a real max-size check.
-            biggest = max(gi.cases_medium, key=lambda c: len(str(c.input)))
-            gi.stress_input = _clean_stdin(problem, biggest.input)
-            gi.stress_degraded = True
-            gi.notes.append("stress input degraded: no usable gen_max output, using largest medium case instead (not a true max-size input)")
     else:
         gi.notes.append("no stress source")
+    # gen_max failed or was rejected in nine of ten round-10 runs, and it is the STRESS author's only
+    # product: with it gone the timing check had nothing to run on. The oracle writes a generator from
+    # the same statement, in its own context, so its "large" mode is a second, independent source of a
+    # real maximum-size input -- tried before falling back to a medium case, which is not one.
+    if gi.stress_input is None and oracle_src.strip():
+        lg = run_python_cases(oracle_src, "gen", [(1, "large")], workdir=os.path.join(workdir, "gen_large"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
+        if not (lg and lg[0].ok):
+            gi.notes.append("gen(large) failed: " + ((lg[0].error[-200:] if lg else "") or "no output"))
+        elif _accept_stress_input(problem, gi, oracle_src, lg[0].output, "gen_large", workdir=workdir, budget=budget):
+            # An oracle whose gen() ignores its mode argument answers "large" with a small input, and
+            # timing a candidate on a small input is not a timing check. To count as max-size it has
+            # to be bigger than the tiers it is standing in for.
+            biggest = max((len(str(c.input)) for c in gi.cases_medium + gi.cases_small), default=0)
+            if not biggest or len(str(gi.stress_input)) <= biggest:   # no tier to compare against = no way to confirm it is large
+                gi.stress_degraded = True
+                gi.notes.append("stress input degraded: gen(large) returned an input no larger than the generated tiers (not a true max-size input)")
+    if gi.stress_input is None and gi.cases_medium:
+        # Neither generator produced a max-size input; rather than ship a correct-but-slow solution
+        # with the timing check silently skipped, fall back to the largest medium case. "Largest" by
+        # len(str(...)): generic across a Python argument tuple (str() of the tuple scales with its
+        # total content) and a Rust stdin string (str() is the string itself), so the same one-line
+        # measure works for both without knowing the problem's shape. This is NOT a true maximum-size
+        # input -- medium is capped far below gen_max's target scale -- so it's marked degraded and
+        # stress()'s evidence records that, so the timing it produces is never mistaken for a real
+        # max-size check.
+        biggest = max(gi.cases_medium, key=lambda c: len(str(c.input)))
+        gi.stress_input = _clean_stdin(problem, biggest.input)
+        gi.stress_degraded = True
+        gi.stress_source = "medium_degraded"
+        gi.notes.append("stress input degraded: no usable gen_max or gen(large) output, using largest medium case instead (not a true max-size input)")
+    if gi.stress_input is not None:
+        log(f"stress.input source={gi.stress_source} size={_input_size(gi.stress_input)}")
     # How far the oracle's own validate() and gen() disagree about the statement's preconditions.
     # Edge counts are recorded above but deliberately excluded here: those inputs come from the
     # independent STRESS author, so they are corroboration, not evidence about this oracle's gen().
@@ -888,7 +920,13 @@ def regenerate_oracle(run, gi: GateInputs, extra: str, pv: dict, *, counter: str
         return gi
     examples = {c.id: getattr(c, "examples", []) for c in run.cands if getattr(c, "examples", None)}
     new = prepare_gate_inputs(run.p, src, "", run.cfg["limits"], workdir=os.path.join(run.dir, workdir_tag), budget=run.budget, log=run.log, examples=examples)
-    new.stress_input, new.cases_edge, new.regressions = gi.stress_input, gi.cases_edge, []
+    new.cases_edge, new.regressions = gi.cases_edge, []
+    # Keep the stress input the run already had -- it came from the independent STRESS call and the
+    # statement has not changed. The exception is a degraded one: the replacement oracle's own
+    # gen(large) is a real max-size input and beats the largest medium case. `stress_degraded` used
+    # to be left behind here, which silently turned a degraded timing run back into a full pass.
+    if gi.stress_input is not None and (not gi.stress_degraded or new.stress_input is None):
+        new.stress_input, new.stress_degraded, new.stress_source = gi.stress_input, gi.stress_degraded, gi.stress_source
     new.oracle_regens, new.oracle_selfrepairs = gi.oracle_regens, gi.oracle_selfrepairs
     setattr(new, counter, getattr(new, counter) + 1)
     new.regen_failed = False

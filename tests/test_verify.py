@@ -349,12 +349,36 @@ def test_rust_stdin_fixtures_are_dedented_before_reaching_the_gate(tmp_path):
     assert gi.cases_edge and gi.cases_edge[0].input == "1\n41\n1"   # not "1\n    41\n    1"
     assert gi.stress_input == "1\n41\n1"
 
-def test_gen_max_failure_falls_back_to_largest_medium_case(tmp_path):
-    # F2: gen_max failing must not silently disable the stress gate when a medium case exists --
-    # fall back to the biggest one, degraded rather than skipped.
-    stress_bad_genmax = "def gen_max(seed):\n    raise RuntimeError('boom')\nEDGES = [(0, 0)]\n"
+BAD_GENMAX = "def gen_max(seed):\n    raise RuntimeError('boom')\nEDGES = [(0, 0)]\n"
+# the oracle's third gen mode: one input at full scale, used for timing only
+ORACLE_WITH_LARGE = ORACLE.replace("def gen(seed, mode):\n", "def gen(seed, mode):\n    if mode == 'large':\n        return (10**18, 10**18)\n")
+ORACLE_NO_LARGE = ORACLE.replace("def gen(seed, mode):\n", "def gen(seed, mode):\n    if mode == 'large':\n        raise ValueError('no large mode')\n")
+
+def test_gen_max_failure_falls_back_to_the_oracles_large_mode(tmp_path):
+    # round-10 L2: gen_max failed or was rejected in nine of ten runs and it was the only source of a
+    # max-size input. The oracle wrote its generator from the same statement in its own context, so
+    # its "large" mode is a second, independent source -- and a real one, not a degraded stand-in.
     limits = {"cases_small": 3, "cases_medium": 3, "mem_mb": 2048}
-    gi = V.prepare_gate_inputs(PY, ORACLE, stress_bad_genmax, limits, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+    logs = []
+    gi = V.prepare_gate_inputs(PY, ORACLE_WITH_LARGE, BAD_GENMAX, limits, workdir=str(tmp_path), budget=FakeBudget(), log=logs.append)
+    assert gi.stress_input == (10**18, 10**18) and gi.stress_source == "gen_large" and gi.stress_degraded is False
+    assert any(l.startswith("stress.input source=gen_large size=") for l in logs)
+
+def test_a_large_mode_that_is_not_actually_large_is_degraded(tmp_path):
+    # An oracle whose gen() ignores its mode argument answers "large" with a small input; timing a
+    # candidate on that is not a timing check.
+    limits = {"cases_small": 3, "cases_medium": 3, "mem_mb": 2048}
+    ignores_mode = ORACLE.replace("hi = 20 if mode == 'small' else 10**5", "hi = 20")
+    gi = V.prepare_gate_inputs(PY, ignores_mode, BAD_GENMAX, limits, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+    assert gi.stress_input is not None and gi.stress_degraded is True
+
+def test_gen_max_failure_falls_back_to_largest_medium_case(tmp_path):
+    # F2: with neither generator usable, the stress gate must not be silently disabled when a medium
+    # case exists -- fall back to the biggest one, degraded rather than skipped.
+    stress_bad_genmax = BAD_GENMAX
+    limits = {"cases_small": 3, "cases_medium": 3, "mem_mb": 2048}
+    gi = V.prepare_gate_inputs(PY, ORACLE_NO_LARGE, stress_bad_genmax, limits, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+    assert gi.stress_source == "medium_degraded"
     assert gi.cases_medium   # sanity: the fallback pool actually exists
     biggest = max(gi.cases_medium, key=lambda c: len(str(c.input)))
     assert gi.stress_input == biggest.input
@@ -365,9 +389,9 @@ def test_gen_max_failure_falls_back_to_largest_medium_case(tmp_path):
 
 def test_gen_max_failure_with_no_medium_cases_still_skips(tmp_path):
     # The old behavior (skip, not degrade) must be preserved when there's no fallback pool at all.
-    stress_bad_genmax = "def gen_max(seed):\n    raise RuntimeError('boom')\nEDGES = [(0, 0)]\n"
+    stress_bad_genmax = BAD_GENMAX
     limits = {"cases_small": 0, "cases_medium": 0, "mem_mb": 2048}
-    gi = V.prepare_gate_inputs(PY, ORACLE, stress_bad_genmax, limits, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+    gi = V.prepare_gate_inputs(PY, ORACLE_NO_LARGE, stress_bad_genmax, limits, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
     assert gi.stress_input is None and gi.stress_degraded is False
     ev = V.stress(PY, GOOD, gi.stress_input, workdir=str(tmp_path / "s"), limit_s=5.0, mem_mb=2048, degraded=gi.stress_degraded)
     assert ev.skipped
