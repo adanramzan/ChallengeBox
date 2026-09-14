@@ -36,7 +36,7 @@ solve_reserve_s = 45.0
 # sum(). With a thinking model in the strong role a solve measures 150-200s, which is most of the
 # deadline, so the second attempt is not free any more -- it leaves no room for the repair loop,
 # and bench16 lost a run to a one-line boundary bug that a repair could have fixed. One attempt
-# plus a repair at low effort (see repair_extra on the strong role) is the better trade at this
+# plus a repair at low effort (see tag_extra on the strong role) is the better trade at this
 # latency, and it halves the per-problem cost.
 # Raise it back to 2 when the ORACLE is the suspect rather than the solution: two independently
 # sampled candidates that produce the SAME answer against the reference are a dispute that
@@ -145,6 +145,19 @@ generate_call_share = 0.70
 # so raising/lowering it does not silently get overridden by a hardcoded fraction (see F6).
 repair_call_share = 0.25
 
+# Which model role each PROMPT is sent to. Defaults (this table absent) are solve/repair -> strong,
+# oracle/stress -> fast; solve.PROMPT_ROLES holds them. The STRESS call is mapped to the strong role
+# here because it was the primary cause in three of three Opus-era runs of one focus problem (an
+# input nested 3333x over the stated cap, a 7-operation input whose first operation was invalid,
+# twice, and eight mis-shaped EDGES), and it is the one generation call that is OFF the critical
+# path: preparation overlaps the solve call, so a slower, better author costs no wall time. It runs
+# at the cheaper effort the strong role's tag_extra selects, and its cap stays the generate share.
+[roles]
+solve = "strong"
+oracle = "fast"
+stress = "strong"
+repair = "strong"
+
 # Any OpenAI-compatible endpoint can be added as another [profiles.<name>.<role>] table.
 # A THINKING model in the strong role. Rounds 10-14 settle what the cheap coder model cannot do:
 # qwen3-coder read the semantics of 5cb294c18288 correctly in round 14 -- c4 matched an independent
@@ -174,10 +187,13 @@ price_in_per_m = 5.0
 price_out_per_m = 25.0  # OpenRouter reports usage.cost and the client prefers it; these are the fallback
 omit_temperature = true  # Claude 5 takes no sampling temperature once thinking is on (same reason as [profiles.anthropic.strong])
 extra = { reasoning = { effort = "medium" } }
-# After the gate the deadline is measured in tens of seconds, not hundreds, so the two post-gate
-# calls think at low effort instead. At medium effort a solve call measured 150-200s; a repair at
-# low effort is expected to be about half that, which is what repair_cap_s below is set against.
-repair_extra = { reasoning = { effort = "low" } }
+# Per-tag overrides merged over `extra`, one entry per prompt tag. After the gate the deadline is
+# measured in tens of seconds, not hundreds, so the two post-gate calls (repair, solve_fresh) think
+# at low effort instead: at medium effort a solve call measured 150-200s, and a repair at low effort
+# is expected to be about half that, which is what repair_cap_s below is set against. The stress call
+# is here for the opposite reason -- it is a long call that costs no wall time (it overlaps the
+# solve), so it buys this model's reading of the statement at the cheapest effort that gets it.
+tag_extra = { stress = { reasoning = { effort = "low" } }, repair = { reasoning = { effort = "low" } }, solve_fresh = { reasoning = { effort = "low" } } }
 # Floor for the repair/fresh-solve call cap (verify.repair_cap takes the larger of this and
 # [phases] repair_call_share * usable). The fraction alone is 0.25 * 285 = 71s, tuned when the
 # strong role was a 12-17s non-reasoning coder model; against this role it is a guaranteed timeout,

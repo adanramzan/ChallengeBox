@@ -1211,6 +1211,7 @@ def test_repair_cap_takes_the_larger_of_the_phase_share_and_the_role_floor(tmp_p
         llm = _LLM()
         cfg = {"phases": {"repair_call_share": 0.25}}
         budget = S.Budget(300.0, margin_s=15.0, phases={})
+        role = S.Run.role
     assert S.V.repair_cap(_Run()) == 120.0            # 0.25 * 285 = 71 s, far below the role's own latency
     _Run.cfg = {"phases": {"repair_call_share": 0.6}}
     assert S.V.repair_cap(_Run()) == pytest.approx(171.0)
@@ -1409,3 +1410,20 @@ def test_a_varied_tier_triggers_no_weak_regeneration(tmp_path):
     rep = S.solve(prob(tmp_path), llm, cfg_weak(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert rep["oracle_selfrepaired"] == 0 and rep["gate_inputs"]["weak_tiers"] == {}
     assert rep["status"] == "passed_all_gates"
+
+
+# --- round 14 batch 7: which model role each prompt goes to is config ---
+
+def test_the_prompt_to_role_mapping_is_honoured_per_tag(tmp_path):
+    c = cfg(); c["prompt_roles"] = {"solve": "strong", "oracle": "fast", "stress": "strong", "repair": "strong"}
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    by_tag = {call["tag"]: call["role"] for call in rep["calls"]}
+    assert by_tag == {"solve": "strong", "oracle": "fast", "stress": "strong"}
+    assert any("stress.sent role=strong" in e for e in rep["events"])
+
+def test_without_the_mapping_every_prompt_goes_where_it_always_did(tmp_path):
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert {call["tag"]: call["role"] for call in rep["calls"]} == {"solve": "strong", "oracle": "fast", "stress": "fast"}
+    assert S.PROMPT_ROLES == {"solve": "strong", "oracle": "fast", "stress": "fast", "repair": "strong"}

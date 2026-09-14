@@ -1409,14 +1409,14 @@ def _agreement_note(run, cand, failed: Evidence, gi: GateInputs, detail: dict) -
 
 def repair_cap(run) -> float:
     """The wall cap for one repair or fresh-solve call: the larger of the phase fraction
-    ([phases] repair_call_share, which is tuned to the DEADLINE) and the strong role's own
+    ([phases] repair_call_share, which is tuned to the DEADLINE) and the repair role's own
     repair_cap_s (which is tuned to the MODEL). Both are needed: the fraction alone gave bench16 a
     67 s cap against a role whose completed solve that run took 168 s, so the repair could only time
     out; a fixed floor alone would ignore a shorter deadline. solve() uses the same number to decide
     whether a repair can be afforded at all, so the call is never started against a cap the budget
     cannot cover."""
     roles = getattr(run.llm, "roles", None) or {}
-    floor = float(getattr(roles.get("strong"), "repair_cap_s", 0.0) or 0.0)
+    floor = float(getattr(roles.get(run.role("repair")), "repair_cap_s", 0.0) or 0.0)
     return max(run.cfg["phases"]["repair_call_share"] * run.budget.usable_s, floor)
 
 def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, str]:
@@ -1446,7 +1446,7 @@ def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, 
     # what goes wrong when a phase cap is hardcoded instead (raising the config knob then does
     # nothing because the hardcoded fraction still wins the min() in Run.chat/step_timeout).
     cap = repair_cap(run)
-    r = run.chat("strong", "repair", cap, kind=failed.kind, expected_source=expected_source(failed.kind),
+    r = run.chat(run.role("repair"), "repair", cap, kind=failed.kind, expected_source=expected_source(failed.kind),
                  input=_fmt_typed(detail.get("input")), expected=_fmt_typed(detail.get("expected")),
                  actual=_fmt_typed(detail.get("actual")), details=_fmt({k: v for k, v in detail.items() if k not in ("input", "expected", "actual")}),
                  code=_fmt(cand.source), agreement=agreement,
@@ -1498,7 +1498,7 @@ def regenerate_oracle(run, gi: GateInputs, extra: str, pv: dict, *, counter: str
     # smaller hardcoded fraction that clips before the oracle's measured latency (min 38s / median 73s
     # / max 128s). step_timeout (inside run.chat) still caps this to whatever budget remains.
     gen_cap = run.cfg["phases"]["generate_call_share"] * run.budget.usable_s
-    r = run.chat("fast", "oracle", gen_cap, **{**pv, "statement": pv["statement"] + extra})
+    r = run.chat(run.role("oracle"), "oracle", gen_cap, **{**pv, "statement": pv["statement"] + extra})
     src = parse_blocks(r.text).get("ORACLE", "")
     if not src.strip():
         run.log(f"oracle.{label} failed: empty")

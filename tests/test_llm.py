@@ -308,28 +308,40 @@ def test_a_stall_that_exhausts_retries_returns_an_error_inside_the_call_timeout(
     assert time.monotonic() - t0 < 20.0 and not reply.text
 
 
-def test_repair_extra_is_sent_only_for_the_post_gate_tags(server):
-    # A thinking model cannot finish a repair at the effort its first solve used, so the two
-    # post-gate calls get their own extra. Which knob that is stays in config; llm.py only knows
-    # which tags take it.
+def test_tag_extra_reaches_the_request_body_only_for_the_mapped_tag(server):
+    # A thinking model cannot finish a repair at the effort its first solve used, and the stress call
+    # can afford a cheaper one because it is off the critical path. Which knob that is stays in
+    # config; llm.py only knows that a tag may carry its own extra.
     role = Role("strong", server, "m", "", 100, 1, 30.0, {"reasoning": {"effort": "medium"}},
-                repair_extra={"reasoning": {"effort": "low"}})
+                tag_extra={"repair": {"reasoning": {"effort": "low"}},
+                           "solve_fresh": {"reasoning": {"effort": "low"}},
+                           "stress": {"reasoning": {"effort": "minimal"}}})
     llm = LLM({"strong": role})
     llm.chat("strong", "s", "u", timeout_s=10, tag="solve")
-    assert _Handler.last_body["reasoning"] == {"effort": "medium"}
+    assert _Handler.last_body["reasoning"] == {"effort": "medium"}   # unmapped tag: the role's own extra
     llm.chat("strong", "s", "u", timeout_s=10, tag="repair")
     assert _Handler.last_body["reasoning"] == {"effort": "low"}
     llm.chat("strong", "s", "u", timeout_s=10, tag="solve_fresh")
     assert _Handler.last_body["reasoning"] == {"effort": "low"}
-    # a role that sets no repair_extra sends exactly what it always sent
+    llm.chat("strong", "s", "u", timeout_s=10, tag="stress")
+    assert _Handler.last_body["reasoning"] == {"effort": "minimal"}
+    # a role that sets no tag_extra at all sends exactly what it always sent
     plain = LLM({"strong": Role("strong", server, "m", "", 100, 1, 30.0, {"reasoning": {"effort": "medium"}})})
     plain.chat("strong", "s", "u", timeout_s=10, tag="repair")
     assert _Handler.last_body["reasoning"] == {"effort": "medium"}
 
-def test_config_gives_the_thinking_role_a_repair_effort_and_a_repair_cap():
+def test_config_gives_the_thinking_role_per_tag_efforts_and_a_repair_cap():
     strong = load_config(str(ROOT / "config.toml"), "openrouter")["roles"]["strong"]
-    assert strong.repair_extra == {"reasoning": {"effort": "low"}} and strong.repair_cap_s == 120.0
-    assert load_config(str(ROOT / "config.toml"), "openai")["roles"]["strong"].repair_extra == {}
+    assert strong.tag_extra == {"stress": {"reasoning": {"effort": "low"}},
+                                "repair": {"reasoning": {"effort": "low"}},
+                                "solve_fresh": {"reasoning": {"effort": "low"}}}
+    assert strong.repair_cap_s == 120.0
+    assert load_config(str(ROOT / "config.toml"), "openai")["roles"]["strong"].tag_extra == {}
+
+def test_config_carries_the_prompt_to_role_mapping():
+    cfg = load_config(str(ROOT / "config.toml"), "openrouter")
+    assert cfg["prompt_roles"] == {"solve": "strong", "oracle": "fast", "stress": "strong", "repair": "strong"}
+    assert set(cfg["prompt_roles"].values()) <= set(cfg["roles"])   # every mapped role exists in the profile
 
 
 # --- round 14 batch 6: a timed-out stream is salvaged when its CODE block closed ---

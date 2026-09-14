@@ -34,13 +34,14 @@ class Role:
     # stream sets stream = false in its role config; no branch on provider name goes in this module.
     stream: bool = True
     stall_timeout_s: float = 30.0
-    # Merged over `extra` for the calls in REPAIR_TAGS -- a repair and a fresh solve, the two calls
-    # that happen after the gate, when what is left of the deadline is measured in tens of seconds
-    # rather than hundreds. A thinking model at the effort its first solve used cannot finish one:
-    # bench16 gave a repair 67 s against a role whose completed call that run took 168 s, and the
-    # repair timed out having produced nothing. Which effort knob to turn down is the provider's
-    # business and stays in config; llm.py only knows which of the two extras a tag gets.
-    repair_extra: dict = field(default_factory=dict)
+    # {tag: extra} merged over `extra` for that tag's request only. Two uses so far, both about
+    # effort: the post-gate calls (`repair`, `solve_fresh`), where what is left of the deadline is
+    # measured in tens of seconds rather than hundreds and a thinking model at its solve-time effort
+    # cannot finish one (bench16 gave a repair 67 s against a role whose completed call that run took
+    # 168 s); and `stress`, which is off the critical path and can take a slower, better author at a
+    # cheaper effort. Which knob to turn is the provider's business and stays in config; llm.py only
+    # knows that a tag may carry its own extra.
+    tag_extra: dict = field(default_factory=dict)
     # Floor for the repair/fresh-solve call cap in seconds (see verify.repair_cap): the phase
     # fraction alone is tuned to the deadline, not to the model, and for a thinking model it is far
     # below the call's measured latency. 0 keeps the fraction as the only rule.
@@ -75,9 +76,12 @@ def load_config(path: str, profile: str) -> dict:
                         int(r.get("transport_retries", 2)), float(r.get("transport_backoff_s", 2.0)),
                         r.get("token_param", "max_tokens"), bool(r.get("omit_temperature", False)), float(r.get("price_in_per_m", 0.0)), float(r.get("price_out_per_m", 0.0)),
                         bool(r.get("stream", True)), float(r.get("stall_timeout_s", 30.0)),
-                        dict(r.get("repair_extra", {})), float(r.get("repair_cap_s", 0.0)))
+                        dict(r.get("tag_extra", {})), float(r.get("repair_cap_s", 0.0)))
              for name, r in prof.items()}
-    return {"roles": roles, "limits": cfg["limits"], "phases": cfg["phases"], "profile": profile}
+    # `roles` is the per-role model config above; `prompt_roles` is the [roles] table -- which model
+    # role each PROMPT is sent to (solve.PROMPT_ROLES holds the defaults when it is absent). Two
+    # different things with one natural name; the return keys are what keeps them apart.
+    return {"roles": roles, "prompt_roles": dict(cfg.get("roles", {})), "limits": cfg["limits"], "phases": cfg["phases"], "profile": profile}
 
 
 def pick_profile(path: str) -> str:
@@ -146,11 +150,6 @@ def _fill_cost(usage: dict, r: Role) -> dict:
     return usage
 
 
-# The tags whose request body gets Role.repair_extra merged over Role.extra. Both are calls made
-# after the gate, against whatever is left of the deadline.
-REPAIR_TAGS = ("repair", "solve_fresh")
-
-
 class LLM:
     def __init__(self, roles: dict[str, Role]):
         self.roles = roles
@@ -166,7 +165,7 @@ class LLM:
     def chat(self, role: str, system: str, user: str, *, timeout_s: float, max_tokens: int | None = None, tag: str = "") -> Reply:
         r = self.roles[role]
         limit = max_tokens or r.max_tokens
-        extra = {**r.extra, **r.repair_extra} if tag in REPAIR_TAGS and r.repair_extra else r.extra
+        extra = {**r.extra, **r.tag_extra[tag]} if tag in r.tag_extra else r.extra
         body = {"model": r.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 r.token_param: limit, "temperature": 0.2, "stream": r.stream,
                 **({"stream_options": {"include_usage": True}} if r.stream else {}), **extra}

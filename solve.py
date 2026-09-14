@@ -110,6 +110,12 @@ def prompt_vars(p: Problem) -> dict:
             "previous_attempt": ""}
 
 
+# Which model role each prompt goes to when config.toml carries no [roles] table. Not a fallback
+# for a missing entry only -- it is the whole mapping for an older config, and it is the mapping the
+# system was tuned on before the table existed.
+PROMPT_ROLES = {"solve": "strong", "oracle": "fast", "stress": "fast", "repair": "strong"}
+
+
 class Run:
     """Per-problem state: budget, log, candidates, artifacts."""
     def __init__(self, problem: Problem, llm, cfg: dict, run_dir: str, deadline_scale: float, clock):
@@ -155,11 +161,16 @@ class Run:
         self.log(f"candidate.added id={c.id} parent={parent}")
         return c
 
+    def role(self, prompt_name: str) -> str:
+        """Which model role a prompt is sent to. Pure config: config.toml's [roles] table, with
+        PROMPT_ROLES as the mapping a config that does not carry the table gets."""
+        return (self.cfg.get("prompt_roles") or {}).get(prompt_name, PROMPT_ROLES.get(prompt_name, "strong"))
+
     def chat(self, role: str, prompt_name: str, cap_s: float, *, tag: str | None = None, **vars):
         # `tag` defaults to the prompt name and is overridden only where the same prompt is sent for
-        # a different purpose -- a fresh solve, which is a post-gate call and takes the role's
-        # repair_extra (llm.REPAIR_TAGS). It is what the log line, report.json's `calls` and the
-        # FakeLLM script are keyed on, so the two are distinguishable everywhere.
+        # a different purpose -- a fresh solve, which is a post-gate call and takes its own entry in
+        # the role's tag_extra. It is what the log line, report.json's `calls` and the FakeLLM script
+        # are keyed on, so the two are distinguishable everywhere.
         tag = tag or prompt_name
         timeout = self.budget.step_timeout(min(cap_s, self.llm.roles[role].timeout_cap_s if hasattr(self.llm, "roles") else cap_s), reserve_s=10.0)
         self.log(f"{tag}.sent role={role} timeout={timeout:.0f}")
@@ -265,7 +276,7 @@ def fresh_solve(run, prev_cand, failed, gi, pv) -> "Candidate | None":
     of anything -- and competes for emission through candidate_score like any other."""
     gen_cap = fresh_solve_cap(run.cfg, run.budget)
     section = V.previous_attempt_section(run.p, prev_cand, failed, gi)
-    r = run.chat("strong", "solve", gen_cap, tag="solve_fresh", **{**pv, "previous_attempt": section})
+    r = run.chat(run.role("solve"), "solve", gen_cap, tag="solve_fresh", **{**pv, "previous_attempt": section})
     if r.partial and not salvageable(r):
         run.log("solve.fresh the reply was cut off before ===CODE=== closed"); return None
     blocks = parse_blocks(r.text)
@@ -469,9 +480,9 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         # ceiling is the budget minus what a gate pass and emission need (solve_call_cap), while the
         # measuring calls keep generate_call_share.
         gen_cap = cfg["phases"]["generate_call_share"] * run.budget.usable_s
-        f_solves = [ex.submit(run.chat, "strong", "solve", solve_call_cap(cfg, run.budget), **pv) for _ in range(attempts)]
-        f_oracle = ex.submit(run.chat, "fast", "oracle", gen_cap, **pv)
-        f_stress = ex.submit(run.chat, "fast", "stress", gen_cap, **pv)
+        f_solves = [ex.submit(run.chat, run.role("solve"), "solve", solve_call_cap(cfg, run.budget), **pv) for _ in range(attempts)]
+        f_oracle = ex.submit(run.chat, run.role("oracle"), "oracle", gen_cap, **pv)
+        f_stress = ex.submit(run.chat, run.role("stress"), "stress", gen_cap, **pv)
         # The ORACLE reply is waited for FIRST and its preparation starts immediately, while the
         # solve and stress calls are still in flight. Preparation is subprocess-bound work that needs
         # nothing from either of them: on bench14 the oracle landed at 30 s, stress at 51 s, and prep
@@ -493,13 +504,13 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         # a 285 s run on two capped oracle calls and gated nothing.
         oracle_timed_out = r_oracle.error == "timeout"
         if oracle_timed_out:
-            fast_cap = run.llm.roles["fast"].timeout_cap_s if hasattr(run.llm, "roles") else gen_cap
+            fast_cap = run.llm.roles[run.role("oracle")].timeout_cap_s if hasattr(run.llm, "roles") else gen_cap
             afford = run.budget.can_afford(fast_cap + limits["repair_afford_s"])
         else:
             afford = run.budget.can_afford(limits["oracle_retry_afford_s"])
         if not oracle_src.strip() and afford and not run.over_cost():
             run.log(f"oracle.retry reason={'timeout' if oracle_timed_out else 'no_block'}, retrying once")
-            r_oracle = run.chat("fast", "oracle", gen_cap, **pv)
+            r_oracle = run.chat(run.role("oracle"), "oracle", gen_cap, **pv)
             oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
         pending = sum(1 for f in f_solves if not f.done())
         run.log(f"prep.overlap solve_pending={pending}")
