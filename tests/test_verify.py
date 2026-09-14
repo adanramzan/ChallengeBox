@@ -846,3 +846,29 @@ def test_an_accepted_max_size_input_still_fails_a_slow_candidate(tmp_path):
     limits = {"cases_small": 3, "cases_medium": 1, "mem_mb": 2048, "stress_limit_python_s": 0.05, "stress_limit_rust_s": 2.0}
     e = {x.kind: x for x in V.run_gate(p, slow, gi, workdir=str(tmp_path), budget=FakeBudget(), limits=limits, log=lambda m: None)}["stress"]
     assert not e.passed and not e.skipped and e.detail["too_slow"] and "degraded" not in e.detail
+
+
+# --- round 14: a hand-traced example may spell an integer with arithmetic ---
+
+def test_parse_examples_evaluates_integer_arithmetic():
+    # bench15: solve.md asks for "one input sitting at a stated numeric limit", whose natural
+    # spelling is 10**18 -- an ast.BinOp, which ast.literal_eval refused, so both of that
+    # candidate's limit-sized traces were silently dropped.
+    block = ("((10**18, 0), 10**18)\n"
+             "((-(2**31), 1), -2147483647)\n"
+             "((10**18 - 1, 2 * 3), 10**18 + 5)\n"
+             "((7 // 2, 7 % 2), 4)\n")
+    got = [(c.input, c.expected) for c in V.parse_examples(PY, block)]
+    assert got == [((10**18, 0), 10**18), ((-2147483648, 1), -2147483647),
+                   ((10**18 - 1, 6), 10**18 + 5), ((3, 1), 4)]
+
+def test_parse_examples_rejects_everything_that_is_not_a_literal_or_integer_arithmetic():
+    for line in ("([10**18] * 3, 1)",        # Mult with a list operand: repetition, not arithmetic
+                 "((range(3),), 1)",         # a call
+                 "((len([1, 2]),), 2)",      # another call
+                 "((x, 1), 2)",              # a name
+                 "(('a' * 10**6,), 1)",      # string repetition
+                 "((10**99999,), 1)",        # exponent out of range
+                 "((10**30 * 10**30,), 1)",  # result past the magnitude cap
+                 "((sys.maxsize,), 1)"):     # an attribute
+        assert V.parse_examples(PY, line) == [], line

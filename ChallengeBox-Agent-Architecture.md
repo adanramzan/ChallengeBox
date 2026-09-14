@@ -174,7 +174,12 @@ The SOLVE reply carries one more block, `===EXAMPLES===`: three to five lines, e
 statement by hand and explicitly not obtained by running the code. The prompt asks for the smallest legal
 input, one input at a stated numeric limit, and the input the author thinks is most likely to be misread.
 
-`verify.parse_examples` reads them with one `ast.literal_eval` per line — never `exec`, this is model output —
+`verify.parse_examples` reads them with one restricted evaluation per line — never `exec`, this is model output.
+The grammar is Python literals plus integer arithmetic (`+ - * ** // %` and unary sign over `int` constants, with
+magnitudes capped at 10^40 and exponents at 10^4); names, calls, attributes and comprehensions are rejected, and a
+`*` whose operand is a container or a string is rejected rather than repeated. `ast.literal_eval` alone refused
+`10**18`, so on bench15 the candidate lost both of the traces covering the very limit the statement is built around
+while the other candidate, which spelled the same constant as `1000000000000000000`, lost nothing. It then
 drops any line that is not a 2-tuple (the count is reported per candidate as `examples: {count, dropped}`),
 wraps non-tuple Python args as a 1-tuple, requires a `str` for Rust, and caps the list at 8. They are used twice:
 

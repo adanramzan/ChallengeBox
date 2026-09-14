@@ -79,21 +79,71 @@ class Case:
 
 MAX_EXAMPLES = 8
 
+# A hand-traced example that sits "at a stated numeric limit" is naturally spelled 10**18, which is
+# an ast.BinOp and not a literal: ast.literal_eval raises on it and the line was silently dropped.
+# On bench15 that cost the candidate both of its limit-sized traces -- the only cases covering the
+# trap the statement is built around -- while the other candidate, which spelled the same constant
+# as 1000000000000000000, lost nothing. This is the whole of the extension: literals as before, plus
+# integer arithmetic over them. Names, calls, attributes, comprehensions and f-strings stay
+# unreachable, which is what keeps this a parser for model output rather than an evaluator.
+_EXAMPLE_BINOPS = {ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b, ast.Mult: lambda a, b: a * b,
+                   ast.Pow: lambda a, b: a ** b, ast.FloorDiv: lambda a, b: a // b, ast.Mod: lambda a, b: a % b}
+_MAX_EXAMPLE_INT = 10 ** 40   # bigger than any stated limit; bounds what one line can make us compute
+_MAX_EXAMPLE_EXP = 10 ** 4
+
+def _example_literal(node):
+    """One node of an example line. Raises ValueError for anything outside the grammar above."""
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, int) and abs(node.value) > _MAX_EXAMPLE_INT:
+            raise ValueError("integer too large")
+        return node.value
+    if isinstance(node, ast.Tuple):
+        return tuple(_example_literal(e) for e in node.elts)
+    if isinstance(node, ast.List):
+        return [_example_literal(e) for e in node.elts]
+    if isinstance(node, ast.Set):
+        return {_example_literal(e) for e in node.elts}
+    if isinstance(node, ast.Dict):
+        if any(k is None for k in node.keys):   # {**other}
+            raise ValueError("dict unpacking")
+        return {_example_literal(k): _example_literal(v) for k, v in zip(node.keys, node.values)}
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        v = _example_literal(node.operand)
+        if not isinstance(v, (int, float, complex)):
+            raise ValueError("unary operand")
+        return -v if isinstance(node.op, ast.USub) else +v
+    if isinstance(node, ast.BinOp) and type(node.op) in _EXAMPLE_BINOPS:
+        a, b = _example_literal(node.left), _example_literal(node.right)
+        # Integers only, on both sides. That is what the arithmetic is for -- and it is also what
+        # keeps [x]*3 and "ab"*10**6 out: a container or a string operand is rejected, not repeated.
+        if not (isinstance(a, int) and isinstance(b, int)) or isinstance(a, bool) or isinstance(b, bool):
+            raise ValueError("non-integer operand")
+        if isinstance(node.op, ast.Pow) and (b > _MAX_EXAMPLE_EXP or b < 0):
+            raise ValueError("exponent out of range")
+        v = _EXAMPLE_BINOPS[type(node.op)](a, b)
+        if abs(v) > _MAX_EXAMPLE_INT:
+            raise ValueError("integer too large")
+        return v
+    raise ValueError(f"not allowed in an example: {type(node).__name__}")
+
 def parse_examples(problem, block_text: str) -> list[Case]:
     """The ===EXAMPLES=== block of a SOLVE reply: input/expected pairs the solution's author
     hand-traced from the statement. This is the only ground truth in the run besides the oracle that
     was not produced by running code, and it is a SECOND reading of the statement -- so it checks the
     candidate against its own author's trace, and the oracle against a reading it did not write.
 
-    One ast.literal_eval per non-blank line (never exec: this is model output). A line that does not
-    evaluate to a 2-tuple is dropped; the caller counts the drops by comparing against the line count.
+    One restricted evaluation per non-blank line (never exec: this is model output). The grammar is
+    Python literals plus integer arithmetic -- `+ - * ** // %` and unary sign over int constants --
+    and nothing else, so `10**18` parses where ast.literal_eval raised on it (see _example_literal).
+    A line that does not evaluate to a 2-tuple is dropped; the caller counts the drops by comparing
+    against the line count.
     Python args that are not a tuple are wrapped as a 1-tuple (a single-argument entrypoint); Rust args
     must be the stdin text, so anything but a str is dropped."""
     cases: list[Case] = []
     for line in [l for l in block_text.splitlines() if l.strip()][:MAX_EXAMPLES]:
         try:
-            v = ast.literal_eval(line.strip())
-        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            v = _example_literal(ast.parse(line.strip(), mode="eval").body)
+        except (ValueError, TypeError, SyntaxError, ZeroDivisionError, OverflowError, MemoryError, RecursionError):
             continue
         if not isinstance(v, tuple) or len(v) != 2:
             continue
