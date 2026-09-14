@@ -278,6 +278,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     oracle_checked = False        # the accumulating example check has run for at least one candidate
     settled: set[str] = set()     # example disagreements the dispute decision has already seen
     no_repair: set[str] = set()   # lineages a regression closed: another patch there is the same losing bet
+    agreed_cases: set = set()     # candidate agreements already counted as a disagreement with the oracle
 
     def build_candidate(r_solve, attempt: int) -> "Candidate | None":
         blocks = parse_blocks(r_solve.text)
@@ -541,6 +542,29 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
                 run.log("gate.passed"); break
             if len(run.cands) > 1:
                 run.log(f"repair.target {cand.id} (best of {len(run.cands)} candidates)")
+            # Two independently written candidates that produce the SAME answer on the failing input
+            # are two readings of the statement against the oracle's one, and the oracle is the side
+            # this system can rewrite. It is the same evidence a hand-traced example gives, so it is
+            # recorded in the same place (it can then tip examples_disputed, and it tells a
+            # regeneration's cross-check which of the two references was the wrong one), and it takes
+            # the regeneration BEFORE any candidate repair: patching two agreeing candidates into
+            # agreement with a wrong reference is how bench16-1dea lost a run that was already
+            # correct. Only before a regeneration has happened -- afterwards the other candidate's
+            # evidence refers to a different oracle's case list, so its index means something else.
+            agreement = None if gi.oracle_regens else V.candidates_agree(problem, run.cands, cand, failed)
+            if agreement:
+                key = (agreement["kind"], agreement["index"], repr(agreement["actual"]))
+                if key not in agreed_cases:
+                    agreed_cases.add(key)
+                    V.add_candidate_agreement(gi, agreement)
+                if not gi.regen_failed and run.budget.can_afford(cfg["limits"]["oracle_selfrepair_afford_s"]) and not run.over_cost():
+                    run.log(f"oracle.dispute two_candidates_agree kind={agreement['kind']} index={agreement['index']} "
+                            f"authors={','.join(agreement['authors'])}")
+                    gi = V.regenerate_oracle(run, gi, V.dispute_extra(gi, failed, agreement), pv, counter="oracle_regens")
+                    if gi.regen_failed:
+                        run.log("oracle.regen failed: stopping repair loop"); break
+                    cand.evidence = cand.evidence[:1]   # re-gate against the new oracle; if it still disagrees, the next pass repairs
+                    continue
             # Two failures a patch cannot fix, both routed to a fresh solution from a different
             # algorithm instead of to the patch-style repair: a timing failure on a real max-size
             # input (a smaller edit does not change an approach's complexity -- round-10 L2, round-13

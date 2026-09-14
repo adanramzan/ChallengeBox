@@ -584,7 +584,7 @@ def _examples_paragraph(gi: GateInputs) -> str:
     """The hand-traced examples this oracle's reference() contradicts, as inputs and expected values
     only. Never any candidate code: the oracle is generated in its own context and never sees it."""
     ec = gi.example_checks or {}
-    bad = ec.get("disagreements") or []
+    bad = [d for d in (ec.get("disagreements") or []) if not d.get("from_candidates")]
     if not bad:
         return ""
     shown = "\n".join(f"- Input: {_fmt(d['input'], 800)}\n  Hand-traced expected: {_fmt(d['expected'], 800)}\n"
@@ -600,7 +600,64 @@ def examples_dispute_extra(gi: GateInputs) -> str:
         "\n\nYour reference disagreed with inputs hand-traced from this statement. Re-derive the "
         "expected output from the statement alone, sentence by sentence, before writing the new reference.\n")
 
-def dispute_extra(gi: GateInputs, failed: Evidence) -> str:
+def _no_answer(v) -> bool:
+    """_actual_for_report renders a crash or a timeout as a "(no answer: ...)" sentence rather than
+    a value. Two candidates that both crashed are not two authors agreeing on anything."""
+    return isinstance(v, str) and v.startswith("(no answer")
+
+def _same_answer(problem, a, b) -> bool:
+    if b is None or _no_answer(a) or _no_answer(b):
+        return False
+    if problem.language == "rust":
+        return tokens(a if isinstance(a, str) else str(a)) == tokens(b if isinstance(b, str) else str(b))
+    return repr(a) == repr(b)
+
+def _lineage_root(cands, c):
+    """The root candidate `c` descends from: a repaired child inherits its parent's reading of the
+    statement, so it is not a second author."""
+    by_id = {x.id: x for x in cands}
+    seen = set()
+    while c.parent and c.parent in by_id and c.parent not in seen:
+        seen.add(c.parent)
+        c = by_id[c.parent]
+    return c
+
+def candidates_agree(problem, cands, cand, failed: Evidence) -> dict | None:
+    """Another candidate that failed the SAME tier at the SAME input index with the SAME answer.
+
+    Two solutions sampled independently, written in separate contexts, agreeing on a value the
+    oracle contradicts is two readings of the statement against one -- the same shape of evidence as
+    a hand-traced example and the strongest the system has that the ORACLE is the wrong side. On
+    bench16-1dea both candidates were right on the failing input, the oracle had one wrong conjunct,
+    and the run spent its repair on the candidates. Returns the agreeing pair, or None."""
+    idx = failed.detail.get("index")
+    mine = failed.detail.get("actual")
+    if idx is None or not failed.kind.startswith("diff_") or _no_answer(mine):
+        return None
+    root = _lineage_root(cands, cand)
+    for other in cands:
+        if other is cand or _lineage_root(cands, other) is root:
+            continue
+        for e in other.evidence:
+            if e.kind == failed.kind and not e.passed and e.detail.get("index") == idx \
+                    and _same_answer(problem, mine, e.detail.get("actual")):
+                return {"kind": failed.kind, "index": idx, "authors": sorted({cand.id, other.id}),
+                        "input": failed.detail.get("input"), "actual": mine, "reference": failed.detail.get("expected")}
+    return None
+
+def add_candidate_agreement(gi: GateInputs, agreement: dict) -> None:
+    """Record one candidate agreement as a value disagreement with the oracle, in the same place and
+    the same shape as the hand-traced ones -- so the existing >= half rule (examples_disputed), and
+    the resolution rule a regeneration's cross-check applies, both see it. Flagged so the prompt
+    paragraph that calls these "hand-traced" does not claim this one was."""
+    ec = gi.example_checks or {"cases": 0, "agreements": 0, "disagreements": [], "rejected": [], "errors": 0, "normalized": 0}
+    ec["cases"] = ec.get("cases", 0) + 1
+    ec.setdefault("disagreements", []).append(
+        {"input": agreement["input"], "expected": agreement["actual"], "reference": agreement["reference"],
+         "authors": agreement["authors"], "from_candidates": True})
+    gi.example_checks = ec
+
+def dispute_extra(gi: GateInputs, failed: Evidence, agreement: dict | None = None) -> str:
     """Extra context for regenerate_oracle when a repair call adjudicated candidate vs. oracle and
     blamed the oracle for a wrong answer on a specific input.
 
@@ -609,6 +666,15 @@ def dispute_extra(gi: GateInputs, failed: Evidence) -> str:
     leaking into the oracle's context: on runs/bench6/1dea32802072 the regenerated oracle inherited
     the candidate's exact bug and agreed with it on 4000/4000 inputs, while the original oracle had
     been right. The oracle is generated in its own context and never sees the candidate."""
+    if agreement:
+        return ("\n\nTwo solutions to this statement, written independently and without seeing each other, "
+                "produced the SAME output on this input, and it is not what the previous reference produced:\n"
+                f"Input: {_fmt(agreement['input'])}\n"
+                f"Both solutions returned: {_fmt(agreement['actual'])}\n"
+                f"Previous reference returned: {_fmt(agreement['reference'])}\n"
+                "Re-derive the expected output from the statement alone, sentence by sentence, before writing the "
+                "new reference.\n"
+                + _examples_paragraph(gi))
     return ("\n\nA previous reference produced this output on this input:\n"
             f"Input: {_fmt(failed.detail.get('input'))}\nPrevious reference output: {_fmt(failed.detail.get('expected'))}\n"
             "An independent review believes the reference's output on this input does not follow the statement. "

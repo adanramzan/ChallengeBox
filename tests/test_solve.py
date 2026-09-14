@@ -628,8 +628,10 @@ def test_repair_targets_the_best_attempt_not_the_last_gated(tmp_path):
     # One attempt fails only the LAST differential tier; the other fails an earlier one, so the
     # first got further. Once both are gated the repair must be spent on that one, not on whichever
     # happened to be gated last. Which id it carries depends on which reply landed first.
+    # the two bugs must not overlap on any tier: two candidates failing the SAME tier at the same
+    # index with the same answer is a dispute about the oracle, not a repair (see below).
     ok_small_bad_medium = SOLVE_OK.replace("return a + b", "return a + b if a < 10**4 else a + b + 1")
-    bad_small = SOLVE_OK.replace("return a + b", "return a + b if a < 15 else a + b + 1")
+    bad_small = SOLVE_OK.replace("return a + b", "return a + b + 1 if a < 15 else a + b")
     llm = FakeLLM({"solve": [ok_small_bad_medium, bad_small], "oracle": [ORACLE_MED], "stress": [STRESS_OK],
                    "repair": ["===VERDICT===\ncandidate\n===END===\n===CODE===\ndef add(a, b):\n    return a + b\n===END===\n"]})
     rep = S.solve(prob(tmp_path), llm, cfg_n(2), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
@@ -1214,3 +1216,50 @@ def test_repair_cap_takes_the_larger_of_the_phase_share_and_the_role_floor(tmp_p
     assert S.V.repair_cap(_Run()) == pytest.approx(171.0)
     _Role.repair_cap_s = 0.0                           # unset: the phase share is the only rule, as before
     assert S.V.repair_cap(_Run()) == pytest.approx(171.0)
+
+
+# --- round 14: two candidates agreeing against the oracle is a dispute ---
+
+SOLVE_OK_VARIANT = SOLVE_NO_EXAMPLES.replace("return a + b", "return b + a") + EXAMPLES_BLOCK
+
+def test_two_candidates_agreeing_on_the_failing_case_dispute_the_oracle_before_any_repair(tmp_path):
+    # bench16-1dea: both candidates produced the same output on the failing input, the oracle had
+    # one wrong conjunct, and the repair was aimed at the candidates. Two independent authors
+    # against one reference is a dispute, and the reference is the side this system can rewrite.
+    llm = FakeLLM({"solve": [SOLVE_OK, SOLVE_OK_VARIANT], "oracle": [ORACLE_WRONG, ORACLE_OK], "stress": [STRESS_OK],
+                   "repair": [REPAIR_FIX]})
+    rep = S.solve(prob(tmp_path), llm, cfg_n(2), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert any("oracle.dispute two_candidates_agree kind=diff_edge" in e for e in rep["events"])
+    assert rep["oracle_regenerated"] == 1
+    assert not any(c["tag"] == "repair" for c in rep["calls"]), "the regeneration must come before any repair"
+    assert rep["repairs"] == 0 and rep["status"] == "passed_all_gates"
+    # and the agreement is recorded as a value disagreement with the oracle, like a hand trace
+    agreed = [d for d in rep["gate_inputs"]["example_checks"]["disagreements"] if d.get("from_candidates")]
+    assert len(agreed) <= 1   # the regenerated oracle's own check replaces the dict; at most one is carried
+
+def test_a_single_candidate_failing_alone_still_goes_to_repair(tmp_path):
+    # One author against the oracle is not a dispute: today's path, unchanged.
+    llm = FakeLLM({"solve": [BUGGY], "oracle": [ORACLE_OK], "stress": [STRESS_OK], "repair": [REPAIR_FIX]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert not any("oracle.dispute" in e for e in rep["events"])
+    assert rep["repairs"] == 1 and rep["oracle_regenerated"] == 0 and rep["status"] == "passed_all_gates"
+
+def test_two_candidates_that_merely_both_crash_are_not_an_agreement(tmp_path):
+    # "(no answer: crashed ...)" is not a value two authors agreed on.
+    p = prob(tmp_path)
+    crash = S.Candidate("c1", "x", None)
+    crash.evidence = [S.V.Evidence("static", True),
+                      S.V.Evidence("diff_edge", False, 2, detail={"index": 1, "actual": "(no answer: crashed before completing)", "expected": 3})]
+    other = S.Candidate("c2", "y", None)
+    other.evidence = list(crash.evidence)
+    assert S.V.candidates_agree(p, [crash, other], crash, crash.evidence[1]) is None
+    # a repaired child agreeing with its own parent is one author, not two
+    parent = S.Candidate("c1", "x", None)
+    parent.evidence = [S.V.Evidence("static", True), S.V.Evidence("diff_edge", False, 2, detail={"index": 1, "actual": 15, "expected": 16})]
+    child = S.Candidate("c2", "y", "c1")
+    child.evidence = list(parent.evidence)
+    assert S.V.candidates_agree(p, [parent, child], child, child.evidence[1]) is None
+    root2 = S.Candidate("c3", "z", None)
+    root2.evidence = list(parent.evidence)
+    got = S.V.candidates_agree(p, [parent, child, root2], child, child.evidence[1])
+    assert got and got["authors"] == ["c2", "c3"] and got["index"] == 1
