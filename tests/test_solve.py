@@ -780,6 +780,9 @@ def test_a_candidate_with_no_examples_skips_the_step(tmp_path):
     ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
     assert ev["diff_examples"]["skipped"] and ev["diff_examples"]["passed"]
     assert rep["examples"]["c1"] == {"count": 0, "dropped": 0}
+    # ...and a missing block never demotes the status: that would report on the reply's formatting
+    # rather than on what was verified. Everything the oracle could check here did run.
+    assert rep["status"] == "passed_all_gates"
 
 def test_diff_examples_failure_reaches_repair_with_the_author_trace_wording(tmp_path):
     llm = FakeLLM({"solve": [SOLVE_CONTRADICTS_ITSELF], "repair": [REPAIR_NO_CHANGE], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})

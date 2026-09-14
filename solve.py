@@ -393,7 +393,13 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         # Evidence carrying detail["degraded"] (a stress input that is not really max-size, a tier
         # with far too few cases) passed against weaker input than the gate claims to check, so it
         # is not full evidence either -- count it exactly like a skip.
-        skipped = any(e.skipped or e.detail.get("degraded") for e in best.evidence if not (e.kind == "overflow" and problem.language == "python"))
+        # A skipped "diff_examples" is exempt for a different reason: it means the SOLVE reply
+        # carried no parseable ===EXAMPLES=== block, which is prompt compliance, not a gap in what
+        # the oracle-derived steps checked. Tying the emitted status to a block's presence would
+        # make the status report on formatting; `checked` below is what protects a run where
+        # nothing real ran at all.
+        exempt = lambda e: (e.kind == "overflow" and problem.language == "python") or (e.kind == "diff_examples" and e.skipped)
+        skipped = any(e.skipped or e.detail.get("degraded") for e in best.evidence if not exempt(e))
         # "static"/"compile" are pre-flight, not verification. A candidate that was never gated (a
         # second attempt left ungated when the budget ran out) has only its static check -- nothing
         # skipped, nothing failed, and nothing checked either. Measured on bench7/2beff58fa923: no
