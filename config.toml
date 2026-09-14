@@ -55,6 +55,8 @@ validate_reject_frac_regen = 0.5
 # one produced no ===ORACLE=== block (timeout or empty reply). Tuned to the measured worst-case
 # oracle latency against the current [profiles] models (observed max 128s, +2s margin) -- if a
 # different/slower model is configured for the "fast" role, raise this to match its measured max.
+# Conservative for the qwen3-coder now configured for "fast" (17-24s per oracle call); left at the
+# deepseek-era worst case so a slower model can be swapped in without re-tuning it.
 oracle_retry_afford_s = 130.0
 # Minimum remaining budget (seconds) required to start another repair-loop iteration (a syntax or
 # semantic repair call plus re-gating). Generous headroom over the measured repair-call latency
@@ -69,6 +71,7 @@ repair_afford_s = 60.0
 # the same reference+gen+validate functions; independent of, and can fire alongside, the adjudication
 # regeneration in the repair loop (that one has no separate afford threshold -- it's gated by the
 # repair loop's own repair_afford_s check instead).
+# Conservative for qwen3-coder, same as oracle_retry_afford_s above.
 oracle_selfrepair_afford_s = 130.0
 
 # Phase boundaries as fractions of usable time (deadline*scale - margin)
@@ -96,12 +99,21 @@ extra = {}   # non-reasoning models: reasoning params are ignored and burn the w
 
 [profiles.openrouter.fast]
 base_url = "https://openrouter.ai/api/v1"
-model = "openai/gpt-5.6-luna"
+# Same model as the strong role. deepseek produced three unusable oracles for one problem across
+# rounds 10 and 13 -- constant-answer or 45% wrong against an independent reference -- at 106-128s
+# per call, so most oracle calls were lost to the cap and the ones that arrived were not ground
+# truth. qwen3-coder returns in 17-24s and read the same statement correctly.
+# The cost: one model authoring both the candidate and the oracle can share a misreading, and two
+# sides that agree because they misread identically are no evidence at all. The check for that is
+# the SOLVE-authored examples (next batch), run against candidate and oracle alike; until those
+# exist, an oracle from the same model is still worth more than no oracle, which is what the
+# previous configuration delivered.
+model = "qwen/qwen3-coder"
 api_key_env = "OPENROUTER_API_KEY"
 max_tokens = 8000
 max_concurrent = 3
 timeout_cap_s = 150.0   # oracle writes reference+gen+validate; round 13 measured 106-128s, so the cap sits above it
-extra = {}
+extra = {}   # non-reasoning model: reasoning params are ignored and burn the whole budget
 
 # Anthropic, through its OpenAI-compatible endpoint (which Anthropic describes as a layer for testing
 # and comparing models, not a production-grade path). Claude 5 models reject sampling parameters and
