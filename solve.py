@@ -249,6 +249,23 @@ def best_candidate(cands: list[Candidate]) -> Candidate | None:
 GATE_PASS_ESTIMATE_S = 60.0
 
 
+def oracle_afford_s(run, key: str) -> float:
+    """How much budget an optional ORACLE-shaped call -- the retry, a self-repair, a dispute
+    regeneration -- must still have before it is worth starting.
+
+    The [limits] values were tuned to a fast model measured at up to 128 s per call. qwen3-coder
+    returns in 12-45 s, and a 130 s threshold then means a run more than half way through its
+    deadline can never regenerate an oracle it already knows is broken: bench19 kept a weak,
+    self-rejecting oracle for the whole run because the check first ran at 180 s with 105 s left.
+    So the requirement follows the role's OWN measured ceiling -- half its cap (a call that runs to
+    the cap is the pathological case, not the median) plus the time to use what comes back -- and
+    the config value is a ceiling on that, never a floor. A client with no role table (FakeLLM)
+    keeps the configured number."""
+    role = (getattr(run.llm, "roles", None) or {}).get(run.role("oracle"))
+    configured = float(run.cfg["limits"][key])
+    return min(configured, role.timeout_cap_s * 0.5 + 30.0) if role is not None else configured
+
+
 def solve_call_cap(cfg: dict, budget) -> float:
     """The ceiling for the initial SOLVE call: everything except what a gate pass and emission need.
 
@@ -326,6 +343,11 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     no_repair: set[str] = set()   # lineages a regression closed: another patch there is the same losing bet
     agreed_cases: set = set()     # candidate agreements already counted as a disagreement with the oracle
 
+    f_solves: list = []
+
+    def solve_pending() -> int:
+        return sum(1 for f in f_solves if not f.done())
+
     def build_candidate(r_solve, attempt: int) -> "Candidate | None":
         blocks = parse_blocks(r_solve.text)
         code = blocks.get("CODE", "")
@@ -397,7 +419,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         oracle_checked = True
         adjudicate_oracle()
 
-    def adjudicate_oracle() -> None:
+    def adjudicate_oracle(health_only: bool = False) -> None:
         # The oracle CALL can succeed while the CODE it wrote crashes at runtime -- reference() raising on
         # every input, gen() raising while unpacking its own tuple -- leaving zero usable cases in every
         # tier even though prepare_gate_inputs ran to completion. That's silent: no gate step fails (there's
@@ -425,7 +447,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             selfrepair_why = "no usable case in any tier"
         elif gi.validate_reject_frac >= cfg["limits"]["validate_reject_frac_regen"]:
             selfrepair_why = f"validate() rejected {gi.validate_reject_frac:.0%} of its own gen() inputs"
-        elif V.examples_disputed(gi):
+        elif not health_only and V.examples_disputed(gi):
             ec = gi.example_checks
             disputed = True
             selfrepair_why = f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {V.examples_nonrejected(ec)}"
@@ -438,8 +460,9 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         elif gi.weak_tiers.get("small"):
             weak = True
             selfrepair_why = gi.weak_tiers["small"]["note"]
-        if selfrepair_why and run.budget.can_afford(cfg["limits"]["oracle_selfrepair_afford_s"]) and not run.over_cost():
-            run.log(f"oracle.selfrepair triggered: {selfrepair_why}; notes={'; '.join(gi.notes)[:300]}")
+        if selfrepair_why and run.budget.can_afford(oracle_afford_s(run, "oracle_selfrepair_afford_s")) and not run.over_cost():
+            run.log(f"oracle.selfrepair triggered: {selfrepair_why}; solve_pending={solve_pending()}; "
+                    f"notes={'; '.join(gi.notes)[:300]}")
             prev = gi
             selfrepaired = True
             extra = (V.examples_dispute_extra(gi) if disputed else
@@ -482,7 +505,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         # ceiling is the budget minus what a gate pass and emission need (solve_call_cap), while the
         # measuring calls keep generate_call_share.
         gen_cap = cfg["phases"]["generate_call_share"] * run.budget.usable_s
-        f_solves = [ex.submit(run.chat, run.role("solve"), "solve", solve_call_cap(cfg, run.budget), **pv) for _ in range(attempts)]
+        f_solves.extend(ex.submit(run.chat, run.role("solve"), "solve", solve_call_cap(cfg, run.budget), **pv) for _ in range(attempts))
         f_oracle = ex.submit(run.chat, run.role("oracle"), "oracle", gen_cap, **pv)
         f_stress = ex.submit(run.chat, run.role("stress"), "stress", gen_cap, **pv)
         # The ORACLE reply is waited for FIRST and its preparation starts immediately, while the
@@ -509,17 +532,36 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             fast_cap = run.llm.roles[run.role("oracle")].timeout_cap_s if hasattr(run.llm, "roles") else gen_cap
             afford = run.budget.can_afford(fast_cap + limits["repair_afford_s"])
         else:
-            afford = run.budget.can_afford(limits["oracle_retry_afford_s"])
+            afford = run.budget.can_afford(oracle_afford_s(run, "oracle_retry_afford_s"))
         if not oracle_src.strip() and afford and not run.over_cost():
             run.log(f"oracle.retry reason={'timeout' if oracle_timed_out else 'no_block'}, retrying once")
             r_oracle = run.chat(run.role("oracle"), "oracle", gen_cap, **pv)
             oracle_src = parse_blocks(r_oracle.text).get("ORACLE", "")
-        pending = sum(1 for f in f_solves if not f.done())
-        run.log(f"prep.overlap solve_pending={pending}")
+        run.log(f"prep.overlap solve_pending={solve_pending()}")
         try:
             gi = V.prepare_oracle_tiers(problem, oracle_src, limits, workdir=oracle_dir, budget=run.budget, log=run.log)
         except Exception as e:
             prep_error = e
+        # Oracle health is judged HERE, not after the solve reply lands. The three triggers that
+        # need no candidate -- an unusable oracle, one whose validate() rejects its own gen()
+        # output, a small tier whose answers do not vary -- are facts about the oracle alone, and
+        # every second they wait is a second of the solve call's own latency. On bench19 prep
+        # finished at 18 s knowing both that the small tier was weak and that validate() had
+        # rejected 89 of 171 inputs, the solve reply landed at 180 s, and by then the afford check
+        # refused the regeneration: the run shipped unverified with 100 s unused. The example
+        # dispute needs a candidate's hand trace and stays where it was; it shares the same
+        # one-shot budget, so a health regeneration here spends it.
+        if prep_error is None:
+            before_gi = gi
+            adjudicate_oracle(health_only=True)
+            if gi is not before_gi:
+                # The regeneration re-prepped through prepare_gate_inputs with no STRESS source, so
+                # it has already walked part of the max-size chain on the oracle's own gen(large).
+                # prepare_stress_inputs is still to come with the real STRESS reply: give it the
+                # whole chain back rather than a position advanced by a prep that had nothing to
+                # prefer gen_max over.
+                gi.stress_input, gi.stress_source, gi.stress_validity = None, "", ""
+                gi.stress_degraded, gi.stress_tried = False, []
         r_stress = f_stress.result()
         stress_src = parse_blocks(r_stress.text).get("STRESS", "")
         if prep_error is None:
@@ -544,7 +586,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
                 check_oracle_against_examples()
             except Exception as e:
                 prep_error = e; continue
-            run.log(f"gate.early cand={cand.id} solve_pending={sum(1 for g in f_solves if not g.done())}")
+            run.log(f"gate.early cand={cand.id} solve_pending={solve_pending()}")
             try:
                 gate_candidate(cand)
             except Exception as e:
@@ -637,7 +679,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
                 if key not in agreed_cases:
                     agreed_cases.add(key)
                     V.add_candidate_agreement(gi, agreement)
-                if not gi.regen_failed and run.budget.can_afford(cfg["limits"]["oracle_selfrepair_afford_s"]) and not run.over_cost():
+                if not gi.regen_failed and run.budget.can_afford(oracle_afford_s(run, "oracle_selfrepair_afford_s")) and not run.over_cost():
                     run.log(f"oracle.dispute two_candidates_agree kind={agreement['kind']} index={agreement['index']} "
                             f"authors={','.join(agreement['authors'])}")
                     gi = V.regenerate_oracle(run, gi, V.dispute_extra(gi, failed, agreement), pv, counter="oracle_regens")

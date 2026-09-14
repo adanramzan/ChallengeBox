@@ -99,12 +99,12 @@ oracle_regen_max_disagreement = 0.5
 validate_reject_frac_regen = 0.5
 
 # Minimum remaining budget (seconds) required before starting another ORACLE call after the first
-# one produced no ===ORACLE=== block (timeout or empty reply). Tuned to the measured worst-case
-# oracle latency against the current [profiles] models (observed max 128s, +2s margin) -- if a
-# different/slower model is configured for the "fast" role, raise this to match its measured max.
-# Conservative for the qwen3-coder now configured for "fast" (17-24s per oracle call); left at the
-# deepseek-era worst case so a slower model can be swapped in without re-tuning it.
-oracle_retry_afford_s = 130.0
+# one produced no ===ORACLE=== block (timeout or empty reply). This is a CEILING, not the whole
+# rule: solve.oracle_afford_s takes the smaller of it and the fast role's own measured cap
+# (timeout_cap_s * 0.5 + 30), so swapping in a slower or faster model re-tunes the threshold by
+# itself. It was 130.0, the deepseek-era worst case; qwen3-coder answers an oracle call in 12-45s,
+# and a 130s threshold refuses a retry through the whole second half of a 300s deadline.
+oracle_retry_afford_s = 60.0
 # Minimum remaining budget (seconds) required before an ORACLE retry is worth making after a
 # TIMED-OUT first call: the retry's own cap plus this, so the oracle is only re-asked while there is
 # still time to use what comes back.
@@ -123,8 +123,12 @@ repair_afford_s = 60.0
 # the same reference+gen+validate functions; independent of, and can fire alongside, the adjudication
 # regeneration in the repair loop (that one has no separate afford threshold -- it's gated by the
 # repair loop's own repair_afford_s check instead).
-# Conservative for qwen3-coder, same as oracle_retry_afford_s above.
-oracle_selfrepair_afford_s = 130.0
+# Same ceiling rule and the same reason as oracle_retry_afford_s above: it was 130.0, which on
+# bench19 refused a regeneration at 180s with 105s still on the clock, for an oracle prep had
+# already reported as weak AND self-rejecting at 18s. The health triggers now fire during the
+# generate-phase overlap, where the remaining budget is nearly the whole deadline, so this number
+# only ever binds a LATE trigger (the example dispute, a two-candidate agreement).
+oracle_selfrepair_afford_s = 60.0
 
 # Phase boundaries as fractions of usable time (deadline*scale - margin)
 [phases]

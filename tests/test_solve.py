@@ -1427,3 +1427,86 @@ def test_without_the_mapping_every_prompt_goes_where_it_always_did(tmp_path):
     rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert {call["tag"]: call["role"] for call in rep["calls"]} == {"solve": "strong", "oracle": "fast", "stress": "fast"}
     assert S.PROMPT_ROLES == {"solve": "strong", "oracle": "fast", "stress": "fast", "repair": "strong"}
+
+
+# --- round 14 batch 8: oracle health is judged during the overlap, not after the solve reply ---
+
+class _BlockedSolve(FakeLLM):
+    """A solve reply that does not arrive until another call releases it. Lets a test assert that
+    something happened WHILE the solver was still thinking rather than after it answered."""
+    def __init__(self, script, release_on=("oracle", 2), wait_s=8.0):
+        super().__init__(script)
+        import threading
+        self._release, self._wait_s = threading.Event(), wait_s
+        self._release_tag, self._release_nth = release_on
+        self._seen = {}
+        self.solve_released = None   # True: released by the other call; False: the wait timed out
+
+    def chat(self, role, system, user, *, timeout_s, max_tokens=None, tag=""):
+        if tag == "solve":
+            self.solve_released = self._release.wait(self._wait_s)
+            return super().chat(role, system, user, timeout_s=timeout_s, tag=tag)
+        r = super().chat(role, system, user, timeout_s=timeout_s, tag=tag)
+        self._seen[tag] = self._seen.get(tag, 0) + 1
+        if tag == self._release_tag and self._seen[tag] >= self._release_nth:
+            self._release.set()
+        return r
+
+def test_a_weak_small_tier_regenerates_before_the_solve_reply_lands(tmp_path):
+    llm = _BlockedSolve({"solve": [SOLVE_OK], "oracle": [ORACLE_WEAK_TIER, ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg_weak(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert llm.solve_released is True, "the regeneration waited for the solve reply instead of overlapping it"
+    assert rep["oracle_selfrepaired"] == 1
+    assert any("oracle.selfrepair triggered: small tier weak" in e and "solve_pending=1" in e for e in rep["events"])
+    assert rep["gate_inputs"]["weak_tiers"] == {}
+
+def test_a_high_reject_fraction_regenerates_before_the_solve_reply_lands(tmp_path):
+    llm = _BlockedSolve({"solve": [SOLVE_OK], "oracle": [ORACLE_REJECTS_ITS_OWN_GEN, ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert llm.solve_released is True
+    assert rep["oracle_selfrepaired"] == 1
+    assert any("oracle.selfrepair triggered: validate() rejected" in e and "solve_pending=1" in e for e in rep["events"])
+    assert rep["gate_inputs"]["small"] == 5   # the gate ran on the replacement's cases
+
+def test_the_example_dispute_still_waits_for_a_candidate(tmp_path):
+    # The oracle is healthy on its own terms -- it generates and validates fine -- and is only
+    # contradicted by the hand trace a candidate carries, so nothing can fire until one arrives.
+    llm = _BlockedSolve({"solve": [SOLVE_OK], "oracle": [ORACLE_OFF_BY_1000, ORACLE_OK], "stress": [STRESS_OK]},
+                        release_on=("stress", 1))
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 1
+    trig = next(e for e in rep["events"] if "oracle.selfrepair triggered" in e)
+    assert "hand-traced examples" in trig and "solve_pending=0" in trig
+    # and it happened after the candidate was built, not during the overlap
+    assert rep["events"].index(trig) > rep["events"].index(next(e for e in rep["events"] if "candidate.added" in e))
+
+def test_a_health_regeneration_spends_the_one_shot_the_dispute_would_have_used(tmp_path):
+    # This oracle is BOTH self-rejecting (health, fires at prep) and off by 1000 against every
+    # hand-traced example (dispute, would fire later). One budget: exactly one regeneration.
+    bad = ("===ORACLE===\ndef reference(a, b):\n    return a + b + 1000\n"
+           "def gen(seed, mode):\n    return (seed, 1)\n"
+           "def validate(a, b):\n    return a == 0\n===END===\n")
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [bad, bad], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 1
+    assert len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 2   # never a third
+    assert sum("oracle.selfrepair triggered" in e for e in rep["events"]) == 1
+    assert any("validate() rejected" in e for e in rep["events"] if "oracle.selfrepair triggered" in e)
+
+def test_the_oracle_afford_threshold_follows_the_fast_role_cap(tmp_path):
+    from llm import Role
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    c = cfg()
+    run = S.Run(prob(tmp_path), llm, c, str(tmp_path / "run"), 1.0, lambda: 0.0)
+    # no role table (FakeLLM): the configured number stands
+    assert S.oracle_afford_s(run, "oracle_selfrepair_afford_s") == 130.0
+    # a fast role whose cap is low needs less, and the config value is only a ceiling
+    llm.roles = {"fast": Role("fast", "", "m", "", 100, 3, 40.0, {})}
+    assert S.oracle_afford_s(run, "oracle_selfrepair_afford_s") == 50.0
+    llm.roles = {"fast": Role("fast", "", "m", "", 100, 3, 400.0, {})}
+    assert S.oracle_afford_s(run, "oracle_selfrepair_afford_s") == 130.0
+
+def test_config_ships_afford_thresholds_a_fast_oracle_can_meet():
+    import tomllib
+    lim = tomllib.loads((pathlib.Path(S.__file__).parent / "config.toml").read_text())["limits"]
+    assert lim["oracle_retry_afford_s"] == 60.0 and lim["oracle_selfrepair_afford_s"] == 60.0
