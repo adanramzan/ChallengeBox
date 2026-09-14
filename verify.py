@@ -71,6 +71,7 @@ class GateInputs:
         return {"small": len(self.cases_small), "medium": len(self.cases_medium), "edge": len(self.cases_edge),
                 "public": len(self.cases_public), "stress": self.stress_input is not None,
                 "stress_source": self.stress_source, "stress_degraded": self.stress_degraded,
+                "stress_tried": self.stress_tried,
                 "stress_validity": self.stress_validity, "input_skeleton": self.input_skeleton,
                 "weak_tiers": self.weak_tiers,
                 "notes": self.notes, "example_checks": self.example_checks}
@@ -1301,17 +1302,30 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         e = stress(problem, source, gi.stress_input, workdir=os.path.join(workdir, "stress"), limit_s=min(limit, avail), mem_mb=limits["mem_mb"], degraded=gi.stress_degraded,
                    min_plausible_s=limits.get("stress_min_plausible_s", 0.0), unjudged=gi.stress_validity == "unjudged", validity=gi.stress_validity)
         # A suspicious measurement is no measurement, and the suspect is the INPUT: the candidate
-        # answered before any real work could have happened. The chain has more sources (§5.4), and
-        # until now a suspicious first one ended the timing check for the whole run. Try the next one
-        # and keep the better evidence -- a real measurement or a degraded pass both beat a suspicious
-        # pass, and two suspicious runs leave the run degraded exactly as one did. Bounded at two
-        # stress runs per candidate by construction: only the first result can trigger this.
+        # answered before any real work could have happened. An UNJUDGED one is no measurement
+        # either -- nothing in the run could say the input was legal, so stress() recorded a skipped
+        # pass whichever way it went. Both are facts about the input, the chain has more sources
+        # (§5.4), and until now a bad first one ended the timing check for the whole run. Try the
+        # next one and keep the better evidence: after a suspicious run a real measurement or a
+        # degraded pass both win, while after an unjudged one only a source the oracle could
+        # actually judge (accepted, or bounds_checked) AND that is a real maximum is worth a second
+        # stress run -- a second unjudged input buys the same skipped pass for a whole timing grant,
+        # and a judged-but-degraded one (a gen(large) no bigger than the tiers) trades an honest
+        # measurement on a big input for a meaningless one on a small input, so in both cases the run
+        # keeps the input it had and only records that the source was tried. Bounded at two stress
+        # runs per candidate by construction: only the first result can trigger this.
         avail2 = budget.step_timeout(limit, reserve_s=reserve)
-        if e.detail.get("suspicious") and avail2 > 0 and next_stress_source(problem, gi, workdir=os.path.join(workdir, "stress2"), budget=budget, log=log):
-            e2 = stress(problem, source, gi.stress_input, workdir=os.path.join(workdir, "stress2"), limit_s=min(limit, avail2), mem_mb=limits["mem_mb"], degraded=gi.stress_degraded,
-                        min_plausible_s=limits.get("stress_min_plausible_s", 0.0), unjudged=gi.stress_validity == "unjudged", validity=gi.stress_validity)
-            if not e2.detail.get("suspicious"):
-                e = e2
+        suspicious = bool(e.detail.get("suspicious"))
+        if (suspicious or gi.stress_validity == "unjudged") and avail2 > 0:
+            before = (gi.stress_input, gi.stress_source, gi.stress_degraded, gi.stress_validity)
+            if next_stress_source(problem, gi, workdir=os.path.join(workdir, "stress2"), budget=budget, log=log):
+                if suspicious or (gi.stress_validity in ("accepted", "bounds_checked") and not gi.stress_degraded):
+                    e2 = stress(problem, source, gi.stress_input, workdir=os.path.join(workdir, "stress2"), limit_s=min(limit, avail2), mem_mb=limits["mem_mb"], degraded=gi.stress_degraded,
+                                min_plausible_s=limits.get("stress_min_plausible_s", 0.0), unjudged=gi.stress_validity == "unjudged", validity=gi.stress_validity)
+                    if not e2.detail.get("suspicious"):
+                        e = e2
+                else:
+                    gi.stress_input, gi.stress_source, gi.stress_degraded, gi.stress_validity = before
     ev.append(e); log(_gate_line(e, f"duration={e.detail.get('duration_s')}"))
     # Placed after stress (not before) so stress's timing measurement runs first, on a warm cache,
     # unaffected by this step; and so this step's own subprocess never masks a stress timeout.

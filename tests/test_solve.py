@@ -1112,6 +1112,10 @@ def test_a_slow_run_on_an_unjudged_max_size_input_is_not_a_failure(tmp_path):
     assert rep["fresh_solves"] == 0 and rep["repairs"] == 0 and len(_prompts(llm, "solve")) == 1
     assert rep["status"] == "emitted_unverified"                    # never passed_all_gates either
     assert any("validity=unjudged" in e for e in rep["events"])
+    # an unjudged input falls through to a JUDGED one -- but this oracle's gen() ignores its mode,
+    # so gen(large) is no bigger than the tiers: judged and degraded is not better evidence than an
+    # honest measurement on a big input, so the source is marked tried and the input is kept.
+    assert rep["gate_inputs"]["stress_tried"] == ["gen_max", "gen_large"]
 
 def _cand_with_stress(cid, duration):
     c = S.Candidate(cid, f"# {cid}", None)

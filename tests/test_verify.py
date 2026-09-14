@@ -1065,3 +1065,38 @@ def test_bounds_verdicts_reads_a_falsy_answer_as_within_bounds(tmp_path):
     out = V.bounds_verdicts(PY, src, [(0, 0), (1, 1)], workdir=str(tmp_path), timeout_s=20)
     assert out == [None, None]
     assert V.bounds_verdicts(PY, ORACLE, [(0, 0)], workdir=str(tmp_path / "x"), timeout_s=20) == [V.NO_BOUNDS_VERDICT]
+
+
+# --- round 14 batch 8: an unjudged max-size input also falls through ---
+
+def test_an_unjudged_max_size_input_falls_through_to_a_judged_one(tmp_path):
+    # bounds() cannot check the 10**18 input gen_max returns (it raises, so: no verdict), but it
+    # clears the smaller one the oracle's own gen(large) builds -- so the timing that counts comes
+    # from gen_large, not from the input nothing could judge.
+    oracle = (ORACLE_NO_VERDICT_ON_BIG
+              + "def bounds(a, b):\n    if a > 10**9:\n        raise RuntimeError('too big to check')\n    return None\n")
+    oracle = oracle.replace("def gen(seed, mode):\n", "def gen(seed, mode):\n    if mode == 'large':\n        return (10**8, 10**8)\n")
+    lines = []
+    gi = V.prepare_gate_inputs(PY, oracle, STRESS_HUGE, {"cases_small": 3, "cases_medium": 1},
+                               workdir=str(tmp_path / "p"), budget=FakeBudget(), log=lines.append)
+    assert gi.stress_source == "gen_max" and gi.stress_validity == "unjudged"
+    limits = {"cases_small": 3, "cases_medium": 1, "mem_mb": 2048, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0}
+    ev = {e.kind: e for e in V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lines.append)}
+    assert any("stress.fallthrough from=gen_max to=gen_large" in l for l in lines)
+    assert gi.stress_source == "gen_large" and gi.stress_validity == "bounds_checked"
+    e = ev["stress"]
+    assert e.passed and not e.skipped and "degraded" not in e.detail   # real evidence, from the judged source
+    assert e.detail["validity"] == "bounds_checked"
+
+def test_an_unjudged_input_keeps_its_own_measurement_when_no_source_is_better(tmp_path):
+    # gen(large) is no more judgeable than gen_max was: the source is marked tried, but the run
+    # keeps the input it had rather than spending a second timing grant on the same verdict.
+    oracle = ORACLE_NO_VERDICT_ON_BIG.replace("def gen(seed, mode):\n", "def gen(seed, mode):\n    if mode == 'large':\n        return (10**17, 10**17)\n")
+    lines = []
+    gi = V.prepare_gate_inputs(PY, oracle, STRESS_HUGE, {"cases_small": 3, "cases_medium": 1},
+                               workdir=str(tmp_path / "p"), budget=FakeBudget(), log=lines.append)
+    assert gi.stress_validity == "unjudged" and gi.stress_source == "gen_max"
+    limits = {"cases_small": 3, "cases_medium": 1, "mem_mb": 2048, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0}
+    e = {x.kind: x for x in V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lines.append)}["stress"]
+    assert "gen_large" in gi.stress_tried and gi.stress_source == "gen_max"   # tried, not adopted
+    assert e.passed and e.skipped and e.detail["degraded"] == V.UNJUDGED_STRESS_REASON
