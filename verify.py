@@ -52,6 +52,7 @@ class GateInputs:
     stress_input: object = None
     stress_degraded: bool = False
     stress_source: str = ""   # gen_max | gen_large | medium_degraded -- which generator produced the timing input
+    stress_validity: str = ""   # accepted | unjudged -- what the oracle's validate() said about the timing input
     validate_trusted: bool = False   # the oracle's validate() accepted at least one generated input and was not distrusted
     validate_reject_frac: float = 0.0   # rejected/checked over small+medium: how far the oracle's validate() and gen() disagree
     validate_rejects: dict = field(default_factory=dict)   # tier -> (checked, rejected, up to two rejected inputs), for the self-repair prompt
@@ -67,6 +68,7 @@ class GateInputs:
         return {"small": len(self.cases_small), "medium": len(self.cases_medium), "edge": len(self.cases_edge),
                 "public": len(self.cases_public), "stress": self.stress_input is not None,
                 "stress_source": self.stress_source, "stress_degraded": self.stress_degraded,
+                "stress_validity": self.stress_validity,
                 "notes": self.notes, "example_checks": self.example_checks}
 
 @dataclass
@@ -569,20 +571,36 @@ def _input_size(v) -> int:
     return len((v if isinstance(v, str) else repr(v)).encode("utf-8", "replace"))
 
 def _accept_stress_input(problem, gi: GateInputs, oracle_src: str, value, source: str, *, workdir: str, budget) -> bool:
-    """Take `value` as the max-size stress input unless the oracle's own validate() rejects it.
+    """Take `value` as the max-size stress input unless the oracle's own validate() rejects it, and
+    record which of the three verdicts it got: accepted, rejected, or unjudged.
 
     The stress input is the one gate input no tier validated: an invalid max-size input makes the
     stress step meaningless -- the candidate crashes or answers nonsense on something the statement
-    forbids, and a repair attempt gets spent chasing it."""
+    forbids, and a repair attempt gets spent chasing it.
+
+    `unjudged` is the third outcome and it used to be silently treated as `accepted`: validate()
+    timed out or crashed on the input, or there is no trusted validate() in this run at all, so
+    nothing in the system can say whether the input is legal. On bench15 gen_max returned an input
+    nested 200,000 deep against a stated cap of 60; the literal reference could not finish on it, so
+    there was no verdict, and both candidates -- one of them correct and fast on every legal maximum
+    -- were killed at the timing cap by an input the statement forbids. The input is still USED (a
+    timing measurement on a doubtful input is better than none), but everything it produces is
+    degraded: see stress(). Generic over every problem whose constraints include a bound the literal
+    oracle cannot evaluate, which is precisely the class where timing matters most."""
     value = _clean_stdin(problem, value)
     verdicts = None
     if gi.validate_trusted:
         verdicts, _ = _validate_inputs(problem, oracle_src, [value], workdir=os.path.join(workdir, f"{source}_validate"),
                                        timeout_s=budget.step_timeout(20.0, reserve_s=20.0))
-    if verdicts and verdicts[0] is False:   # None = validate crashed/timed out on it: keep the input
+    verdict = ("accepted" if verdicts and verdicts[0] is True else
+               "rejected" if verdicts and verdicts[0] is False else "unjudged")
+    if verdict == "rejected":
         gi.notes.append(f"{source} output rejected by validate(); not used")
         return False
-    gi.stress_input, gi.stress_source = value, source
+    gi.stress_input, gi.stress_source, gi.stress_validity = value, source, verdict
+    if verdict == "unjudged":
+        gi.notes.append(f"{source} output could not be validated (the reference gave no verdict on it); "
+                        "its timing is indicative only")
     return True
 
 def prepare_oracle_tiers(problem, oracle_src: str, limits: dict, *, workdir: str, budget, log) -> GateInputs:
@@ -702,7 +720,7 @@ def prepare_stress_inputs(problem, gi: GateInputs, stress_src: str, limits: dict
         gi.stress_source = "medium_degraded"
         gi.notes.append("stress input degraded: no usable gen_max or gen(large) output, using largest medium case instead (not a true max-size input)")
     if gi.stress_input is not None:
-        log(f"stress.input source={gi.stress_source} size={_input_size(gi.stress_input)}")
+        log(f"stress.input source={gi.stress_source} validity={gi.stress_validity or 'unvalidated'} size={_input_size(gi.stress_input)}")
 
 def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict, *, workdir: str, budget, log, examples: dict | None = None) -> GateInputs:
     """All three phases in one call, for every caller that has the oracle, the stress source and the
@@ -712,7 +730,10 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
     prepare_stress_inputs(problem, gi, stress_src, limits, workdir=workdir, budget=budget, log=log)
     return gi
 
-def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, mem_mb: int, degraded: bool = False, min_plausible_s: float = 0.0) -> Evidence:
+UNJUDGED_STRESS_REASON = ("max-size input could not be validated (reference did not finish); "
+                          "timing is indicative only")
+
+def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, mem_mb: int, degraded: bool = False, min_plausible_s: float = 0.0, unjudged: bool = False) -> Evidence:
     if stress_input is None:
         return Evidence("stress", True, 0, 0.0, {"skipped": "no stress input"}, skipped=True)
     t0 = time.monotonic()
@@ -733,7 +754,15 @@ def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, 
     # where r.ok is still in hand.
     detail = {"duration_s": round(dur, 3), "limit_s": limit_s, "timed_out": r.timed_out,
               "too_slow": bool(r.timed_out or (r.ok and dur > limit_s)), "error": r.error[-400:]}
-    if degraded:
+    if unjudged:
+        # Nothing in the run could say whether this input is legal (see _accept_stress_input), so
+        # neither direction of the measurement is evidence: a pass is not proof the candidate is fast
+        # enough on a legal maximum, and a failure is not proof it is too slow on one. It is recorded
+        # as a SKIPPED PASS either way -- that is what keeps it out of passed_all_gates while making
+        # it impossible for it to fail a candidate, spend a repair, or trigger a fresh solve on an
+        # input nothing can confirm. The measured numbers stay in the detail, as a note, not a verdict.
+        detail["degraded"] = UNJUDGED_STRESS_REASON
+    elif degraded:
         detail["degraded"] = "gen_max failed; this is the largest medium case, not a true max-size input -- this timing is not a real max-size stress check"
     # An answer that arrives faster than any real work could is not a timing measurement, whatever
     # the input weighed. On bench14 gen_max's first operation named an identifier the input never
@@ -741,7 +770,7 @@ def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, 
     # gate recorded that as evidence of speed -- for a solution that needs ~10^11 s at the stated
     # limits. Generic over every early-exit shape (first-invalid-index, validators, short-circuiting
     # searches): the step cannot be a pass, because nothing was actually exercised.
-    suspicious = passed and not degraded and min_plausible_s > 0 and dur < min_plausible_s
+    suspicious = passed and not detail.get("degraded") and min_plausible_s > 0 and dur < min_plausible_s
     if suspicious:
         detail["suspicious"] = (f"finished in {dur:.3f} s on a {_input_size(stress_input)}-byte input; "
                                 "the input may not exercise the candidate")
@@ -750,7 +779,8 @@ def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, 
     # candidate is fast enough: record it as a SKIPPED step, which is what the finalizer and the
     # benchmark already treat as "not checked". A degraded run that was still too slow is kept as a
     # real failure -- too slow on a smaller-than-max input is only more damning.
-    return Evidence("stress", passed, 1, time.monotonic() - t0, detail, skipped=(degraded or suspicious) and passed)
+    return Evidence("stress", passed or unjudged, 1, time.monotonic() - t0, detail,
+                    skipped=unjudged or ((degraded or suspicious) and passed))
 
 def overflow_check(problem, binary: str | None, stress_input, *, limit_s: float, mem_mb: int) -> Evidence:
     """Reruns the max-size stress input on the OVERFLOW-CHECKED build (the one already compiled and
@@ -905,7 +935,7 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         e = Evidence("stress", True, 0, 0.0, {"skipped": "no budget"}, skipped=True)
     else:
         e = stress(problem, source, gi.stress_input, workdir=os.path.join(workdir, "stress"), limit_s=min(limit, avail), mem_mb=limits["mem_mb"], degraded=gi.stress_degraded,
-                   min_plausible_s=limits.get("stress_min_plausible_s", 0.0))
+                   min_plausible_s=limits.get("stress_min_plausible_s", 0.0), unjudged=gi.stress_validity == "unjudged")
     ev.append(e); log(_gate_line(e, f"duration={e.detail.get('duration_s')}"))
     # Placed after stress (not before) so stress's timing measurement runs first, on a warm cache,
     # unaffected by this step; and so this step's own subprocess never masks a stress timeout.
@@ -1139,6 +1169,7 @@ def regenerate_oracle(run, gi: GateInputs, extra: str, pv: dict, *, counter: str
     # to be left behind here, which silently turned a degraded timing run back into a full pass.
     if gi.stress_input is not None and (not gi.stress_degraded or new.stress_input is None):
         new.stress_input, new.stress_degraded, new.stress_source = gi.stress_input, gi.stress_degraded, gi.stress_source
+        new.stress_validity = gi.stress_validity
     new.oracle_regens, new.oracle_selfrepairs = gi.oracle_regens, gi.oracle_selfrepairs
     setattr(new, counter, getattr(new, counter) + 1)
     new.regen_failed = False

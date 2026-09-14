@@ -362,7 +362,7 @@ def test_gen_max_failure_falls_back_to_the_oracles_large_mode(tmp_path):
     logs = []
     gi = V.prepare_gate_inputs(PY, ORACLE_WITH_LARGE, BAD_GENMAX, limits, workdir=str(tmp_path), budget=FakeBudget(), log=logs.append)
     assert gi.stress_input == (10**18, 10**18) and gi.stress_source == "gen_large" and gi.stress_degraded is False
-    assert any(l.startswith("stress.input source=gen_large size=") for l in logs)
+    assert any(l.startswith("stress.input source=gen_large validity=accepted size=") for l in logs)
 
 def test_a_large_mode_that_is_not_actually_large_is_degraded(tmp_path):
     # An oracle whose gen() ignores its mode argument answers "large" with a small input; timing a
@@ -807,3 +807,42 @@ def test_run_gate_marks_a_zero_work_stress_run_degraded_from_the_limit(tmp_path)
                                         workdir=str(tmp_path), budget=FakeBudget(), limits=limits, log=lines.append)}
     assert ev["stress"].passed and ev["stress"].skipped and ev["stress"].detail.get("suspicious")
     assert any("gate.stress skipped=True reason=finished in" in l for l in lines)
+
+
+# --- round 14: a max-size input nothing could validate cannot fail a candidate ---
+
+# validate() is the literal reference, and on bench15 it could not finish on the max-size input:
+# no verdict. Here it crashes on any large input instead of hanging, which is the same "no verdict"
+# outcome through _validate_inputs, without costing the test a timeout.
+ORACLE_NO_VERDICT_ON_BIG = (ORACLE + "def validate(a, b):\n"
+                            "    if a > 10**6 or b > 10**6:\n        raise RuntimeError('cannot judge an input this big')\n"
+                            "    return True\n")
+STRESS_HUGE = "def gen_max(seed):\n    return (10**18, 10**18)\nEDGES = [(0, 0)]\n"
+
+def test_an_unjudged_max_size_input_is_used_but_degrades_the_timing(tmp_path):
+    gi = V.prepare_gate_inputs(PY, ORACLE_NO_VERDICT_ON_BIG, STRESS_HUGE, {"cases_small": 3, "cases_medium": 1},
+                               workdir=str(tmp_path / "p"), budget=FakeBudget(), log=lambda m: None)
+    assert gi.stress_source == "gen_max" and gi.stress_validity == "unjudged"
+    assert gi.stress_input is not None   # the input is still used: an indicative timing beats none
+    assert any("could not be validated" in n for n in gi.notes)
+
+def test_a_timeout_on_an_unjudged_input_never_fails_the_candidate(tmp_path):
+    p = Problem("p", "python", "s", "f", [], 300.0)
+    slow = "def f(n):\n    t = 0\n    for i in range(n):\n        t += i\n    return t\n"
+    gi = V.GateInputs(oracle_src=ORACLE, stress_input=(3_000_000,), stress_validity="unjudged")
+    limits = {"cases_small": 3, "cases_medium": 1, "mem_mb": 2048, "stress_limit_python_s": 0.05, "stress_limit_rust_s": 2.0}
+    lines = []
+    ev = {e.kind: e for e in V.run_gate(p, slow, gi, workdir=str(tmp_path), budget=FakeBudget(), limits=limits, log=lines.append)}
+    e = ev["stress"]
+    assert e.detail["too_slow"] and e.detail["duration_s"] > 0.05   # the measurement is honest...
+    assert e.passed and e.skipped                                   # ...and it is still not a failure
+    assert e.detail["degraded"] == V.UNJUDGED_STRESS_REASON
+    assert any("gate.stress skipped=True reason=max-size input could not be validated" in l for l in lines)
+
+def test_an_accepted_max_size_input_still_fails_a_slow_candidate(tmp_path):
+    p = Problem("p", "python", "s", "f", [], 300.0)
+    slow = "def f(n):\n    t = 0\n    for i in range(n):\n        t += i\n    return t\n"
+    gi = V.GateInputs(oracle_src=ORACLE, stress_input=(3_000_000,), stress_validity="accepted")
+    limits = {"cases_small": 3, "cases_medium": 1, "mem_mb": 2048, "stress_limit_python_s": 0.05, "stress_limit_rust_s": 2.0}
+    e = {x.kind: x for x in V.run_gate(p, slow, gi, workdir=str(tmp_path), budget=FakeBudget(), limits=limits, log=lambda m: None)}["stress"]
+    assert not e.passed and not e.skipped and e.detail["too_slow"] and "degraded" not in e.detail

@@ -1078,3 +1078,46 @@ def test_the_example_check_runs_against_the_prepared_oracle_after_the_solves(tmp
     small = next(i for i, l in enumerate(rep["events"]) if "oracle.small cases=" in l)
     ex = next(i for i, l in enumerate(rep["events"]) if "oracle.examples cases=" in l)
     assert small < ex
+
+
+# --- round 14: an unvalidated max-size input cannot fail a candidate ---
+
+# The literal reference cannot finish on a max-size input, so validate() gives no verdict on it
+# (bench15). Raising here is the same "no verdict" outcome as the timeout was, at no cost in test time.
+ORACLE_SUM_NO_VERDICT = ORACLE_SUM.replace(
+    "===END===\n", "def validate(xs):\n    if len(xs) > 100:\n        raise RuntimeError('cannot judge an input this big')\n    return True\n===END===\n")
+STRESS_MID_LIST = "===STRESS===\ndef gen_max(seed):\n    return (list(range(5000)),)\nEDGES = [([],), ([5],)]\n===END===\n"
+
+def test_a_slow_run_on_an_unjudged_max_size_input_is_not_a_failure(tmp_path):
+    # bench15: gen_max returned a structure nested 200 000 deep against a stated cap of 60, the
+    # reference could not judge it, and the timing gate failed a candidate that is fast on every
+    # legal maximum. An input nothing could validate must never fail one, nor spend a fresh solve.
+    c = slow_cfg(); c["limits"]["stress_limit_python_s"] = 0.05
+    llm = FakeLLM({"solve": [SOLVE_QUADRATIC, SOLVE_LINEAR], "oracle": [ORACLE_SUM_NO_VERDICT], "stress": [STRESS_MID_LIST]})
+    rep = S.solve(sumprob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["gate_inputs"]["stress_validity"] == "unjudged" and rep["gate_inputs"]["stress_source"] == "gen_max"
+    ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
+    assert ev["stress"]["detail"]["too_slow"]                       # measured honestly
+    assert ev["stress"]["passed"] and ev["stress"]["skipped"]       # and still not a failure
+    assert rep["fresh_solves"] == 0 and rep["repairs"] == 0 and len(_prompts(llm, "solve")) == 1
+    assert rep["status"] == "emitted_unverified"                    # never passed_all_gates either
+    assert any("validity=unjudged" in e for e in rep["events"])
+
+def _cand_with_stress(cid, duration):
+    c = S.Candidate(cid, f"# {cid}", None)
+    c.evidence = [S.V.Evidence("static", True), S.V.Evidence("diff_small", True, 5, detail={"mismatches": 0}),
+                  S.V.Evidence("stress", True, 1, detail={"duration_s": duration})]
+    return c
+
+def test_two_all_passing_candidates_are_ranked_by_measured_stress_time(tmp_path):
+    # bench15 shipped the first of two identically-scored candidates by attempt order; the other is
+    # 10x slower on legal maximum-size inputs.
+    slow, fast = _cand_with_stress("c1", 4.2), _cand_with_stress("c2", 0.3)
+    assert S.best_candidate([slow, fast]) is fast
+    assert S.best_candidate([fast, slow]) is fast
+    # a candidate whose timing is not a real measurement is not compared on it: the tie falls back
+    # to candidate_score's own last tie-break, the older attempt.
+    slow, degraded = _cand_with_stress("c1", 4.2), _cand_with_stress("c2", 0.3)
+    degraded.evidence[-1].detail["degraded"] = "not a true max-size input"
+    assert S.measured_stress_s(degraded) is None
+    assert S.best_candidate([slow, degraded]) is slow

@@ -179,9 +179,34 @@ def regression_score(c: Candidate) -> tuple:
     return (c.passed_count(), -sum(1 for e in c.evidence if not e.passed and not e.skipped))
 
 
+def measured_stress_s(c: Candidate) -> float | None:
+    """The candidate's max-size stress time, when it is a real measurement: the step ran, passed, and
+    its input was a true, validated maximum. A degraded/skipped step (an unjudged or below-maximum
+    input, an implausibly fast answer) is not a measurement, and a failed Python run reports a
+    `limit_s + 1` sentinel rather than a duration -- neither is comparable across candidates."""
+    for e in c.evidence:
+        if e.kind == "stress" and e.passed and not e.skipped and not e.detail.get("degraded") and "duration_s" in e.detail:
+            return float(e.detail["duration_s"])
+    return None
+
+
 def best_candidate(cands: list[Candidate]) -> Candidate | None:
+    """Best by candidate_score, with one extra tie-break: two candidates whose evidence is otherwise
+    identical (same steps passed, same mismatch and failure totals -- the common case, since most
+    gate steps are pass/fail) are separated by their measured max-size stress time.
+
+    bench15 emitted the first of two byte-identically-scored candidates purely by attempt order; the
+    other one takes 8-12 s on legal maximum-size inputs where the emitted one takes 0.74 s, so the
+    run shipped the fast solution by luck. The comparison is only made when EVERY candidate in the
+    tied group has a real measurement (see measured_stress_s), otherwise a candidate whose timing
+    step was skipped would win or lose on the absence of evidence; the fall-back is candidate_score's
+    own last tie-break, the older attempt."""
     if not cands: return None
-    return max(cands, key=candidate_score)
+    best = max(cands, key=candidate_score)
+    tied = [c for c in cands if candidate_score(c)[:3] == candidate_score(best)[:3]]
+    if len(tied) > 1 and all(measured_stress_s(c) is not None for c in tied):
+        return min(tied, key=lambda c: (measured_stress_s(c), int(c.id[1:])))
+    return best
 
 
 # One gate pass, for the affordability check before a fresh solve. Taken from the measured numbers
