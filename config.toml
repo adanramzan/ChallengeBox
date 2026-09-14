@@ -187,6 +187,11 @@ price_in_per_m = 5.0
 price_out_per_m = 25.0  # OpenRouter reports usage.cost and the client prefers it; these are the fallback
 omit_temperature = true  # Claude 5 takes no sampling temperature once thinking is on (same reason as [profiles.anthropic.strong])
 extra = { reasoning = { effort = "medium" } }
+# What a call really cost, asked of the provider when the stream was cut off before its usage chunk
+# arrived. The buffer estimate llm.py falls back to ignores reasoning tokens entirely, so a salvaged
+# thinking call under-reports by an order of magnitude: bench17 and bench18 reported $0.12 between
+# them and the key's usage rose by $0.32. One GET, never retried, failure ignored.
+usage_lookup_url = "https://openrouter.ai/api/v1/generation?id={id}"
 # Per-tag overrides merged over `extra`, one entry per prompt tag. After the gate the deadline is
 # measured in tens of seconds, not hundreds, so the two post-gate calls (repair, solve_fresh) think
 # at low effort instead: at medium effort a solve call measured 150-200s, and a repair at low effort
@@ -217,6 +222,7 @@ max_tokens = 8000
 max_concurrent = 3
 timeout_cap_s = 150.0   # oracle writes reference+gen+validate; round 13 measured 106-128s, so the cap sits above it
 extra = {}   # non-reasoning model: reasoning params are ignored and burn the whole budget
+usage_lookup_url = "https://openrouter.ai/api/v1/generation?id={id}"
 
 # Anthropic, through its OpenAI-compatible endpoint (which Anthropic describes as a layer for testing
 # and comparing models, not a production-grade path). Claude 5 models reject sampling parameters and

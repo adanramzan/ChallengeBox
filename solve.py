@@ -176,6 +176,8 @@ class Run:
         self.log(f"{tag}.sent role={role} timeout={timeout:.0f}")
         r = self.llm.chat(role, "You are a precise competitive-programming engineer.", render(prompt_name, **vars), timeout_s=timeout, tag=tag)
         self.log(f"{tag}.done error={r.error} latency={r.latency_s:.1f} usage={r.usage}")
+        if getattr(r, "cost_lookup", None):
+            self.log(f"cost.lookup id={r.cost_lookup['id']} cost={r.cost_lookup.get('cost')}")
         return r
 
 

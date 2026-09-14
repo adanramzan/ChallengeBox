@@ -46,6 +46,11 @@ class Role:
     # fraction alone is tuned to the deadline, not to the model, and for a thinking model it is far
     # below the call's measured latency. 0 keeps the fraction as the only rule.
     repair_cap_s: float = 0.0
+    # Where to ask the provider what a call actually cost, when the stream never delivered its usage
+    # chunk. `{id}` is filled with the generation id the first streamed chunk carried. Empty (the
+    # default) means there is nothing to ask and the buffer estimate stands. A provider difference,
+    # so it lives here rather than in a branch in chat(); the response shape is read leniently.
+    usage_lookup_url: str = ""
 
 
 @dataclass
@@ -61,6 +66,9 @@ class Reply:
     # downstream that reads such a reply has to ask which blocks actually closed (`salvageable`),
     # because the block the cut landed in is truncated, not finished.
     partial: bool = False
+    # {id, cost} when the real cost of this call was fetched from the provider after the fact (see
+    # _lookup_usage). None when it was not asked for, or the lookup failed and `usage` is an estimate.
+    cost_lookup: dict | None = None
 
     @property
     def text(self) -> str:
@@ -76,7 +84,7 @@ def load_config(path: str, profile: str) -> dict:
                         int(r.get("transport_retries", 2)), float(r.get("transport_backoff_s", 2.0)),
                         r.get("token_param", "max_tokens"), bool(r.get("omit_temperature", False)), float(r.get("price_in_per_m", 0.0)), float(r.get("price_out_per_m", 0.0)),
                         bool(r.get("stream", True)), float(r.get("stall_timeout_s", 30.0)),
-                        dict(r.get("tag_extra", {})), float(r.get("repair_cap_s", 0.0)))
+                        dict(r.get("tag_extra", {})), float(r.get("repair_cap_s", 0.0)), r.get("usage_lookup_url", ""))
              for name, r in prof.items()}
     # `roles` is the per-role model config above; `prompt_roles` is the [roles] table -- which model
     # role each PROMPT is sent to (solve.PROMPT_ROLES holds the defaults when it is absent). Two
@@ -101,7 +109,7 @@ def _new_acc() -> dict:
     abandoned. `content`/`reasoning` are lists because list.append and the reader's slice copy are
     each atomic under the GIL -- that is the whole of the thread safety needed here, and one is
     created per attempt so an abandoned thread can never write into a later call's buffer."""
-    return {"content": [], "reasoning": [], "usage": {}, "model": None}
+    return {"content": [], "reasoning": [], "usage": {}, "model": None, "id": None}
 
 
 def _acc_text(acc: dict) -> tuple[str, str]:
@@ -127,6 +135,7 @@ def _read_sse(resp, acc: dict) -> dict:
         except ValueError:   # a keep-alive or a malformed frame is not the answer; skip it
             continue
         acc["model"] = chunk.get("model") or acc["model"]
+        acc["id"] = acc["id"] or chunk.get("id")   # what _lookup_usage asks the provider about
         if chunk.get("usage"):
             acc["usage"] = chunk["usage"]
         for ch in chunk.get("choices") or []:
@@ -140,6 +149,35 @@ def _read_sse(resp, acc: dict) -> dict:
     if acc["model"]:
         out["model"] = acc["model"]
     return out
+
+
+def _lookup_usage(r: Role, gen_id: str, headers: dict) -> dict | None:
+    """What the call really cost, asked of the provider after the fact.
+
+    A stream cut off at its timeout never reaches its usage chunk, so the only figure available is
+    len(buffer) // 4 -- which ignores reasoning tokens entirely and is therefore wrong by an order of
+    magnitude for a thinking model. bench17 and bench18 reported $0.12 between them while the key's
+    usage rose by $0.32. One GET, the call's own auth header, 10 s, never retried: any failure returns
+    None and the estimate stands, because a cost figure is a report line and never a control decision
+    inside the call. The response is read leniently (OpenRouter wraps it in `data` and spells the
+    counts `tokens_prompt` / `tokens_completion` / `total_cost`) so no provider name appears here."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(r.usage_lookup_url.format(id=gen_id), headers=headers), timeout=10.0) as resp:
+            d = json.load(resp)
+    except Exception:
+        return None
+    if isinstance(d, dict) and isinstance(d.get("data"), dict):
+        d = d["data"]
+    if not isinstance(d, dict):
+        return None
+    usage = {}
+    for key, names in (("prompt_tokens", ("tokens_prompt", "native_tokens_prompt", "prompt_tokens")),
+                       ("completion_tokens", ("tokens_completion", "native_tokens_completion", "completion_tokens")),
+                       ("cost", ("total_cost", "cost"))):
+        v = next((d[n] for n in names if isinstance(d.get(n), (int, float)) and not isinstance(d.get(n), bool)), None)
+        if v is not None:
+            usage[key] = v
+    return usage or None
 
 
 def _fill_cost(usage: dict, r: Role) -> dict:
@@ -235,6 +273,13 @@ class LLM:
             d = result["data"]; msg = d["choices"][0]["message"]
             reply = Reply(msg.get("content") or "", msg.get("reasoning_content") or msg.get("reasoning") or "",
                           _fill_cost(d.get("usage") or {}, r), latency, d.get("model", r.model), None)
+        # A reply with no usage of its own -- cut off before the usage chunk, or a stream that never
+        # sent one -- is the only case worth a round trip; everything else already has the numbers.
+        if r.usage_lookup_url and acc.get("id") and (reply.partial or not reply.usage):
+            found = _lookup_usage(r, acc["id"], headers)
+            if found:
+                reply.usage, estimated = found, False
+                reply.cost_lookup = {"id": acc["id"], "cost": found.get("cost")}
         rec = {"role": role, "tag": tag, "model": reply.model, "latency_s": round(latency, 2), "usage": reply.usage,
                "error": reply.error, "timed_out": timed_out, "partial": reply.partial, "max_tokens": limit}
         if estimated:

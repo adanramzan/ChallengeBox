@@ -350,7 +350,7 @@ class _PartialHandler(_Handler):
     """Streams a ===CODE=== block and then goes quiet, never sending [DONE]. With close_code the
     block is terminated first and the stream stops inside ===TRAPS===; without it the cut lands
     inside the code itself."""
-    requests = 0; close_code = True
+    requests = 0; close_code = True; fail_lookup = False; lookups = 0
     def do_POST(self):
         json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         with _Handler.lock:
@@ -359,15 +359,27 @@ class _PartialHandler(_Handler):
         pieces = ["===CODE===\n", "def add(a, b):\n    return a + b\n"]
         pieces += ["===END===\n", "===TRAPS===\nwatch out for over"] if _PartialHandler.close_code else ["    # more to come"]
         for piece in pieces:
-            self._sse({"model": "m", "choices": [{"delta": {"content": piece}}]})
+            self._sse({"id": "gen-abc", "model": "m", "choices": [{"delta": {"content": piece}}]})
         time.sleep(4)   # longer than any timeout_s the tests below use
+    def do_GET(self):
+        # the provider's generation-metadata endpoint: what the cut-off call actually cost
+        with _Handler.lock:
+            _PartialHandler.lookups += 1
+        if _PartialHandler.fail_lookup:
+            self.send_response(500); self.send_header("Content-Length", "0"); self.end_headers(); return
+        assert "id=gen-abc" in self.path and self.headers.get("Authorization") == "Bearer k"
+        body = json.dumps({"data": {"id": "gen-abc", "total_cost": 0.42,
+                                    "tokens_prompt": 100, "tokens_completion": 2000}}).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 
 @pytest.fixture
 def partial_server():
     srv = ThreadingHTTPServer(("127.0.0.1", 0), _PartialHandler); th = threading.Thread(target=srv.serve_forever, daemon=True); th.start()
     _PartialHandler.requests = 0; _PartialHandler.close_code = True
+    _PartialHandler.fail_lookup = False; _PartialHandler.lookups = 0
     yield f"http://127.0.0.1:{srv.server_port}/v1"
-    srv.shutdown(); _PartialHandler.close_code = True
+    srv.shutdown(); _PartialHandler.close_code = True; _PartialHandler.fail_lookup = False
 
 def test_a_timed_out_stream_keeps_what_it_streamed(partial_server):
     role = Role("strong", partial_server, "m", "", 100, 3, 30.0, {}, transport_retries=0,
@@ -414,3 +426,43 @@ def test_terminated_blocks_reads_the_last_occurrence_like_parse_blocks():
     assert parse_blocks(t)["CODE"] == "final but cut off" and terminated_blocks(t) == set()
     t2 = "===VERDICT===\ncandidate\n===END===\n===CODE===\nx = 1\n===END===\n===NOTES===\nhalf"
     assert terminated_blocks(t2) == {"VERDICT", "CODE"}
+
+
+# --- round 14 batch 7: a salvaged call's real cost ---
+
+def _lookup_role(server):
+    return Role("strong", server, "m", "KEY_LOOKUP", 100, 3, 30.0, {}, transport_retries=0,
+                price_out_per_m=10.0, stall_timeout_s=10.0,
+                usage_lookup_url=server + "/generation?id={id}")
+
+def test_a_salvaged_calls_real_cost_is_looked_up(partial_server, monkeypatch):
+    monkeypatch.setenv("KEY_LOOKUP", "k")
+    llm = LLM({"strong": _lookup_role(partial_server)})
+    r = llm.chat("strong", "s", "u", timeout_s=1.0)
+    assert r.partial and salvageable(r)
+    assert r.cost_lookup == {"id": "gen-abc", "cost": 0.42}
+    rec = llm.calls[-1]
+    # the measured numbers replace the buffer estimate entirely, and the record no longer claims one
+    assert rec["usage"] == {"prompt_tokens": 100, "completion_tokens": 2000, "cost": 0.42}
+    assert "estimated" not in rec and _PartialHandler.lookups == 1
+
+def test_a_failed_lookup_leaves_the_estimate_flagged(partial_server, monkeypatch):
+    monkeypatch.setenv("KEY_LOOKUP", "k")
+    _PartialHandler.fail_lookup = True
+    llm = LLM({"strong": _lookup_role(partial_server)})
+    r = llm.chat("strong", "s", "u", timeout_s=1.0)
+    assert r.partial and r.cost_lookup is None
+    rec = llm.calls[-1]
+    assert rec["estimated"] is True and rec["usage"]["completion_tokens"] == len(r.text) // 4
+    assert rec["usage"]["cost"] > 0 and _PartialHandler.lookups == 1
+
+def test_a_role_without_a_lookup_url_never_asks(partial_server):
+    role = Role("strong", partial_server, "m", "", 100, 3, 30.0, {}, transport_retries=0,
+                price_out_per_m=10.0, stall_timeout_s=10.0)
+    r = LLM({"strong": role}).chat("strong", "s", "u", timeout_s=1.0)
+    assert r.partial and r.cost_lookup is None and _PartialHandler.lookups == 0
+
+def test_config_gives_the_openrouter_roles_a_usage_lookup_url():
+    roles = load_config(str(ROOT / "config.toml"), "openrouter")["roles"]
+    assert all(r.usage_lookup_url == "https://openrouter.ai/api/v1/generation?id={id}" for r in roles.values())
+    assert load_config(str(ROOT / "config.toml"), "openai")["roles"]["strong"].usage_lookup_url == ""
