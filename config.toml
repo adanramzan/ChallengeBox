@@ -21,6 +21,15 @@ stress_limit_rust_s = 2.0
 # down if a problem set is full of such answers -- 0 disables the signal entirely.
 stress_min_plausible_s = 0.01
 max_repairs = 2
+# What the SOLVE call must leave behind, in seconds. With solve_attempts = 1 the solve call is the
+# only thing in the run that can produce an answer, so its ceiling is "everything except what a gate
+# pass and emission need" rather than a share of the generate phase: one gate pass is 2-30 s
+# including a Rust compile, plus the emit margin. bench17 gave one Opus attempt 200 s
+# ([phases] generate_call_share 0.70 * 285 s usable), it timed out at 199.5 s, and 85 s of the
+# budget went unused. The oracle and stress calls keep generate_call_share -- once preparation
+# overlaps the solve call they are no longer on the critical path. Raise this if a gate pass on the
+# problem set regularly costs more than a Rust compile plus one differential tier.
+solve_reserve_s = 45.0
 # Independent SOLVE attempts, issued concurrently and gated against the same oracle as each reply
 # lands; best_candidate() keeps whichever passes the most gates. Two attempts were tuned to a 17s
 # non-reasoning coder model, where the second one was free: N attempts cost max() latency, not
@@ -156,7 +165,10 @@ model = "anthropic/claude-opus-5"
 api_key_env = "OPENROUTER_API_KEY"
 max_tokens = 24000
 max_concurrent = 3
-timeout_cap_s = 210.0   # thinking + answer; the generate share (0.70 of ~285s usable) is what binds first
+timeout_cap_s = 240.0   # measured 152-200+ s at medium effort (and twice at the cap); with the
+                        # salvage of a cut-off stream (llm.salvageable) a call clipped at this cap
+                        # still yields the code when ===CODE=== was emitted, so the cap can sit above
+                        # the measured spread. [limits] solve_reserve_s is what binds first.
 stall_timeout_s = 45.0  # time-to-first-token is longer with thinking; only a real stall should abort
 price_in_per_m = 5.0
 price_out_per_m = 25.0  # OpenRouter reports usage.cost and the client prefers it; these are the fallback

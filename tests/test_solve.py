@@ -1330,3 +1330,40 @@ def test_a_timed_out_repair_with_a_complete_code_block_is_used(tmp_path):
     rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert any("repair.partial" in e for e in rep["events"]) and "c2" in rep["evidence"]
     assert rep["repairs"] == 1 and rep["solver_status"] == "partial"
+
+
+# --- round 14 batch 6: the lone solve attempt's ceiling follows the budget ---
+
+def _sent_timeout(events, tag):
+    return float(next(e for e in events if f"{tag}.sent " in e).split("timeout=")[1])
+
+def test_the_solve_call_may_use_the_budget_up_to_the_gate_reserve(tmp_path):
+    from llm import Role
+    c = cfg(); c["limits"]["solve_reserve_s"] = 45.0
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    # a role cap well above the budget, so the reserve is what binds
+    llm.roles = {"strong": Role("strong", "", "m", "", 100, 3, 240.0, {}),
+                 "fast": Role("fast", "", "m", "", 100, 3, 150.0, {})}
+    rep = S.solve(prob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    usable = 300.0 - c["limits"]["safety_margin_s"]
+    assert S.solve_call_cap(c, S.Budget(300.0, margin_s=15.0, phases=c["phases"])) == usable - 45.0
+    assert _sent_timeout(rep["events"], "solve") == round(usable - 45.0)
+    # the measuring calls keep the generate share, and a repair keeps its own cap
+    assert _sent_timeout(rep["events"], "oracle") == round(c["phases"]["generate_call_share"] * usable)
+
+def test_the_role_cap_still_binds_the_solve_call_when_it_is_the_smaller_of_the_two(tmp_path):
+    from llm import Role
+    c = cfg(); c["limits"]["solve_reserve_s"] = 45.0
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    llm.roles = {"strong": Role("strong", "", "m", "", 100, 3, 90.0, {}),
+                 "fast": Role("fast", "", "m", "", 100, 3, 150.0, {})}
+    rep = S.solve(prob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert _sent_timeout(rep["events"], "solve") == 90.0
+
+def test_config_ships_a_gate_reserve_for_the_solve_call():
+    import tomllib
+    cfg_toml = tomllib.loads((pathlib.Path(S.__file__).parent / "config.toml").read_text())
+    reserve = cfg_toml["limits"]["solve_reserve_s"]
+    assert 0 < reserve < cfg_toml["limits"]["safety_margin_s"] * 10
+    # the role cap must sit above the measured solve latency, not below it
+    assert cfg_toml["profiles"]["openrouter"]["strong"]["timeout_cap_s"] == 240.0

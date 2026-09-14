@@ -236,8 +236,22 @@ def best_candidate(cands: list[Candidate]) -> Candidate | None:
 GATE_PASS_ESTIMATE_S = 60.0
 
 
+def solve_call_cap(cfg: dict, budget) -> float:
+    """The ceiling for the initial SOLVE call: everything except what a gate pass and emission need.
+
+    At solve_attempts = 1 this call is the only thing in the run that can produce an answer, so a
+    fixed share of the generate phase is the wrong shape for it -- bench17 capped one Opus attempt at
+    200 s ([phases] generate_call_share 0.70 of 285 s usable), it timed out at 199.5 s, and 85 s of
+    the budget were never spent. [limits] solve_reserve_s is what the call must leave behind. The
+    ORACLE and STRESS calls keep generate_call_share: once preparation overlaps the solve call they
+    are no longer on the critical path. Run.chat still takes the min() with the role's own
+    timeout_cap_s, which is where the model's measured ceiling lives."""
+    return max(0.0, budget.usable_s - cfg["limits"].get("solve_reserve_s", 45.0))
+
+
 def fresh_solve_cap(cfg: dict, budget) -> float:
-    """A fresh solve is a whole new SOLVE call, so it is capped like one."""
+    """A fresh solve is a whole new SOLVE call, but it is a POST-gate one: it has to fit alongside
+    the gate pass its own result needs, so it keeps the generate share rather than solve_call_cap."""
     return cfg["phases"]["generate_call_share"] * budget.usable_s
 
 
@@ -428,9 +442,12 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
 
     with ThreadPoolExecutor(max_workers=attempts + 2) as ex:
         # All of these run concurrently, so the generate phase costs max(), not sum() —
-        # each call can therefore have the whole generate budget rather than a share of it.
+        # each call can therefore have the whole generate budget rather than a share of it. The
+        # SOLVE call gets more than a share: it is the only one that can produce an answer, so its
+        # ceiling is the budget minus what a gate pass and emission need (solve_call_cap), while the
+        # measuring calls keep generate_call_share.
         gen_cap = cfg["phases"]["generate_call_share"] * run.budget.usable_s
-        f_solves = [ex.submit(run.chat, "strong", "solve", gen_cap, **pv) for _ in range(attempts)]
+        f_solves = [ex.submit(run.chat, "strong", "solve", solve_call_cap(cfg, run.budget), **pv) for _ in range(attempts)]
         f_oracle = ex.submit(run.chat, "fast", "oracle", gen_cap, **pv)
         f_stress = ex.submit(run.chat, "fast", "stress", gen_cap, **pv)
         # The ORACLE reply is waited for FIRST and its preparation starts immediately, while the

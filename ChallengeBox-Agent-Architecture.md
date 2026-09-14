@@ -105,12 +105,14 @@ Usable time is `deadline_s` minus a 15-second safety margin. Phases are expresse
 | Window (s) | Share | Phase | Allowed |
 |---:|---:|---|---|
 | 0–5 | 2% | intake | parse, validate, build contract, start clock |
-| 5–95 | 30% | generate | three concurrent model calls, each capped at `[phases].generate_call_share` (config.toml, default 0.70) of usable time — since they run concurrently, the phase costs max() of the three, not their sum, so each can get most of the phase rather than a third of it; role caps underneath: strong 120 s, fast 150 s |
+| 5–95 | 30% | generate | three concurrent model calls — since they run concurrently, the phase costs max() of the three, not their sum, so each can get most of the phase rather than a third of it. The ORACLE and STRESS calls are capped at `[phases].generate_call_share` (config.toml, default 0.70) of usable time. The SOLVE call is capped at `usable − [limits].solve_reserve_s` (default 45 s) instead: at `solve_attempts = 1` it is the only call that can produce an answer, so its ceiling is everything except what a gate pass and emission need. Role caps underneath: strong 240 s, fast 150 s |
 | 95–115 | 7% | gate | compile, contract checks, differential, stress |
 | 115–235 | 40% | repair | up to two shrink → repair → gate cycles, each capped at `verify.repair_cap` and started only while that cap plus one gate pass (~60 s) still fits, plus at most one fresh solve (§5.7) under the same rule with the generate cap |
 | 235–270 | 12% | settle | no new model calls; the last gate result stands; write report |
 | 270–285 | 5% | emit | write the solution file atomically |
 | 285–300 | 5% | margin | reserved; never scheduled |
+
+bench17 is why the SOLVE call has its own rule: one Opus attempt was capped at 200 s (0.70 × 285 s usable), timed out at 199.5 s, and the run shipped `no_candidate` with 85 s of budget unused. A share of the phase is the right shape for the two measuring calls, which stopped being on the critical path once preparation began overlapping the solver (§5.3); it is the wrong shape for the one call the run cannot do without. The role's own `timeout_cap_s` still applies underneath — `Run.chat` takes the min() — which is where a model's measured ceiling belongs, and a call clipped at that cap now still yields its code when `===CODE===` was emitted (§8.1, salvaging a cut-off reply).
 
 The windows above are advisory, not enforced boundaries: the only phase cutoff the orchestrator
 actually checks is the repair loop's (it will not start another repair once `Budget.phase()` has left
