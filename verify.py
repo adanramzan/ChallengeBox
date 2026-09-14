@@ -137,23 +137,62 @@ def _example_literal(node):
         return v
     raise ValueError(f"not allowed in an example: {type(node).__name__}")
 
+def split_examples(block_text: str) -> list[str]:
+    """The ===EXAMPLES=== block cut into top-level expressions by BRACKET BALANCE, not by newline.
+
+    bench19's block held five examples and the gate got three: one `(args, expected)` pair was
+    pretty-printed across two physical lines, so the line-oriented scan handed ast.parse two
+    syntactically incomplete fragments and dropped both -- and the wrapped example is systematically
+    the most valuable one, since it is the deepest and longest the prompt asks for. Generic over
+    every problem whose inputs are multi-argument or deeply nested literals.
+
+    A newline or a comma SEPARATES only at depth 0; inside (), [] or {} it is part of the
+    expression. String literals (including triple-quoted ones, which a Rust stdin fixture is) are
+    consumed whole, so a comma or a bracket inside one never moves the depth or splits a piece, and
+    a `#` outside a string starts a comment that runs to end of line. Empty pieces -- a blank line, a
+    trailing comma -- are dropped silently and never counted as examples."""
+    parts, start, depth, i, n = [], 0, 0, 0, len(block_text)
+    while i < n:
+        c = block_text[i]
+        if c in "\"'":
+            q = block_text[i:i + 3] if block_text[i:i + 3] in ('"""', "'''") else c
+            i += len(q)
+            while i < n and block_text[i:i + len(q)] != q:
+                i += 2 if block_text[i] == "\\" else 1
+            i += len(q)
+            continue
+        if c == "#":
+            while i < n and block_text[i] != "\n":
+                i += 1
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth = max(0, depth - 1)
+        elif depth == 0 and c in ",\n":
+            parts.append(block_text[start:i]); start = i + 1
+        i += 1
+    parts.append(block_text[start:])
+    return [p.strip() for p in parts if p.strip()]
+
 def parse_examples(problem, block_text: str) -> list[Case]:
     """The ===EXAMPLES=== block of a SOLVE reply: input/expected pairs the solution's author
     hand-traced from the statement. This is the only ground truth in the run besides the oracle that
     was not produced by running code, and it is a SECOND reading of the statement -- so it checks the
     candidate against its own author's trace, and the oracle against a reading it did not write.
 
-    One restricted evaluation per non-blank line (never exec: this is model output). The grammar is
-    Python literals plus integer arithmetic -- `+ - * ** // %` and unary sign over int constants --
-    and nothing else, so `10**18` parses where ast.literal_eval raised on it (see _example_literal).
-    A line that does not evaluate to a 2-tuple is dropped; the caller counts the drops by comparing
-    against the line count.
+    One restricted evaluation per top-level expression (never exec: this is model output -- see
+    split_examples for what "top-level" means). The grammar is Python literals plus integer
+    arithmetic -- `+ - * ** // %` and unary sign over int constants -- and nothing else, so `10**18`
+    parses where ast.literal_eval raised on it (see _example_literal). An expression that does not
+    evaluate to a 2-tuple is dropped; the caller counts the drops by comparing against
+    example_line_count.
     Python args that are not a tuple are wrapped as a 1-tuple (a single-argument entrypoint); Rust args
     must be the stdin text, so anything but a str is dropped."""
     cases: list[Case] = []
-    for line in [l for l in block_text.splitlines() if l.strip()][:MAX_EXAMPLES]:
+    for chunk in split_examples(block_text)[:MAX_EXAMPLES]:
         try:
-            v = _example_literal(ast.parse(line.strip(), mode="eval").body)
+            v = _example_literal(ast.parse(chunk, mode="eval").body)
         except (ValueError, TypeError, SyntaxError, ZeroDivisionError, OverflowError, MemoryError, RecursionError):
             continue
         if not isinstance(v, tuple) or len(v) != 2:
@@ -168,9 +207,9 @@ def parse_examples(problem, block_text: str) -> list[Case]:
     return cases
 
 def example_line_count(block_text: str) -> int:
-    """How many lines parse_examples actually looked at -- so `dropped` counts malformed lines, not
-    the ones past the cap."""
-    return len([l for l in block_text.splitlines() if l.strip()][:MAX_EXAMPLES])
+    """How many expressions parse_examples actually looked at -- so `dropped` counts malformed ones,
+    not the ones past the cap."""
+    return len(split_examples(block_text)[:MAX_EXAMPLES])
 
 def _ref_args(problem, inp) -> tuple:
     if problem.language != "python":

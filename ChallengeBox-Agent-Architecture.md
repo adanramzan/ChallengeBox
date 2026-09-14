@@ -197,13 +197,19 @@ meant) is not reachable by any respelling and is still dropped. Counted as `orac
 ORACLE prompt carries the other half of the fix: never raise on the container *type* of an argument, since the
 harness may hand the reference either spelling.
 
-`verify.parse_examples` reads them with one restricted evaluation per line — never `exec`, this is model output.
-The grammar is Python literals plus integer arithmetic (`+ - * ** // %` and unary sign over `int` constants, with
-magnitudes capped at 10^40 and exponents at 10^4); names, calls, attributes and comprehensions are rejected, and a
+`verify.parse_examples` reads them with one restricted evaluation per top-level expression — never `exec`, this is
+model output. `verify.split_examples` cuts the block into those expressions by **bracket balance** rather than by
+newline: a newline or a comma separates only at depth 0, string literals (triple-quoted ones included, which is what
+a Rust stdin fixture is) are consumed whole, and a `#` outside a string runs to end of line. bench19 asked for five
+examples and gated on three, because the two longest — the ones the prompt asks for by name, the limit-sized trace
+and the deepest state — were pretty-printed across two physical lines and the line-oriented scan handed `ast.parse`
+two incomplete fragments. The grammar is Python literals plus integer arithmetic (`+ - * ** // %` and unary sign over
+`int` constants, with magnitudes capped at 10^40 and exponents at 10^4); names, calls, attributes and comprehensions
+are rejected, and a
 `*` whose operand is a container or a string is rejected rather than repeated. `ast.literal_eval` alone refused
 `10**18`, so on bench15 the candidate lost both of the traces covering the very limit the statement is built around
 while the other candidate, which spelled the same constant as `1000000000000000000`, lost nothing. It then
-drops any line that is not a 2-tuple (the count is reported per candidate as `examples: {count, dropped}`),
+drops any expression that is not a 2-tuple (the count is reported per candidate as `examples: {count, dropped}`),
 wraps non-tuple Python args as a 1-tuple, requires a `str` for Rust, and caps the list at 8. They are used twice:
 
 - **Against the candidate** — gate step `diff_examples` (§5.5), immediately after compile and before every

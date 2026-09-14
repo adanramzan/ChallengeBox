@@ -874,6 +874,41 @@ def test_parse_examples_rejects_everything_that_is_not_a_literal_or_integer_arit
         assert V.parse_examples(PY, line) == [], line
 
 
+# --- round 14 batch 9: a hand-traced example may be pretty-printed across several lines ---
+
+def test_parse_examples_spans_lines():
+    # bench19: five examples, three parsed. One (args, expected) pair was wrapped over two physical
+    # lines and the line-oriented scan dropped both halves.
+    two = "((1,\n  2), 3)\n"
+    assert [(c.input, c.expected) for c in V.parse_examples(PY, two)] == [((1, 2), 3)]
+    assert V.example_line_count(two) == 1
+    three = ("(((\n"
+             "    [1, 2],\n"
+             "    {'k': (3, 4)},\n"
+             "  ), 0), 7)\n")
+    assert [(c.input, c.expected) for c in V.parse_examples(PY, three)] == [((([1, 2], {"k": (3, 4)}), 0), 7)]
+    assert V.example_line_count(three) == 1
+
+def test_parse_examples_splits_on_top_level_commas_and_ignores_a_trailing_one():
+    block = "((0, 0), 0), ((1, 2), 3),\n"
+    assert [(c.input, c.expected) for c in V.parse_examples(PY, block)] == [((0, 0), 0), ((1, 2), 3)]
+    assert V.example_line_count(block) == 2   # the trailing comma is not a third example
+
+def test_parse_examples_drops_and_counts_a_fragment_that_never_balances():
+    block = "((1, 2), 3)\n((4, 5), 6\n"   # the second one is missing its closing paren
+    assert [(c.input, c.expected) for c in V.parse_examples(PY, block)] == [((1, 2), 3)]
+    assert V.example_line_count(block) - len(V.parse_examples(PY, block)) == 1
+
+def test_split_examples_respects_strings_and_comments():
+    # A Rust stdin fixture is a multi-line string whose content may hold commas and brackets.
+    rust = '("""3\n1, 2, 3\n""", "6")\n'
+    assert [(c.input, c.expected) for c in V.parse_examples(RUST, rust)] == [("3\n1, 2, 3\n", "6")]
+    # A comma inside a comment must not split the example in two and invent a dropped one.
+    commented = "((1, 2), 3)  # a note, with a comma\n"
+    assert [(c.input, c.expected) for c in V.parse_examples(PY, commented)] == [((1, 2), 3)]
+    assert V.example_line_count(commented) == 1
+
+
 # --- round 14 batch 7: inputs written by hand are respelled to the shape gen() produces ---
 
 # bench18's oracle: `schemas` must be a list, each schema inside it a tuple. A MIXED shape, which
