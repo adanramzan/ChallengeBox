@@ -584,10 +584,19 @@ def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, 
         r = run_rust_cases(binary, [stress_input], timeout_s=limit_s, mem_mb=mem_mb)[0]
         dur = r.duration_s
     passed = r.ok and not r.timed_out and dur <= limit_s
-    detail = {"duration_s": round(dur, 3), "limit_s": limit_s, "timed_out": r.timed_out, "error": r.error[-400:]}
+    # "Too slow" and "crashed" are different failures and want different responses: a timing failure
+    # cannot be patched (solve() sends it to a fresh solve), a crash can. `dur` is limit_s + 1 for a
+    # Python run that died, so duration alone does not separate them -- record the distinction here,
+    # where r.ok is still in hand.
+    detail = {"duration_s": round(dur, 3), "limit_s": limit_s, "timed_out": r.timed_out,
+              "too_slow": bool(r.timed_out or (r.ok and dur > limit_s)), "error": r.error[-400:]}
     if degraded:
         detail["degraded"] = "gen_max failed; this is the largest medium case, not a true max-size input -- this timing is not a real max-size stress check"
-    return Evidence("stress", passed, 1, time.monotonic() - t0, detail)
+    # A degraded input is not a max-size input, so a clean run on it is not evidence that the
+    # candidate is fast enough: record it as a SKIPPED step, which is what the finalizer and the
+    # benchmark already treat as "not checked". A degraded run that was still too slow is kept as a
+    # real failure -- too slow on a smaller-than-max input is only more damning.
+    return Evidence("stress", passed, 1, time.monotonic() - t0, detail, skipped=degraded and passed)
 
 def overflow_check(problem, binary: str | None, stress_input, *, limit_s: float, mem_mb: int) -> Evidence:
     """Reruns the max-size stress input on the OVERFLOW-CHECKED build (the one already compiled and
@@ -669,7 +678,7 @@ def _gate_line(e: Evidence, extra: str = "") -> str:
     cases, which read in log.txt as a step that ran and passed -- so a run that checked nothing
     looked like a clean sweep. Say skipped, with the reason the Evidence already recorded."""
     if e.skipped:
-        return f"gate.{e.kind} skipped=True reason={e.detail.get('skipped', 'unspecified')}"
+        return f"gate.{e.kind} skipped=True reason={e.detail.get('skipped') or e.detail.get('degraded', 'unspecified')}"
     return f"gate.{e.kind} passed={e.passed}" + (f" {extra}" if extra else "")
 
 def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limits: dict, log, examples: list | None = None) -> list[Evidence]:
@@ -690,6 +699,15 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         e = python_import_check(source, problem.entrypoint, gi, workdir=os.path.join(workdir, "compile"), timeout_s=budget.step_timeout(30.0, reserve_s=20.0), mem_mb=limits["mem_mb"])
         ev.append(e); log(_gate_line(e))
         if not e.passed: return ev
+    # Past compile, every step the inputs allow runs, and the list is complete rather than truncated
+    # at the first failure. Three reasons (round-10 L2): the timing steps need no oracle, so a
+    # differential failure must not suppress them -- seven of ten round-10 solutions were
+    # asymptotically wrong and none was ever timed; a full mismatch count across tiers is what
+    # candidate_score ranks on; and solve() still repairs the FIRST failed step in this canonical
+    # order, so a correctness failure is still repaired before a timing one. Cost is bounded: each
+    # differential tier is seconds, the expensive tier (medium) keeps its own budget rule, and every
+    # step turns itself into `skipped: no budget` once step_timeout returns 0.
+    #
     # The candidate against its own author's hand trace: no oracle involved, so it is the one
     # differential step that cannot be poisoned by a wrong reference. Skipped when this candidate
     # has no examples (an older candidate, a reply with no ===EXAMPLES=== block).
@@ -697,7 +715,6 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
                      timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"],
                      per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
     ev.append(e); log(_gate_line(e, f"cases={e.cases}"))
-    if not e.passed: return ev
     # Public examples (ground truth from the problem itself, not the model-written oracle) run first,
     # before any generated tier -- a candidate that fails real ground truth fails fast on the most
     # trustworthy evidence available. Absent entirely (the common case), this step is not added at
@@ -710,7 +727,6 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         if gi.diff_degraded:
             e.detail["degraded"] = gi.diff_degraded
         ev.append(e); log(_gate_line(e, f"cases={e.cases}"))
-        if not e.passed: return ev
     for kind, cases in (("diff_edge", gi.regressions + gi.cases_edge), ("diff_small", gi.cases_small), ("diff_medium", gi.cases_medium)):
         e = differential(problem, source, cases, kind, workdir=os.path.join(workdir, kind), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"],
                          per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
@@ -723,10 +739,9 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         if gi.diff_degraded:
             e.detail["degraded"] = gi.diff_degraded
         ev.append(e); log(_gate_line(e, f"cases={e.cases}"))
-        if not e.passed: return ev
-    e = behavior(problem, source, gi.cases_small or gi.cases_edge, workdir=os.path.join(workdir, "behavior"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"], per_case_s=limits.get("per_case_limit_s", 0.0))
+    e = behavior(problem, source, gi.cases_small or gi.cases_edge or gi.cases_public or gi.cases_medium,
+                 workdir=os.path.join(workdir, "behavior"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"], per_case_s=limits.get("per_case_limit_s", 0.0))
     ev.append(e); log(_gate_line(e, f"detail={e.detail.get('check','')}"))
-    if not e.passed: return ev
     limit = limits["stress_limit_python_s"] if problem.language == "python" else limits["stress_limit_rust_s"]
     # A hung Python stress call can itself run up to limit_s + 15s (see stress() above), so reserve
     # enough margin that it can't eat the whole safety margin; Rust's call is bounded by limit_s exactly.

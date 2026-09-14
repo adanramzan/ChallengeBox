@@ -46,6 +46,22 @@ def test_prepare_gate_inputs_and_run_gate(tmp_path):
     assert ev[1].kind == "diff_examples" and ev[1].skipped   # no candidate examples: skipped, never failed
     assert ev[2].kind == "diff_edge" and not ev[2].passed and ev[2].detail["input"] == (15, 0)
 
+def test_a_failed_tier_no_longer_suppresses_the_later_tiers_or_the_timing(tmp_path):
+    # round-10 L2: stress sat last in a short-circuiting chain, so a differential failure meant the
+    # candidate was never timed -- seven of ten round-10 solutions were asymptotically wrong and the
+    # system had timing data on none of them. Every step after compile now runs.
+    limits = {"cases_small": 20, "cases_medium": 5, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0, "mem_mb": 2048, "shrink_budget_s": 1.0}
+    stress = "def gen_max(seed):\n    return (10**18, 10**18)\nEDGES = [(0, 0), (15, 0)]\n"
+    gi = V.prepare_gate_inputs(PY, ORACLE, stress, limits, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None)
+    ev = V.run_gate(PY, BUG, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lambda m: None)
+    kinds = [e.kind for e in ev]
+    assert kinds == ["compile", "diff_examples", "diff_edge", "diff_small", "diff_medium", "behavior", "stress", "overflow"]
+    by = {e.kind: e for e in ev}
+    assert not by["diff_edge"].passed and not by["diff_small"].passed   # both measured, not just the first
+    assert by["stress"].cases == 1 and by["stress"].detail["duration_s"] >= 0   # timed despite the failures
+    # and the first failure in canonical order is still what a repair would be given
+    assert next(e for e in ev if not e.passed).kind == "diff_edge"
+
 def test_thin_tier_passes_but_is_marked_degraded(tmp_path):
     limits = {"cases_small": 5, "cases_medium": 2, "min_cases_small": 30, "min_cases_medium": 5,
               "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0, "mem_mb": 2048, "shrink_budget_s": 1.0}
@@ -376,20 +392,20 @@ WRONG_ON_PUBLIC = "def add(a, b):\n    return a + b + 1\n"
 
 def test_public_examples_run_as_own_gate_step_before_generated_tiers_and_fail_a_wrong_candidate(tmp_path):
     p = Problem("p", "python", "s", "add", [{"input": [2, 3], "output": 5}], 300.0)
-    limits = {"cases_small": 3, "cases_medium": 2, "mem_mb": 2048}
+    limits = {"cases_small": 3, "cases_medium": 2, "mem_mb": 2048, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0}
     gi = V.prepare_gate_inputs(p, ORACLE, "", limits, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None)
     assert len(gi.cases_public) == 1 and gi.cases_public[0].input == (2, 3) and gi.cases_public[0].expected == 5
     ev = V.run_gate(p, WRONG_ON_PUBLIC, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lambda m: None)
     # diff_public is its own evidence kind and runs right after compile, before any generated tier --
-    # the gate stops here, never reaching diff_small/diff_medium against the model-written oracle.
-    assert [e.kind for e in ev] == ["compile", "diff_examples", "diff_public"]
+    # ahead of the model-written oracle's tiers, which still run (the gate records every tier).
+    assert [e.kind for e in ev][:3] == ["compile", "diff_examples", "diff_public"]
     assert not ev[2].passed
     assert ev[2].detail["input"] == (2, 3) and ev[2].detail["expected"] == 5 and ev[2].detail["actual"] == 6
 
 def test_public_example_disagreeing_with_oracle_reference_is_kept_and_recorded(tmp_path):
     p = Problem("p", "python", "s", "add", [{"input": [2, 3], "output": 5}], 300.0)
     wrong_oracle = "def reference(a, b):\n    return a + b + 100\ndef gen(seed, mode):\n    return (seed, seed)\n"
-    limits = {"cases_small": 2, "cases_medium": 1, "mem_mb": 2048}
+    limits = {"cases_small": 2, "cases_medium": 1, "mem_mb": 2048, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0}
     gi = V.prepare_gate_inputs(p, wrong_oracle, "", limits, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None)
     # kept exactly as given -- not dropped, not overridden by the oracle's (wrong) answer
     assert len(gi.cases_public) == 1 and gi.cases_public[0].expected == 5
@@ -531,11 +547,11 @@ def test_parse_examples_caps_at_eight_and_takes_rust_stdin_strings():
     assert [(c.input, c.expected) for c in rust] == [("3\n1 2 3\n", "6")]   # non-str args dropped for rust
 
 def test_diff_examples_fails_a_candidate_that_contradicts_its_own_trace(tmp_path):
-    limits = {"cases_small": 3, "cases_medium": 1, "mem_mb": 2048}
+    limits = {"cases_small": 3, "cases_medium": 1, "mem_mb": 2048, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0}
     gi = V.prepare_gate_inputs(PY, ORACLE, "", limits, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None)
     examples = [V.Case((15, 0), 15, "example")]   # BUG returns 16 here
     ev = V.run_gate(PY, BUG, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lambda m: None, examples=examples)
-    assert [e.kind for e in ev] == ["compile", "diff_examples"]
+    assert [e.kind for e in ev][:2] == ["compile", "diff_examples"]
     assert not ev[1].passed and ev[1].detail["input"] == (15, 0) and ev[1].detail["actual"] == 16
 
 def test_rust_examples_run_as_stdin_and_stdout(tmp_path):

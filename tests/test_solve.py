@@ -59,7 +59,9 @@ def test_degraded_stress_evidence_is_not_a_full_pass(tmp_path):
     llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_NO_GENMAX]})
     rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
-    assert ev["stress"]["passed"] and ev["stress"]["detail"].get("degraded")
+    # A clean run on a not-max-size input is not evidence the candidate is fast enough, so the step
+    # records itself as skipped rather than as a pass.
+    assert ev["stress"]["skipped"] and ev["stress"]["detail"].get("degraded")
     assert rep["status"] == "emitted_unverified"
 
 def test_static_failure_repair_reaches_cap_and_emits_best(tmp_path):
@@ -842,6 +844,22 @@ def test_examples_alone_are_real_evidence_when_the_oracle_is_dead(tmp_path):
     ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
     assert ev["diff_examples"]["passed"] and not ev["diff_examples"]["skipped"] and ev["diff_examples"]["cases"] == 3
     assert not any("gate.unverifiable" in l for l in rep["events"])
+
+
+# --- round 13: the gate records every tier and always times the candidate ---
+
+def test_a_failing_candidate_is_still_timed_and_repaired_from_the_first_failure(tmp_path):
+    # The candidate contradicts its own hand trace AND the edge cases. Both are recorded, the later
+    # tiers and the timing run anyway, and the repair call is given the FIRST failure in canonical
+    # order (a correctness failure is repaired before a timing one).
+    both_wrong = BUGGY.replace(EXAMPLES_BLOCK, "===EXAMPLES===\n((1, 2), 4)\n===END===\n")
+    llm = FakeLLM({"solve": [both_wrong], "repair": [REPAIR_FIX], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
+    assert not ev["diff_examples"]["passed"] and not ev["diff_edge"]["passed"]
+    assert ev["diff_small"]["cases"] and ev["stress"]["cases"] == 1   # neither suppressed by the failures above
+    prompt = next(u for r, s_, u in llm.prompts if "Failure kind" in u)
+    assert "Failure kind: diff_examples" in prompt
 
 
 # --- round 13: validate() is "reference() did not raise ValueError" ---

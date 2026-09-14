@@ -439,7 +439,10 @@ def bench(sample_dir: str, out_dir: str, cfg: dict, llm, deadline_scale: float) 
                 p = Problem.load(os.path.join(sample_dir, name)); pid = p.problem_id[:12]
                 rep = solve(p, llm, cfg, out_path=os.path.join(out_dir, f"{pid}.{'py' if p.language == 'python' else 'rs'}"), run_dir=os.path.join(out_dir, pid), deadline_scale=deadline_scale)
                 ev = {e["kind"]: e for e in rep["evidence"].get(rep["final_candidate"] or "", [])}
-                mark = lambda k: "n/a" if k not in ev else "skip" if ev[k].get("skipped") else "FAIL" if not ev[k]["passed"] else ("degraded" if (ev[k].get("detail") or {}).get("degraded") else "pass")
+                # "degraded" is checked before "skip" so a degraded stress input (which now records
+                # itself as skipped, since its timing is not a max-size check) still says *why* in
+                # the table instead of reading as a step that never ran.
+                mark = lambda k: "n/a" if k not in ev else "FAIL" if not ev[k]["passed"] else "degraded" if (ev[k].get("detail") or {}).get("degraded") else "skip" if ev[k].get("skipped") else "pass"
                 rows.append({"id": pid, "lang": p.language, "compiles": mark("compile"), "examples": mark("diff_examples"), "public": mark("diff_public"), "edge": mark("diff_edge"), "small": mark("diff_small"),
                              "medium": mark("diff_medium"), "behavior": mark("behavior"), "stress": mark("stress"), "overflow": mark("overflow"), "repairs": rep["repairs"], "syntax_repairs": rep["syntax_repairs"], "calls": len(rep["calls"]),
                              "tokens": f"{rep['token_usage']['prompt']}/{rep['token_usage']['completion']}", "elapsed": rep["elapsed_s"], "cost": rep["cost_usd"], "status": rep["status"]})
