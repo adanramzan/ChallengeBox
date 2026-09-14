@@ -365,52 +365,129 @@ def _check_public_against_oracle(problem, gi: GateInputs, oracle_src: str, *, wo
                          f"input={_fmt(c.input, 200)} public_expected={_fmt(c.expected, 200)} oracle_returned={_fmt(oracle_output, 200)}")
         log(f"oracle.disagrees_with_public input={_fmt(c.input, 120)}")
 
+def _as_tuples(v):
+    """Every list in a nested structure respelled as a tuple. Strings, ints and dicts are left
+    exactly as they are -- a dict is never re-containered, and its keys must not be either."""
+    if isinstance(v, (list, tuple)):
+        return tuple(_as_tuples(x) for x in v)
+    return v
+
+def _as_lists(v):
+    if isinstance(v, (list, tuple)):
+        return [_as_lists(x) for x in v]
+    return v
+
+def _respellings(problem, inp) -> list:
+    """Canonical container spellings of one example input, other than the one it was written in.
+    The statement names the containers ("the stated tuple forms"); a hand trace can spell the same
+    input with lists, and the oracle's input check then rejects an input nobody disagrees about --
+    four of seven bench14 "disagreements" were exactly this. Python only: a Rust example is stdin
+    text, which has no container spelling."""
+    if problem.language != "python":
+        return []
+    out = []
+    for f in (_as_tuples, _as_lists):
+        try:
+            v = f(inp)
+        except RecursionError:
+            continue
+        if repr(v) != repr(inp) and all(repr(v) != repr(o) for o in out):
+            out.append(v)
+    return out
+
 def _check_examples_against_oracle(problem, gi: GateInputs, oracle_src: str, examples: dict, limits: dict, *, workdir: str, budget, log) -> None:
     """Run the oracle's validate() and reference() over every distinct input the SOLVE authors
     hand-traced, and record where the reference disagrees with them. Neither side is ground truth --
-    both are readings of the same prose by a model -- so this never drops an example and never drops
-    a case; it only measures how far the two readings are apart, which is what decides whether the
-    oracle is disputed (see examples_disputed)."""
-    seen: dict[str, Case] = {}
+    both are readings of the same prose by a model -- so a value mismatch drops nothing; it only
+    measures how far the two readings are apart, which is what decides whether the oracle is disputed
+    (see examples_disputed).
+
+    A validate() REJECTION is not a disagreement about a value. Two things can be behind it, and
+    neither is the oracle contradicting the trace (bench14: all 7 "disagreements" were rejections,
+    0 were value mismatches, and the false dispute cost the run its oracle and its medium tier):
+
+    * the same input spelled with different containers -- retried once, canonically respelled, and
+      the accepted spelling then replaces the original *in the candidates' own example lists*, so the
+      candidate is gated on the spelling the only precondition check in the system accepts;
+    * an input that really does violate the stated preconditions -- the examples author was wrong.
+      It is recorded as `rejected`, counts toward no dispute, and is dropped from every authoring
+      candidate's examples, because failing a candidate on an input the precondition check calls
+      invalid spends repairs guarding inputs a hidden test cannot contain.
+
+    Both effects reach the candidates by mutating the example lists this function was handed -- they
+    are the candidates' own lists, and `diff_examples` runs off them.
+    """
+    by_key: dict[str, list[tuple[list, Case]]] = {}   # input -> every (candidate's list, its Case)
     authors: dict[str, list[str]] = {}
     for cid, cases in (examples or {}).items():
         for c in cases:
             k = repr(c.input)
-            seen.setdefault(k, c)
+            by_key.setdefault(k, []).append((cases, c))
             authors.setdefault(k, []).append(cid)
-    cases = list(seen.values())
+    keys = list(by_key)
+    cases = [by_key[k][0][1] for k in keys]
     if not cases:
         return
     per_case = limits.get("per_case_limit_s", 0.0)
     consec = limits.get("max_consecutive_case_timeouts", 0)
+    step = lambda: budget.step_timeout(30.0, reserve_s=20.0)
     verdicts, _ = _validate_inputs(problem, oracle_src, [c.input for c in cases], workdir=os.path.join(workdir, "validate_examples"),
-                                   timeout_s=budget.step_timeout(30.0, reserve_s=20.0), per_case_s=per_case, max_consec_timeouts=consec)
+                                   timeout_s=step(), per_case_s=per_case, max_consec_timeouts=consec)
+    # One respelling attempt, for the rejected inputs only, in one batch.
+    normalized = 0
+    trials = [(i, v) for i, c in enumerate(cases)
+              if verdicts is not None and verdicts[i] is False
+              for v in _respellings(problem, c.input)]
+    if trials:
+        tv, _ = _validate_inputs(problem, oracle_src, [v for _, v in trials], workdir=os.path.join(workdir, "validate_respelled"),
+                                 timeout_s=step(), per_case_s=per_case, max_consec_timeouts=consec)
+        taken: dict[int, object] = {}
+        for (i, v), ok in zip(trials, tv or []):
+            if ok is True and i not in taken:
+                taken[i] = v
+        for i, v in taken.items():
+            for _, c in by_key[keys[i]]:
+                c.input = v
+            verdicts[i] = True
+            normalized += 1
+        if normalized:
+            log(f"oracle.examples normalized={normalized}")
     res = run_python_cases(oracle_src, "reference", [_ref_args(problem, c.input) for c in cases], workdir=os.path.join(workdir, "ref_examples"),
-                           timeout_s=budget.step_timeout(30.0, reserve_s=20.0), per_case_s=per_case, max_consec_timeouts=consec)
-    disagreements, errors = [], 0
+                           timeout_s=step(), per_case_s=per_case, max_consec_timeouts=consec)
+    disagreements, rejected, agree, errors = [], [], 0, 0
     for i, c in enumerate(cases):
-        who = authors[repr(c.input)]
+        who = authors[keys[i]]
         if verdicts is not None and verdicts[i] is False:
-            # An input a human-readable statement plainly allows, rejected by the oracle's own
-            # precondition check, is the same disagreement in a different place.
-            disagreements.append({"input": c.input, "expected": c.expected, "reference": "validate() rejected this input", "authors": who})
+            rejected.append({"input": c.input, "expected": c.expected, "authors": who})
+            for lst, case in by_key[keys[i]]:
+                lst[:] = [x for x in lst if x is not case]
             continue
         r = res[i]
         if not r.ok:
             errors += 1
             continue
         if same(problem, r, c.expected):
+            agree += 1
             continue
         disagreements.append({"input": c.input, "expected": c.expected, "reference": r.output, "authors": who})
-    gi.example_checks = {"cases": len(cases), "disagreements": disagreements, "errors": errors}
-    log(f"oracle.examples cases={len(cases)} disagreements={len(disagreements)} errors={errors}")
+    gi.example_checks = {"cases": len(cases), "agreements": agree, "disagreements": disagreements,
+                         "rejected": rejected, "errors": errors, "normalized": normalized}
+    log(f"oracle.examples cases={len(cases)} agree={agree} disagree={len(disagreements)} rejected={len(rejected)} errors={errors}")
+
+def examples_nonrejected(ec: dict) -> int:
+    """Hand-traced inputs the oracle's precondition check accepted: the only ones whose answer the
+    reference and the trace can actually disagree about."""
+    ec = ec or {}
+    return ec.get("cases", 0) - len(ec.get("rejected") or [])
 
 def examples_disputed(gi: GateInputs) -> bool:
-    """The oracle contradicts at least half of the hand-traced examples. Two independent readings of
-    the statement that far apart cannot both be right, and the oracle is the one this system can
-    rewrite -- so this is a regeneration trigger, not a candidate failure."""
+    """The oracle contradicts at least half of the hand-traced examples it accepted as valid. Two
+    independent readings of the statement that far apart cannot both be right, and the oracle is the
+    one this system can rewrite -- so this is a regeneration trigger, not a candidate failure.
+    Rejected examples are excluded from both sides of the ratio: a rejection is a claim about the
+    input, not about the answer."""
     ec = gi.example_checks or {}
-    n = ec.get("cases", 0)
+    n = examples_nonrejected(ec)
     return n >= 2 and 2 * len(ec.get("disagreements") or []) >= n
 
 def oracle_unusable(gi: GateInputs) -> bool:
@@ -460,7 +537,7 @@ def _examples_paragraph(gi: GateInputs) -> str:
         return ""
     shown = "\n".join(f"- Input: {_fmt(d['input'], 800)}\n  Hand-traced expected: {_fmt(d['expected'], 800)}\n"
                       f"  Your reference returned: {_fmt(d['reference'], 800)}" for d in bad[:3])
-    return (f"\n\nAn independent reader hand-traced {ec.get('cases', 0)} inputs from this statement. Your "
+    return (f"\n\nAn independent reader hand-traced {examples_nonrejected(ec)} inputs from this statement. Your "
             f"reference disagrees with {len(bad)} of them. The first three:\n{shown}\n"
             "Re-derive each of these from the statement's own words before writing the new reference.\n")
 

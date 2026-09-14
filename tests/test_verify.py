@@ -605,7 +605,7 @@ def test_oracle_checked_against_every_candidates_examples(tmp_path):
     assert ec["cases"] == 2 and len(ec["disagreements"]) == 2 and ec["errors"] == 0
     assert sorted(ec["disagreements"][0]["authors"]) == ["c1", "c2"]
     assert V.examples_disputed(gi)
-    assert any("oracle.examples cases=2 disagreements=2" in l for l in lines)
+    assert any("oracle.examples cases=2 agree=0 disagree=2 rejected=0 errors=0" in l for l in lines)
     # the dispute context carries inputs and expected values, never candidate code
     extra = V.examples_dispute_extra(gi)
     assert "Hand-traced expected: 3" in extra and "Your reference returned: 103" in extra
@@ -708,3 +708,65 @@ def test_previous_attempt_section_names_where_the_expected_value_came_from(tmp_p
     s = V.previous_attempt_section(PY, C(), failed, V.GateInputs())
     assert "solution author's own hand trace" in s and "(type: tuple)" in s
     assert "public example" in V.expected_source("diff_public")
+
+
+# --- round 14: a validate() rejection of a hand-traced example is not a disagreement ---
+
+# A nested-container argument, and a reference that is strict about both the container spelling and
+# the statement's preconditions -- the two ways every bench14 example was "rejected".
+PYT = Problem("p", "python", "s", "total", [], 300.0)
+ORACLE_TUPLES = ("def reference(rows, k):\n"
+                 "    if not isinstance(rows, tuple) or any(not isinstance(r, tuple) for r in rows):\n"
+                 "        raise ValueError('rows must be tuples')\n"
+                 "    if any(x < 0 for r in rows for x in r):\n"
+                 "        raise ValueError('negative')\n"
+                 "    return sum(sum(r) for r in rows) + k\n"
+                 "def gen(seed, mode):\n"
+                 "    return (((seed, 1), (2, 3)), 0)\n")
+TOTAL = "def total(rows, k):\n    return sum(sum(r) for r in rows) + k\n"
+EX_LIMITS = {"cases_small": 3, "cases_medium": 1, "mem_mb": 2048, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0}
+
+def test_a_list_spelled_example_is_normalized_and_gated_in_that_form(tmp_path):
+    # the author spelled the rows as lists; the oracle's input check demands tuples.
+    cases = V.parse_examples(PYT, "(([[1, 2], [3]], 0), 6)\n")
+    lines = []
+    gi = V.prepare_gate_inputs(PYT, ORACLE_TUPLES, "", EX_LIMITS, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lines.append, examples={"c1": cases})
+    ec = gi.example_checks
+    assert ec["normalized"] == 1 and ec["agreements"] == 1 and ec["disagreements"] == [] and ec["rejected"] == []
+    assert any("oracle.examples normalized=1" in l for l in lines)
+    # the candidate's own example list now carries the accepted spelling, and diff_examples uses it
+    assert cases[0].input == (((1, 2), (3,)), 0)
+    ev = V.run_gate(PYT, TOTAL, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=EX_LIMITS, log=lambda m: None, examples=cases)
+    by = {e.kind: e for e in ev}
+    assert by["diff_examples"].passed and by["diff_examples"].cases == 1
+
+def test_an_out_of_contract_example_is_rejected_not_disputed_and_leaves_diff_examples(tmp_path):
+    cases = V.parse_examples(PYT, "((((-1,),), 0), -1)\n((((1, 2),), 0), 3)\n")
+    lines = []
+    gi = V.prepare_gate_inputs(PYT, ORACLE_TUPLES, "", EX_LIMITS, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lines.append, examples={"c1": cases})
+    ec = gi.example_checks
+    assert len(ec["rejected"]) == 1 and ec["rejected"][0]["input"] == (((-1,),), 0) and ec["rejected"][0]["authors"] == ["c1"]
+    assert ec["disagreements"] == [] and ec["agreements"] == 1 and not V.examples_disputed(gi)
+    assert any("rejected=1" in l for l in lines)
+    # dropped from the candidate's list, so the candidate is never failed on it
+    assert [c.input for c in cases] == [(((1, 2),), 0)]
+    ev = V.run_gate(PYT, TOTAL, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=EX_LIMITS, log=lambda m: None, examples=cases)
+    assert {e.kind: e for e in ev}["diff_examples"].passed
+
+def test_mostly_rejected_examples_do_not_dispute_the_oracle(tmp_path):
+    # bench14's shape: most examples rejected as out of contract, every accepted one agreeing.
+    block = "".join(f"((((-{i},),), 0), 0)\n" for i in range(1, 8)) + "((((4, 1),), 0), 5)\n"
+    cases = V.parse_examples(PYT, block)
+    assert len(cases) == 8
+    gi = V.prepare_gate_inputs(PYT, ORACLE_TUPLES, "", EX_LIMITS, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None, examples={"c1": cases})
+    ec = gi.example_checks
+    assert len(ec["rejected"]) == 7 and ec["disagreements"] == [] and ec["agreements"] == 1
+    assert V.examples_nonrejected(ec) == 1 and not V.examples_disputed(gi)   # fewer than 2 non-rejected
+
+def test_value_disagreements_on_accepted_examples_still_dispute(tmp_path):
+    # three accepted inputs, two of them hand-traced to the wrong value -> a real dispute
+    cases = V.parse_examples(PYT, "((((1, 1),), 0), 99)\n((((2, 2),), 0), 99)\n((((3, 3),), 0), 6)\n")
+    gi = V.prepare_gate_inputs(PYT, ORACLE_TUPLES, "", EX_LIMITS, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None, examples={"c1": cases})
+    ec = gi.example_checks
+    assert ec["rejected"] == [] and len(ec["disagreements"]) == 2 and ec["agreements"] == 1
+    assert V.examples_nonrejected(ec) == 3 and V.examples_disputed(gi)

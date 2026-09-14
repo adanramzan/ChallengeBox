@@ -318,7 +318,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
     elif V.examples_disputed(gi):
         ec = gi.example_checks
         disputed = True
-        selfrepair_why = f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {ec['cases']}"
+        selfrepair_why = f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {V.examples_nonrejected(ec)}"
         run.log(f"oracle.disputed {selfrepair_why}")
     if selfrepair_why and run.budget.can_afford(cfg["limits"]["oracle_selfrepair_afford_s"]) and not run.over_cost():
         run.log(f"oracle.selfrepair triggered: {selfrepair_why}; notes={'; '.join(gi.notes)[:300]}")
@@ -332,7 +332,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         # them, no reference in this run is ground truth and no diff_* step against it is full evidence.
         if disputed and V.examples_disputed(gi):
             ec = gi.example_checks
-            gi.diff_degraded = f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {ec['cases']}"
+            gi.diff_degraded = f"reference disagrees with hand-traced examples on {len(ec['disagreements'])} of {V.examples_nonrejected(ec)}"
             run.log(f"oracle.disputed after regeneration: {gi.diff_degraded}")
         # Coming from the rejection trigger there was a working-but-inconsistent oracle to lose: keep it
         # unless the replacement is actually better. (The crash trigger has nothing to fall back to.)
