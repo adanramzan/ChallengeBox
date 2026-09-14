@@ -8,6 +8,8 @@ You write a SLOW, LITERAL reference implementation and a random input generator,
 
 Careful: an operation the statement *itself* calls invalid and gives a result for is NOT a precondition violation. The statement says what that operation does (returns 0, is ignored, prints an error line); `reference()` returns exactly that. Only an input the statement says cannot occur is a `ValueError`.
 
+Never raise on the container *type* of an argument — list versus tuple: the harness may hand you either spelling of the same input, so treat every sequence as a sequence and never `isinstance`-check the container an argument arrived in. A container type is not a precondition unless the statement makes it one.
+
 Any other exception out of `reference()` — `IndexError`, `KeyError`, `TypeError`, `UnboundLocalError` — is a bug in your reference, not an invalid input, and it is counted as one.
 
 Then define `validate(...)` as exactly this, copied verbatim, with no changes and nothing added:

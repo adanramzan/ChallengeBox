@@ -54,6 +54,7 @@ class GateInputs:
     stress_source: str = ""   # gen_max | gen_large | medium_degraded -- which generator produced the timing input
     stress_validity: str = ""   # accepted | unjudged -- what the oracle's validate() said about the timing input
     validate_trusted: bool = False   # the oracle's validate() accepted at least one generated input and was not distrusted
+    input_skeleton: object = None   # the container shape the oracle's own gen() produces, per argument (see input_skeleton)
     validate_reject_frac: float = 0.0   # rejected/checked over small+medium: how far the oracle's validate() and gen() disagree
     validate_rejects: dict = field(default_factory=dict)   # tier -> (checked, rejected, up to two rejected inputs), for the self-repair prompt
     diff_degraded: str = ""   # why every diff_* evidence against this oracle is weaker than it looks (set by regenerate_oracle)
@@ -68,7 +69,7 @@ class GateInputs:
         return {"small": len(self.cases_small), "medium": len(self.cases_medium), "edge": len(self.cases_edge),
                 "public": len(self.cases_public), "stress": self.stress_input is not None,
                 "stress_source": self.stress_source, "stress_degraded": self.stress_degraded,
-                "stress_validity": self.stress_validity,
+                "stress_validity": self.stress_validity, "input_skeleton": self.input_skeleton,
                 "notes": self.notes, "example_checks": self.example_checks}
 
 @dataclass
@@ -429,23 +430,100 @@ def _as_lists(v):
         return [_as_lists(x) for x in v]
     return v
 
-def _respellings(problem, inp) -> list:
-    """Canonical container spellings of one example input, other than the one it was written in.
+def _container_skeleton(v):
+    """The container shape of one value: ("list"|"tuple", shape-of-its-first-element) at each
+    sequence depth, "dict" for a mapping, None for a leaf. Every element of a sequence is taken to
+    share the first element's shape, which is what makes this a skeleton rather than a copy."""
+    if isinstance(v, dict):
+        return "dict"
+    if isinstance(v, (list, tuple)):
+        return (type(v).__name__, _container_skeleton(v[0]) if v else None)
+    return None
+
+
+def input_skeleton(problem, inp):
+    """The per-argument container skeleton of one input the oracle's own gen() produced and its own
+    validate() accepted. Python only -- a Rust input is stdin text, which has no container spelling."""
+    if problem.language != "python":
+        return None
+    try:
+        return tuple(_container_skeleton(a) for a in _ref_args(problem, inp))
+    except RecursionError:
+        return None
+
+
+def _respell_value(v, sk):
+    if not isinstance(v, (list, tuple)) or not isinstance(sk, tuple):
+        return v
+    kind, child = sk
+    items = [_respell_value(x, child) for x in v]
+    return tuple(items) if kind == "tuple" else list(items)
+
+
+def _as_skeleton(problem, inp, skeleton):
+    """`inp` with the container at every depth converted to the one `skeleton` records there, leaves
+    untouched. None when the skeleton does not describe this input (absent, or a different arity)."""
+    if not skeleton:
+        return None
+    args = _ref_args(problem, inp)
+    if len(args) != len(skeleton):
+        return None
+    out = tuple(_respell_value(a, s) for a, s in zip(args, skeleton))
+    if isinstance(inp, tuple):
+        return out
+    if isinstance(inp, list):
+        return list(out)
+    return out[0]
+
+
+def _respellings(problem, inp, skeleton=None) -> list:
+    """Canonical container spellings of one input, other than the one it was written in.
     The statement names the containers ("the stated tuple forms"); a hand trace can spell the same
     input with lists, and the oracle's input check then rejects an input nobody disagrees about --
     four of seven bench14 "disagreements" were exactly this. Python only: a Rust example is stdin
-    text, which has no container spelling."""
+    text, which has no container spelling.
+
+    The SKELETON spelling comes first, because it is the only one that can be MIXED. bench18's
+    reference opened with `if not isinstance(schemas, list): raise` and then
+    `if not isinstance(schema, tuple): raise` -- outer list, inner tuples -- so neither uniform form
+    could satisfy it and all four hand traces plus the whole diff_examples tier were lost. The
+    skeleton is read off an input the oracle's own gen() produced and its own validate() accepted,
+    which makes it authoritative: by the shared I/O convention the candidate has to accept whatever
+    gen produces, so an input respelled into that shape is one both sides are held to."""
     if problem.language != "python":
         return []
     out = []
+    def offer(v):
+        if v is not None and repr(v) != repr(inp) and all(repr(v) != repr(o) for o in out):
+            out.append(v)
+    try:
+        offer(_as_skeleton(problem, inp, skeleton))   # None when there is no skeleton, or it does not describe this input
+    except RecursionError:
+        pass
     for f in (_as_tuples, _as_lists):
         try:
-            v = f(inp)
+            offer(f(inp))
         except RecursionError:
             continue
-        if repr(v) != repr(inp) and all(repr(v) != repr(o) for o in out):
-            out.append(v)
     return out
+
+
+def _accept_respellings(problem, oracle_src: str, inputs: list, verdicts, skeleton, *, workdir: str, timeout_s: float,
+                        per_case_s: float = 0.0, max_consec_timeouts: int = 0) -> dict:
+    """{index: accepted respelling} for the inputs validate() rejected, in ONE extra batch. Shared by
+    the hand-traced examples and the STRESS author's EDGES, which fail the same way for the same
+    reason -- a literal typed by a model that never saw the oracle's own spelling."""
+    trials = [(i, v) for i in range(len(inputs)) if verdicts and verdicts[i] is False
+              for v in _respellings(problem, inputs[i], skeleton)]
+    if not trials:
+        return {}
+    tv, _ = _validate_inputs(problem, oracle_src, [v for _, v in trials], workdir=workdir, timeout_s=timeout_s,
+                             per_case_s=per_case_s, max_consec_timeouts=max_consec_timeouts)
+    taken: dict[int, object] = {}
+    for (i, v), ok in zip(trials, tv or []):
+        if ok is True and i not in taken:
+            taken[i] = v
+    return taken
 
 def _check_examples_against_oracle(problem, gi: GateInputs, oracle_src: str, examples: dict, limits: dict, *, workdir: str, budget, log) -> None:
     """Run the oracle's validate() and reference() over every distinct input the SOLVE authors
@@ -486,24 +564,16 @@ def _check_examples_against_oracle(problem, gi: GateInputs, oracle_src: str, exa
     verdicts, _ = _validate_inputs(problem, oracle_src, [c.input for c in cases], workdir=os.path.join(workdir, "validate_examples"),
                                    timeout_s=step(), per_case_s=per_case, max_consec_timeouts=consec)
     # One respelling attempt, for the rejected inputs only, in one batch.
-    normalized = 0
-    trials = [(i, v) for i, c in enumerate(cases)
-              if verdicts is not None and verdicts[i] is False
-              for v in _respellings(problem, c.input)]
-    if trials:
-        tv, _ = _validate_inputs(problem, oracle_src, [v for _, v in trials], workdir=os.path.join(workdir, "validate_respelled"),
-                                 timeout_s=step(), per_case_s=per_case, max_consec_timeouts=consec)
-        taken: dict[int, object] = {}
-        for (i, v), ok in zip(trials, tv or []):
-            if ok is True and i not in taken:
-                taken[i] = v
-        for i, v in taken.items():
-            for _, c in by_key[keys[i]]:
-                c.input = v
-            verdicts[i] = True
-            normalized += 1
-        if normalized:
-            log(f"oracle.examples normalized={normalized}")
+    taken = _accept_respellings(problem, oracle_src, [c.input for c in cases], verdicts, gi.input_skeleton,
+                                workdir=os.path.join(workdir, "validate_respelled"), timeout_s=step(),
+                                per_case_s=per_case, max_consec_timeouts=consec)
+    for i, v in taken.items():
+        for _, c in by_key[keys[i]]:
+            c.input = v
+        verdicts[i] = True
+    respelled = len(taken)
+    if respelled:
+        log(f"oracle.examples respelled={respelled}")
     res = run_python_cases(oracle_src, "reference", [_ref_args(problem, c.input) for c in cases], workdir=os.path.join(workdir, "ref_examples"),
                            timeout_s=step(), per_case_s=per_case, max_consec_timeouts=consec)
     disagreements, rejected, agree, errors = [], [], 0, 0
@@ -523,7 +593,7 @@ def _check_examples_against_oracle(problem, gi: GateInputs, oracle_src: str, exa
             continue
         disagreements.append({"input": c.input, "expected": c.expected, "reference": r.output, "authors": who})
     gi.example_checks = {"cases": len(cases), "agreements": agree, "disagreements": disagreements,
-                         "rejected": rejected, "errors": errors, "normalized": normalized}
+                         "rejected": rejected, "errors": errors, "respelled": respelled}
     log(f"oracle.examples cases={len(cases)} agree={agree} disagree={len(disagreements)} rejected={len(rejected)} errors={errors}")
 
 def examples_nonrejected(ec: dict) -> int:
@@ -650,7 +720,7 @@ def add_candidate_agreement(gi: GateInputs, agreement: dict) -> None:
     the same shape as the hand-traced ones -- so the existing >= half rule (examples_disputed), and
     the resolution rule a regeneration's cross-check applies, both see it. Flagged so the prompt
     paragraph that calls these "hand-traced" does not claim this one was."""
-    ec = gi.example_checks or {"cases": 0, "agreements": 0, "disagreements": [], "rejected": [], "errors": 0, "normalized": 0}
+    ec = gi.example_checks or {"cases": 0, "agreements": 0, "disagreements": [], "rejected": [], "errors": 0, "respelled": 0}
     ec["cases"] = ec.get("cases", 0) + 1
     ec.setdefault("disagreements", []).append(
         {"input": agreement["input"], "expected": agreement["actual"], "reference": agreement["reference"],
@@ -765,6 +835,13 @@ def prepare_oracle_tiers(problem, oracle_src: str, limits: dict, *, workdir: str
         if ev.detail.get("checked") and not ev.detail.get("validation_skipped"):
             gi.validate_trusted = True
         setattr(gi, f"cases_{mode}", cases); _log_and_note_validation(gi, ev, mode, log)
+    # The container shape the oracle's own gen() produces, read off one input its own validate()
+    # accepted. It is what every input written by hand -- a SOLVE author's trace, a STRESS author's
+    # EDGES entry -- is respelled into before it is judged (see _respellings), because a reference
+    # that isinstance-checks its arguments can demand a MIXED shape no uniform respelling reaches.
+    first = gi.cases_small or gi.cases_medium
+    if first:
+        gi.input_skeleton = input_skeleton(problem, first[0].input)
     # How far the oracle's own validate() and gen() disagree about the statement's preconditions.
     # The edge tier's counts are recorded by prepare_stress_inputs but deliberately excluded here:
     # those inputs come from the independent STRESS author, so they are corroboration, not evidence
@@ -783,6 +860,31 @@ def check_oracle_examples(problem, gi: GateInputs, limits: dict, *, workdir: str
     if gi.oracle_src.strip():
         _check_examples_against_oracle(problem, gi, gi.oracle_src, examples or {}, limits, workdir=workdir, budget=budget, log=log)
 
+def _respell_edges(problem, gi: GateInputs, oracle_src: str, edges: list, limits: dict, *, workdir: str, budget, log) -> None:
+    """The STRESS author's EDGES, respelled IN PLACE into the shape the oracle's own gen() produces,
+    before make_cases judges them. Same failure as a hand-traced example written with the wrong
+    container (see _respellings) and it costs the whole diff_edge tier. An edge whose shape is
+    genuinely wrong -- bench18's eight, which passed a flat list of layout terms where a list of
+    schemas was meant -- is not reachable by any respelling and is dropped exactly as before. Costs
+    one extra validate() batch over a handful of tiny literals, and only when there is a skeleton to
+    respell into."""
+    if not edges or not gi.input_skeleton:
+        return
+    step = budget.step_timeout(30.0, reserve_s=20.0)
+    if step <= 0:
+        return
+    per_case, consec = limits.get("per_case_limit_s", 0.0), limits.get("max_consecutive_case_timeouts", 0)
+    verdicts, _ = _validate_inputs(problem, oracle_src, edges, workdir=os.path.join(workdir, "validate_edges"),
+                                   timeout_s=step, per_case_s=per_case, max_consec_timeouts=consec)
+    taken = _accept_respellings(problem, oracle_src, edges, verdicts, gi.input_skeleton,
+                                workdir=os.path.join(workdir, "validate_edges_respelled"), timeout_s=step,
+                                per_case_s=per_case, max_consec_timeouts=consec)
+    for i, v in taken.items():
+        edges[i] = v
+    if taken:
+        log(f"oracle.edge respelled={len(taken)}")
+
+
 def prepare_stress_inputs(problem, gi: GateInputs, stress_src: str, limits: dict, *, workdir: str, budget, log) -> None:
     """The parts that need the STRESS reply: the edge fixtures and the max-size timing input. Fills
     `gi` in place -- GateInputs stays the single result of preparation, whichever order it was
@@ -795,6 +897,7 @@ def prepare_stress_inputs(problem, gi: GateInputs, stress_src: str, limits: dict
         edges = run_python_cases(stress_src + "\ndef _edges():\n    return list(EDGES)\n", "_edges", [()], workdir=os.path.join(workdir, "edges"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         if edges and edges[0].ok and isinstance(edges[0].output, list):
             cleaned_edges = [_clean_stdin(problem, s) for s in edges[0].output]
+            _respell_edges(problem, gi, oracle_src, cleaned_edges, limits, workdir=workdir, budget=budget, log=log)
             gi.cases_edge, ev = make_cases(problem, oracle_src, cleaned_edges, "edge", workdir=os.path.join(workdir, "ref_edge"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0),
                                            per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
             _log_and_note_validation(gi, ev, "edge", log)

@@ -181,6 +181,22 @@ is. Both halves are paid for in lost checks: an out-of-contract input is rejecte
 dropped (3 of 10 examples on bench14, 2 of 8 on bench15), and a container spelled the other way round is rejected
 until the respelling retry rescues it.
 
+The respelling retry offers three spellings of a rejected input, and the first of them is derived from the run
+itself: after the small tier is built, `verify.input_skeleton` reads the **container skeleton** off one input the
+oracle's own `gen()` produced and its own `validate()` accepted — per argument position, then per sequence depth,
+`("list"|"tuple", shape-of-the-first-element)`, with leaves untouched. Every hand-written input (a SOLVE author's
+`===EXAMPLES===` line, a STRESS author's `EDGES` entry) is respelled into that shape before `validate()` judges it,
+and only then are the two uniform spellings (all-tuples, all-lists) tried. The uniform pair is not enough: bench18's
+reference opened with `if not isinstance(schemas, list): raise` and then `if not isinstance(schema, tuple): raise`,
+a MIXED shape that neither uniform form reaches, and the run lost all four hand traces and all eight edges to it.
+The skeleton is authoritative rather than a guess — by the shared I/O contract the candidate must accept whatever
+`gen()` produces — so an input accepted in the respelled form is used in that form for both candidate and oracle.
+A shape that is genuinely wrong (bench18's edges passed a flat list of layout terms where a list of schemas was
+meant) is not reachable by any respelling and is still dropped. Counted as `oracle.examples respelled=N` /
+`oracle.edge respelled=N`, and the skeleton itself reaches `report.json` under `gate_inputs.input_skeleton`. The
+ORACLE prompt carries the other half of the fix: never raise on the container *type* of an argument, since the
+harness may hand the reference either spelling.
+
 `verify.parse_examples` reads them with one restricted evaluation per line — never `exec`, this is model output.
 The grammar is Python literals plus integer arithmetic (`+ - * ** // %` and unary sign over `int` constants, with
 magnitudes capped at 10^40 and exponents at 10^4); names, calls, attributes and comprehensions are rejected, and a

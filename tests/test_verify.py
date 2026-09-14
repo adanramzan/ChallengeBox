@@ -739,8 +739,8 @@ def test_a_list_spelled_example_is_normalized_and_gated_in_that_form(tmp_path):
     lines = []
     gi = V.prepare_gate_inputs(PYT, ORACLE_TUPLES, "", EX_LIMITS, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lines.append, examples={"c1": cases})
     ec = gi.example_checks
-    assert ec["normalized"] == 1 and ec["agreements"] == 1 and ec["disagreements"] == [] and ec["rejected"] == []
-    assert any("oracle.examples normalized=1" in l for l in lines)
+    assert ec["respelled"] == 1 and ec["agreements"] == 1 and ec["disagreements"] == [] and ec["rejected"] == []
+    assert any("oracle.examples respelled=1" in l for l in lines)
     # the candidate's own example list now carries the accepted spelling, and diff_examples uses it
     assert cases[0].input == (((1, 2), (3,)), 0)
     ev = V.run_gate(PYT, TOTAL, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=EX_LIMITS, log=lambda m: None, examples=cases)
@@ -872,3 +872,57 @@ def test_parse_examples_rejects_everything_that_is_not_a_literal_or_integer_arit
                  "((10**30 * 10**30,), 1)",  # result past the magnitude cap
                  "((sys.maxsize,), 1)"):     # an attribute
         assert V.parse_examples(PY, line) == [], line
+
+
+# --- round 14 batch 7: inputs written by hand are respelled to the shape gen() produces ---
+
+# bench18's oracle: `schemas` must be a list, each schema inside it a tuple. A MIXED shape, which
+# neither uniform respelling (_as_tuples / _as_lists) can produce.
+ORACLE_MIXED = ("def reference(rows, k):\n"
+                "    if not isinstance(rows, list):\n"
+                "        raise ValueError('rows must be a list')\n"
+                "    for r in rows:\n"
+                "        if not isinstance(r, tuple):\n"
+                "            raise ValueError('each row must be a tuple')\n"
+                "    return sum(sum(r) for r in rows) + k\n"
+                "def gen(seed, mode):\n"
+                "    return ([(seed, 1), (2, 3)], 0)\n")
+MIX_LIMITS = {"cases_small": 3, "cases_medium": 1, "mem_mb": 2048, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0}
+
+def test_the_input_skeleton_is_read_off_an_accepted_gen_output(tmp_path):
+    gi = V.prepare_oracle_tiers(PYT, ORACLE_MIXED, MIX_LIMITS, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lambda m: None)
+    # per argument position, and per sequence depth inside it
+    assert gi.input_skeleton == (("list", ("tuple", None)), None)
+    # and it is what _respellings offers first
+    assert V._respellings(PYT, (((1, 2), (3,)), 0), gi.input_skeleton)[0] == ([(1, 2), (3,)], 0)
+
+def test_a_hand_traced_example_is_respelled_to_the_mixed_shape_the_oracle_demands(tmp_path):
+    # the author spelled everything as tuples; the oracle wants an outer list of inner tuples.
+    cases = V.parse_examples(PYT, "((((1, 2), (3,)), 0), 6)\n")
+    lines = []
+    gi = V.prepare_gate_inputs(PYT, ORACLE_MIXED, "", MIX_LIMITS, workdir=str(tmp_path / "gi"), budget=FakeBudget(),
+                               log=lines.append, examples={"c1": cases})
+    ec = gi.example_checks
+    assert ec["respelled"] == 1 and ec["agreements"] == 1 and ec["rejected"] == [] and ec["disagreements"] == []
+    assert any("oracle.examples respelled=1" in l for l in lines)
+    assert cases[0].input == ([(1, 2), (3,)], 0)   # gated in the form the oracle accepts
+
+def test_edges_are_respelled_and_a_genuinely_wrong_shape_is_still_rejected(tmp_path):
+    # edge 0 is the right input in the wrong container spelling; edge 1 is a flat row where a list
+    # of rows was meant -- bench18's actual defect, which no respelling can reach.
+    stress = "EDGES = [(((1, 2), (3,)), 0), ((1, 2), 0)]\ndef gen_max(seed):\n    return ([(1, 1)], 0)\n"
+    lines = []
+    gi = V.prepare_gate_inputs(PYT, ORACLE_MIXED, stress, MIX_LIMITS, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lines.append)
+    assert any("oracle.edge respelled=1" in l for l in lines)
+    assert [c.input for c in gi.cases_edge] == [([(1, 2), (3,)], 0)]
+    assert [c.expected for c in gi.cases_edge] == [6]
+
+def test_without_a_skeleton_respelling_is_exactly_what_it_was(tmp_path):
+    # gen() crashes, so no tier and no skeleton: only the two uniform spellings are offered, and the
+    # edge path costs no extra validate batch.
+    broken = ORACLE_MIXED.replace("    return ([(seed, 1), (2, 3)], 0)\n", "    raise RuntimeError('no gen')\n")
+    lines = []
+    gi = V.prepare_gate_inputs(PYT, broken, "EDGES = [(((1, 2),), 0)]\n", MIX_LIMITS, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lines.append)
+    assert gi.input_skeleton is None
+    assert not any("oracle.edge respelled" in l for l in lines)
+    assert V._respellings(PYT, [[1, 2], [3]], None) == [((1, 2), (3,))]
