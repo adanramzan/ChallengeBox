@@ -1263,3 +1263,14 @@ def test_two_candidates_that_merely_both_crash_are_not_an_agreement(tmp_path):
     root2.evidence = list(parent.evidence)
     got = S.V.candidates_agree(p, [parent, child, root2], child, child.evidence[1])
     assert got and got["authors"] == ["c2", "c3"] and got["index"] == 1
+
+
+def test_the_examples_block_demands_in_contract_inputs_and_the_io_convention(tmp_path):
+    # bench14 lost 3 of 10 hand-traced examples and bench15 2 of 8 to inputs the oracle's
+    # precondition check rejected, or to a container spelled the other way round.
+    py = S.render("solve", **S.prompt_vars(prob(tmp_path)))
+    assert "must satisfy every precondition the statement states" in py
+    assert "thrown away and its check is lost" in py
+    assert "`()` is not" in py and "{{io_rules}}" not in py      # the python container rule, rendered
+    rust = S.render("solve", **S.prompt_vars(prob(tmp_path, "rust")))
+    assert "whitespace-separated token stream" in rust.split("===EXAMPLES===")[1]

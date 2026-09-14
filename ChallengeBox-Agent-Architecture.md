@@ -172,7 +172,12 @@ On top of those, one **I/O contract per language** (`solve.py`'s `io_rules`) is 
 The SOLVE reply carries one more block, `===EXAMPLES===`: three to five lines, each a Python literal
 `(args, expected)` pair (for Rust, the complete stdin and the complete stdout as strings), traced from the
 statement by hand and explicitly not obtained by running the code. The prompt asks for the smallest legal
-input, one input at a stated numeric limit, and the input the author thinks is most likely to be misread.
+input, one input at a stated numeric limit, and the input the author thinks is most likely to be misread — and it
+asks for all of them to be *in contract*: every example must satisfy every precondition the statement states, and
+every container in it must be spelled the way the same `{{io_rules}}` the oracle and stress authors receive says it
+is. Both halves are paid for in lost checks: an out-of-contract input is rejected by the oracle's `validate()` and
+dropped (3 of 10 examples on bench14, 2 of 8 on bench15), and a container spelled the other way round is rejected
+until the respelling retry rescues it.
 
 `verify.parse_examples` reads them with one restricted evaluation per line — never `exec`, this is model output.
 The grammar is Python literals plus integer arithmetic (`+ - * ** // %` and unary sign over `int` constants, with

@@ -29,6 +29,7 @@ Three to five lines and nothing else — no comments, no prose, no blank lines w
 Each line is one Python literal 2-tuple `(args, expected)`. `args` is {{gen_returns}}, exactly as the
 entrypoint will be called with it; `expected` is exactly what must come back — the return value for a
 Python function, the complete stdout text for a Rust program.
+Every example must satisfy every precondition the statement states — an example whose input the statement forbids is thrown away and its check is lost — and every container in it must be spelled exactly as this contract says: {{io_rules}}
 Hand-trace every one of them from the statement. Never obtain them by running the code above.
 Include at least these three: the smallest legal input; one input sitting at a stated numeric limit
 whose answer is cheap to reason about; and the input you consider most likely to be misread — the
