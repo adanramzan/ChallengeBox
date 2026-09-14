@@ -37,9 +37,11 @@ max_syntax_repairs = 2   # separate, smaller-scope budget for a static/compile f
 # timing failure on a real max-size input, by a repair that answers ===VERDICT=== approach, or by a
 # repaired child scoring below its parent -- three failures no patch can fix (round-10 L1/L2,
 # round-13 G4: four candidates for one statement, all asymptotically wrong in the same way, every
-# repair a variant of the same approach). Costs one strong call plus a gate pass on the result, so
-# it only starts while the budget covers repair_afford_s + one gate pass (~60 s, from the measured
-# tier timings above). Raise it only with the measured elapsed headroom to spend.
+# repair a variant of the same approach). Costs one strong SOLVE call plus a gate pass on the result,
+# so it only starts while the budget covers [phases] generate_call_share * usable + one gate pass
+# (~60 s, from the measured tier timings above) -- with a thinking model that is most of the
+# deadline, and a fresh solve started without it could only time out. Raise it only with the
+# measured elapsed headroom to spend.
 max_fresh_solves = 1
 mem_mb = 4096
 # Wall limit for ONE case inside the python harness, enforced per call rather than per batch.
@@ -89,11 +91,15 @@ validate_reject_frac_regen = 0.5
 # Conservative for the qwen3-coder now configured for "fast" (17-24s per oracle call); left at the
 # deepseek-era worst case so a slower model can be swapped in without re-tuning it.
 oracle_retry_afford_s = 130.0
-# Minimum remaining budget (seconds) required to start another repair-loop iteration (a syntax or
-# semantic repair call plus re-gating). Generous headroom over the measured repair-call latency
-# (~20s max against current models) so a repair attempt is never started only to be starved by
-# step_timeout's reserve. The strong role is now a thinking model, whose repair latency is
-# unmeasured; raise this if a live run shows repairs starting and then being starved.
+# Minimum remaining budget (seconds) required before an ORACLE retry is worth making after a
+# TIMED-OUT first call: the retry's own cap plus this, so the oracle is only re-asked while there is
+# still time to use what comes back.
+#
+# It no longer gates the repair loop or the fresh solve. Those two now require the budget to cover
+# the call's OWN cap plus one gate pass -- verify.repair_cap (the larger of [phases]
+# repair_call_share and the strong role's repair_cap_s) for a repair, generate_call_share for a
+# fresh solve -- because a fixed 60 s threshold said "affordable" for a call that needs 120 s and
+# can only time out. bench16 spent 67 s of a 285 s run that way.
 repair_afford_s = 60.0
 
 # Minimum remaining budget (seconds) required to trigger one oracle self-repair regeneration when
@@ -151,6 +157,16 @@ price_in_per_m = 5.0
 price_out_per_m = 25.0  # OpenRouter reports usage.cost and the client prefers it; these are the fallback
 omit_temperature = true  # Claude 5 takes no sampling temperature once thinking is on (same reason as [profiles.anthropic.strong])
 extra = { reasoning = { effort = "medium" } }
+# After the gate the deadline is measured in tens of seconds, not hundreds, so the two post-gate
+# calls think at low effort instead. At medium effort a solve call measured 150-200s; a repair at
+# low effort is expected to be about half that, which is what repair_cap_s below is set against.
+repair_extra = { reasoning = { effort = "low" } }
+# Floor for the repair/fresh-solve call cap (verify.repair_cap takes the larger of this and
+# [phases] repair_call_share * usable). The fraction alone is 0.25 * 285 = 71s, tuned when the
+# strong role was a 12-17s non-reasoning coder model; against this role it is a guaranteed timeout,
+# and bench16 spent one that way. Measured 150-200s per solve at medium effort, expected roughly
+# half of that at the low effort repair_extra selects above.
+repair_cap_s = 120.0
 
 [profiles.openrouter.fast]
 base_url = "https://openrouter.ai/api/v1"

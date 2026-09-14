@@ -1138,6 +1138,18 @@ def _agreement_note(run, cand, failed: Evidence, gi: GateInputs, detail: dict) -
             return f"disagrees with the reference on {e.detail.get('mismatches', 0)} of {e.cases} small inputs"
     return "was not measured against a whole tier of inputs"
 
+def repair_cap(run) -> float:
+    """The wall cap for one repair or fresh-solve call: the larger of the phase fraction
+    ([phases] repair_call_share, which is tuned to the DEADLINE) and the strong role's own
+    repair_cap_s (which is tuned to the MODEL). Both are needed: the fraction alone gave bench16 a
+    67 s cap against a role whose completed solve that run took 168 s, so the repair could only time
+    out; a fixed floor alone would ignore a shorter deadline. solve() uses the same number to decide
+    whether a repair can be afforded at all, so the call is never started against a cap the budget
+    cannot cover."""
+    roles = getattr(run.llm, "roles", None) or {}
+    floor = float(getattr(roles.get("strong"), "repair_cap_s", 0.0) or 0.0)
+    return max(run.cfg["phases"]["repair_call_share"] * run.budget.usable_s, floor)
+
 def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, str]:
     problem = run.p
     previous_attempt = _previous_attempt_note(run, cand, failed)
@@ -1164,13 +1176,21 @@ def repair(run, cand, failed: Evidence, gi: GateInputs, pv: dict) -> tuple[str, 
     # regenerate_oracle's identical use of generate_call_share, and BENCHMARK-FINDINGS.md F6 for
     # what goes wrong when a phase cap is hardcoded instead (raising the config knob then does
     # nothing because the hardcoded fraction still wins the min() in Run.chat/step_timeout).
-    repair_cap = run.cfg["phases"]["repair_call_share"] * run.budget.usable_s
-    r = run.chat("strong", "repair", repair_cap, kind=failed.kind, expected_source=expected_source(failed.kind),
+    cap = repair_cap(run)
+    r = run.chat("strong", "repair", cap, kind=failed.kind, expected_source=expected_source(failed.kind),
                  input=_fmt_typed(detail.get("input")), expected=_fmt_typed(detail.get("expected")),
                  actual=_fmt_typed(detail.get("actual")), details=_fmt({k: v for k, v in detail.items() if k not in ("input", "expected", "actual")}),
                  code=_fmt(cand.source), agreement=agreement,
                  reference=_fmt(gi.oracle_src, 8000) if gi.oracle_src.strip() else "(no reference available)", **pv_repair)
     blocks = parse_blocks(r.text)
+    # A call that never produced an answer -- a transport error, a 4xx/5xx, a timeout, a reply with
+    # no marker block in it -- adjudicated nothing, and must not be read as one. It used to fall
+    # through to the default verdict `candidate`, which says the reference is right and the
+    # candidate is wrong: on bench16 a 403 was recorded that way on a run whose oracle was in fact
+    # the wrong side. There is no verdict here, and no child to mint.
+    if r.error or not blocks:
+        run.log(f"repair.error {r.error or 'no marker block in the reply'}")
+        return "", "error"
     # "approach": the model says no patch of this code can meet the stated limits. Its CODE block is
     # then the current code unchanged (the prompt asks for that), so solve() starts a fresh solution
     # from a different algorithm instead of minting a child that changes nothing.

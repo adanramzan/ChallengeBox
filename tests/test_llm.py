@@ -306,3 +306,27 @@ def test_a_stall_that_exhausts_retries_returns_an_error_inside_the_call_timeout(
     reply = LLM({"fast": role}).chat("fast", "s", "u", timeout_s=20.0)
     assert reply.error.startswith("transport:") and _StallHandler.requests == 1
     assert time.monotonic() - t0 < 20.0 and not reply.text
+
+
+def test_repair_extra_is_sent_only_for_the_post_gate_tags(server):
+    # A thinking model cannot finish a repair at the effort its first solve used, so the two
+    # post-gate calls get their own extra. Which knob that is stays in config; llm.py only knows
+    # which tags take it.
+    role = Role("strong", server, "m", "", 100, 1, 30.0, {"reasoning": {"effort": "medium"}},
+                repair_extra={"reasoning": {"effort": "low"}})
+    llm = LLM({"strong": role})
+    llm.chat("strong", "s", "u", timeout_s=10, tag="solve")
+    assert _Handler.last_body["reasoning"] == {"effort": "medium"}
+    llm.chat("strong", "s", "u", timeout_s=10, tag="repair")
+    assert _Handler.last_body["reasoning"] == {"effort": "low"}
+    llm.chat("strong", "s", "u", timeout_s=10, tag="solve_fresh")
+    assert _Handler.last_body["reasoning"] == {"effort": "low"}
+    # a role that sets no repair_extra sends exactly what it always sent
+    plain = LLM({"strong": Role("strong", server, "m", "", 100, 1, 30.0, {"reasoning": {"effort": "medium"}})})
+    plain.chat("strong", "s", "u", timeout_s=10, tag="repair")
+    assert _Handler.last_body["reasoning"] == {"effort": "medium"}
+
+def test_config_gives_the_thinking_role_a_repair_effort_and_a_repair_cap():
+    strong = load_config(str(ROOT / "config.toml"), "openrouter")["roles"]["strong"]
+    assert strong.repair_extra == {"reasoning": {"effort": "low"}} and strong.repair_cap_s == 120.0
+    assert load_config(str(ROOT / "config.toml"), "openai")["roles"]["strong"].repair_extra == {}

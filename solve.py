@@ -152,11 +152,16 @@ class Run:
         self.log(f"candidate.added id={c.id} parent={parent}")
         return c
 
-    def chat(self, role: str, prompt_name: str, cap_s: float, **vars):
+    def chat(self, role: str, prompt_name: str, cap_s: float, *, tag: str | None = None, **vars):
+        # `tag` defaults to the prompt name and is overridden only where the same prompt is sent for
+        # a different purpose -- a fresh solve, which is a post-gate call and takes the role's
+        # repair_extra (llm.REPAIR_TAGS). It is what the log line, report.json's `calls` and the
+        # FakeLLM script are keyed on, so the two are distinguishable everywhere.
+        tag = tag or prompt_name
         timeout = self.budget.step_timeout(min(cap_s, self.llm.roles[role].timeout_cap_s if hasattr(self.llm, "roles") else cap_s), reserve_s=10.0)
-        self.log(f"{prompt_name}.sent role={role} timeout={timeout:.0f}")
-        r = self.llm.chat(role, "You are a precise competitive-programming engineer.", render(prompt_name, **vars), timeout_s=timeout, tag=prompt_name)
-        self.log(f"{prompt_name}.done error={r.error} latency={r.latency_s:.1f} usage={r.usage}")
+        self.log(f"{tag}.sent role={role} timeout={timeout:.0f}")
+        r = self.llm.chat(role, "You are a precise competitive-programming engineer.", render(prompt_name, **vars), timeout_s=timeout, tag=tag)
+        self.log(f"{tag}.done error={r.error} latency={r.latency_s:.1f} usage={r.usage}")
         return r
 
 
@@ -216,6 +221,11 @@ def best_candidate(cands: list[Candidate]) -> Candidate | None:
 GATE_PASS_ESTIMATE_S = 60.0
 
 
+def fresh_solve_cap(cfg: dict, budget) -> float:
+    """A fresh solve is a whole new SOLVE call, so it is capped like one."""
+    return cfg["phases"]["generate_call_share"] * budget.usable_s
+
+
 def fresh_solve(run, prev_cand, failed, gi, pv) -> "Candidate | None":
     """One more SOLVE call that starts over from a different algorithm, carrying the previous
     attempt and the concrete failure that ended it.
@@ -224,9 +234,9 @@ def fresh_solve(run, prev_cand, failed, gi, pv) -> "Candidate | None":
     candidates for one statement were all asymptotically wrong in the same way, and every repair was
     a variant of the same approach. The new candidate is a ROOT (parent None) -- it is not a repair
     of anything -- and competes for emission through candidate_score like any other."""
-    gen_cap = run.cfg["phases"]["generate_call_share"] * run.budget.usable_s
+    gen_cap = fresh_solve_cap(run.cfg, run.budget)
     section = V.previous_attempt_section(run.p, prev_cand, failed, gi)
-    r = run.chat("strong", "solve", gen_cap, **{**pv, "previous_attempt": section})
+    r = run.chat("strong", "solve", gen_cap, tag="solve_fresh", **{**pv, "previous_attempt": section})
     blocks = parse_blocks(r.text)
     code = blocks.get("CODE", "")
     if not code.strip() or any(c.source.strip() == code.strip() for c in run.cands):
@@ -475,12 +485,23 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         # A crashed preparation leaves an oracle with no usable case in any tier, which is the
         # self-repair path's own first trigger: give the run its one recovery attempt here too.
         adjudicate_oracle()
+    def repair_afford() -> float:
+        """What starting a repair costs: the call at its own cap (V.repair_cap, which follows the
+        configured model, not just the deadline) plus the gate pass its result needs. A call that
+        cannot fit its cap can only time out, and bench16 spent 67 s of a 285 s run proving it."""
+        return V.repair_cap(run) + GATE_PASS_ESTIMATE_S
+
     def can_fresh_solve() -> bool:
-        """A fresh solve costs one strong call plus a gate pass on its result, so it is only started
-        while the budget still covers both (and the cost cap and the per-run count allow it)."""
-        return (fresh_solves < cfg["limits"].get("max_fresh_solves", 1)
-                and run.budget.can_afford(cfg["limits"]["repair_afford_s"] + GATE_PASS_ESTIMATE_S)
-                and not run.over_cost())
+        """A fresh solve costs one strong call at the full generate cap plus a gate pass on its
+        result, so it is only started while the budget still covers both (and the cost cap and the
+        per-run count allow it)."""
+        if fresh_solves >= cfg["limits"].get("max_fresh_solves", 1) or run.over_cost():
+            return False
+        need = fresh_solve_cap(cfg, run.budget) + GATE_PASS_ESTIMATE_S
+        if not run.budget.can_afford(need):
+            run.log(f"solve.fresh skipped reason=budget need={need:.0f} remaining={run.budget.remaining():.0f}")
+            return False
+        return True
 
     while run.cands and not gate_crashed:
         # Every attempt that arrived was already gated as it landed; what is left here are the
@@ -508,7 +529,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             run.log(f"gate.failed cand={cand.id} kind={failed.kind} detail={repr(failed.detail)[:300]}")
             # Another independent attempt is still ungated: gate it before spending a repair call.
             # It costs no model call, and an attempt that already passes beats a repaired one.
-            if len(ungated) > 1 and run.budget.can_afford(cfg["limits"]["repair_afford_s"]):
+            if len(ungated) > 1 and run.budget.can_afford(repair_afford()):
                 run.log(f"gate.next_attempt {len(ungated) - 1} attempt(s) still ungated, trying before repair")
                 continue
             # Every attempt is now gated, and `cand` is merely the one this iteration picked up --
@@ -544,7 +565,10 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             is_syntax = failed.kind in ("static", "compile")
             cap = cfg["limits"]["max_syntax_repairs"] if is_syntax else cfg["limits"]["max_repairs"]
             count = syntax_repairs if is_syntax else repairs
-            if count >= cap or run.budget.phase() not in ("generate", "gate", "repair") or not run.budget.can_afford(cfg["limits"]["repair_afford_s"]):
+            if count >= cap or run.budget.phase() not in ("generate", "gate", "repair"):
+                break
+            if not run.budget.can_afford(repair_afford()):
+                run.log(f"repair.skipped reason=budget need={repair_afford():.0f} remaining={run.budget.remaining():.0f}")
                 break
             if run.over_cost():
                 break
@@ -553,6 +577,8 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
             else:
                 repairs += 1
             new_source, verdict = V.repair(run, cand, failed, gi, pv)
+            if verdict == "error":
+                break   # the call produced no answer at all: no verdict, no child, nothing to act on
             if verdict == "oracle":
                 # repair.md tells the model to repeat the current code unchanged when it blames the
                 # oracle, so its CODE block is not a fix. With no regeneration left there is nothing

@@ -474,14 +474,16 @@ def test_oracle_retry_afford_threshold_is_read_from_config(tmp_path):
     assert not any("oracle.retry" in l for l in rep["events"])
     assert len([call for call in rep["calls"] if call["tag"] == "oracle"]) == 1
 
-def test_repair_afford_threshold_is_read_from_config(tmp_path):
-    # limits.repair_afford_s used to be a bare `60` literal gating whether the repair loop may start
-    # another iteration. Raising it past the usable budget must suppress every repair attempt even
-    # though max_repairs would otherwise allow one.
+def test_a_repair_that_cannot_fit_its_own_call_cap_is_never_started(tmp_path):
+    # bench16: the repair cap was 25 % of usable (67 s) against a strong role whose completed call
+    # that run took 168 s, so the call could only time out -- and the 67 s were spent anyway. A
+    # repair now needs its own cap (verify.repair_cap) plus a gate pass to still fit the budget.
     llm = FakeLLM({"solve": [BUGGY], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
-    c = cfg(); c["limits"]["repair_afford_s"] = 10_000.0
+    c = cfg(); c["phases"]["repair_call_share"] = 10.0   # a call this size can never fit the budget
     rep = S.solve(prob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert rep["repairs"] == 0 and rep["syntax_repairs"] == 0
+    assert not any(call["tag"] == "repair" for call in rep["calls"])
+    assert any("repair.skipped reason=budget" in e for e in rep["events"])
     assert rep["status"] == "emitted_with_failures"
 
 def test_static_failure_consumes_syntax_budget_not_semantic(tmp_path):
@@ -945,12 +947,12 @@ def _prompts(llm, tag):
 def test_a_timing_failure_starts_a_fresh_solve_that_can_win_emission(tmp_path):
     # round-13 G4: a patch cannot change the complexity of an approach, so a candidate that is only
     # too slow gets a second solution written from a different algorithm, carrying the failure.
-    llm = FakeLLM({"solve": [SOLVE_QUADRATIC, SOLVE_LINEAR], "oracle": [ORACLE_SUM], "stress": [STRESS_BIG_LIST]})
+    llm = FakeLLM({"solve": [SOLVE_QUADRATIC], "solve_fresh": [SOLVE_LINEAR], "oracle": [ORACLE_SUM], "stress": [STRESS_BIG_LIST]})
     rep = S.solve(sumprob(tmp_path), llm, slow_cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
     assert not ev["stress"]["passed"] and ev["stress"]["detail"]["too_slow"]
     assert rep["fresh_solves"] == 1 and rep["repairs"] == 0   # never sent to the patch-style repair
-    p2 = _prompts(llm, "solve")[1]
+    p2 = _prompts(llm, "solve_fresh")[0]   # a fresh solve is its own tag: it is a post-gate call
     assert "A previous solution to this statement failed" in p2
     assert "Re-sum the whole prefix at every index" in p2       # the previous ALGORITHM block
     assert "argument 1: type list; length 20000" in p2           # the input's shape...
@@ -963,23 +965,25 @@ def test_a_timing_failure_starts_a_fresh_solve_that_can_win_emission(tmp_path):
 
 def test_no_fresh_solve_left_falls_through_without_a_patch(tmp_path):
     c = slow_cfg(); c["limits"]["max_fresh_solves"] = 0
-    llm = FakeLLM({"solve": [SOLVE_QUADRATIC, SOLVE_LINEAR], "oracle": [ORACLE_SUM], "stress": [STRESS_BIG_LIST]})
+    llm = FakeLLM({"solve": [SOLVE_QUADRATIC], "solve_fresh": [SOLVE_LINEAR], "oracle": [ORACLE_SUM], "stress": [STRESS_BIG_LIST]})
     rep = S.solve(sumprob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
-    assert rep["fresh_solves"] == 0 and rep["repairs"] == 0 and len(_prompts(llm, "solve")) == 1
+    assert rep["fresh_solves"] == 0 and rep["repairs"] == 0 and not _prompts(llm, "solve_fresh")
     assert rep["final_candidate"] == "c1" and rep["status"] == "emitted_with_failures"
 
 def test_no_budget_means_no_fresh_solve(tmp_path):
-    c = slow_cfg(); c["limits"]["repair_afford_s"] = 10**9   # nothing is affordable any more
-    llm = FakeLLM({"solve": [SOLVE_QUADRATIC, SOLVE_LINEAR], "oracle": [ORACLE_SUM], "stress": [STRESS_BIG_LIST]})
+    # A fresh solve needs its own call cap (the generate share) plus a gate pass to still fit.
+    c = slow_cfg(); c["phases"]["generate_call_share"] = 10.0   # a call this size can never fit the budget
+    llm = FakeLLM({"solve": [SOLVE_QUADRATIC], "solve_fresh": [SOLVE_LINEAR], "oracle": [ORACLE_SUM], "stress": [STRESS_BIG_LIST]})
     rep = S.solve(sumprob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
-    assert rep["fresh_solves"] == 0 and len(_prompts(llm, "solve")) == 1
+    assert rep["fresh_solves"] == 0 and not _prompts(llm, "solve_fresh")
+    assert any("solve.fresh skipped reason=budget" in e for e in rep["events"])
     assert any("solve.fresh unavailable" in e for e in rep["events"])
 
 REPAIR_APPROACH = "===VERDICT===\napproach\n===END===\n===CODE===\ndef add(a, b):\n    return a + b if a < 15 else a + b + 1\n===END===\n"
 
 def test_an_approach_verdict_mints_no_child_and_starts_a_fresh_solve(tmp_path):
     c = cfg(); c["limits"]["max_fresh_solves"] = 1
-    llm = FakeLLM({"solve": [BUGGY, SOLVE_OK], "repair": [REPAIR_APPROACH], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    llm = FakeLLM({"solve": [BUGGY], "solve_fresh": [SOLVE_OK], "repair": [REPAIR_APPROACH], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
     rep = S.solve(prob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert any("repair.verdict=approach" in e for e in rep["events"])
     assert rep["fresh_solves"] == 1 and rep["parents"] == {"c1": None, "c2": None}   # no repaired child
@@ -990,7 +994,7 @@ REPAIR_WORSE = "===VERDICT===\ncandidate\n===END===\n===CODE===\ndef add(a, b):\
 def test_a_repair_that_regresses_stops_the_lineage_and_re_solves(tmp_path):
     # round-10 L1: a child that fails more gate steps than its parent is a losing bet to patch again.
     c = cfg(); c["limits"]["max_fresh_solves"] = 1
-    llm = FakeLLM({"solve": [BUGGY, SOLVE_OK], "repair": [REPAIR_WORSE], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    llm = FakeLLM({"solve": [BUGGY], "solve_fresh": [SOLVE_OK], "repair": [REPAIR_WORSE], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
     rep = S.solve(prob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert any("repair.regressed child=c2 parent=c1" in e for e in rep["events"])
     assert rep["repairs"] == 1 and rep["fresh_solves"] == 1   # the second repair attempt is never spent
@@ -1174,3 +1178,39 @@ def test_the_example_check_accumulates_and_the_dispute_is_decided_once(tmp_path)
     assert sum("oracle.selfrepair triggered" in e for e in rep["events"]) == 1
     assert len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 2   # the one regeneration, not one per candidate
     assert sum("oracle.examples cases=" in e for e in rep["events"]) >= 2   # the check itself does accumulate
+
+
+# --- round 14: a repair has to fit the model it is sent to ---
+
+class _ErroringRepair(FakeLLM):
+    """Every call scripted as usual, except the repair, which fails the way a 403 or a dropped
+    connection does: no content, no blocks, an error on the Reply."""
+    def chat(self, role, system, user, *, timeout_s, max_tokens=None, tag=""):
+        r = super().chat(role, system, user, timeout_s=timeout_s, max_tokens=max_tokens, tag=tag)
+        if tag == "repair":
+            from llm import Reply
+            return Reply("", "", dict(self.usage), 0.0, "fake", "http 403: key limit reached")
+        return r
+
+def test_an_errored_repair_call_mints_no_child_and_reaches_no_verdict(tmp_path):
+    # bench16-1dea: the repair call 403'd and the empty reply fell through to the default verdict
+    # `candidate` -- "the reference is right" -- on a run whose oracle was in fact the wrong side.
+    llm = _ErroringRepair({"solve": [BUGGY], "repair": [""], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert any("repair.error http 403" in e for e in rep["events"])
+    assert not any("repair.verdict" in e for e in rep["events"])
+    assert list(rep["evidence"]) == ["c1"] and rep["status"] == "emitted_with_failures"
+    assert (tmp_path / "s.py").exists()
+
+def test_repair_cap_takes_the_larger_of_the_phase_share_and_the_role_floor(tmp_path):
+    class _Role: repair_cap_s = 120.0
+    class _LLM: roles = {"strong": _Role()}
+    class _Run:
+        llm = _LLM()
+        cfg = {"phases": {"repair_call_share": 0.25}}
+        budget = S.Budget(300.0, margin_s=15.0, phases={})
+    assert S.V.repair_cap(_Run()) == 120.0            # 0.25 * 285 = 71 s, far below the role's own latency
+    _Run.cfg = {"phases": {"repair_call_share": 0.6}}
+    assert S.V.repair_cap(_Run()) == pytest.approx(171.0)
+    _Role.repair_cap_s = 0.0                           # unset: the phase share is the only rule, as before
+    assert S.V.repair_cap(_Run()) == pytest.approx(171.0)
