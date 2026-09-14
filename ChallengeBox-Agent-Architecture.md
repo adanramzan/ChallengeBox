@@ -421,6 +421,8 @@ The first compiling candidate is checkpointed immutably. A repair that fails to 
 
 Worst case is roughly 25k input and 30k output tokens per problem. Monetary cost is computed from prices in the config file and reported per run; if prices are not configured the report says "cost unavailable" rather than guessing.
 
+**Transport.** Every call goes over one OpenAI-compatible HTTP client and every provider difference lives in the role's config, never in a branch in `llm.py`: `token_param`, `omit_temperature`, `price_in_per_m` / `price_out_per_m`, and now `stream` (default true) and `stall_timeout_s` (default 30 s). Replies are streamed as SSE — `delta.content` and `delta.reasoning` (OpenRouter's spelling; `reasoning_content` is accepted too) accumulated into exactly the shape a non-streamed reply has, with `usage` taken from the final chunk (`stream_options.include_usage`, or OpenRouter's top-level `usage` on the last chunk). The reason is not latency but detection: a connection that stalls mid-answer is otherwise indistinguishable from a model that is still thinking, and the call burns its whole timeout before the existing transport retry can fire. With the body read line by line, the socket timeout *is* the stall detector — no bytes for `stall_timeout_s` raises, the retry treats it as any other transport error, and the call's own `timeout_s` still bounds the whole attempt. A provider that cannot stream sets `stream = false` for that role.
+
 ### 8.2 Levers
 
 - Hard caps: 6 model calls, 2 semantic repairs + 2 syntax repairs (independent budgets, §5.7), 1 oracle regeneration, 60k output tokens per problem.

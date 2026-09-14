@@ -27,6 +27,13 @@ class Role:
     omit_temperature: bool = False   # Claude 5 and OpenAI reasoning models reject a sampling temperature
     price_in_per_m: float = 0.0
     price_out_per_m: float = 0.0
+    # Streaming exists for one reason: a connection that stalls mid-answer is otherwise
+    # indistinguishable from a model that is still thinking, and the call burns its whole timeout
+    # before the transport retry can fire. With the body streamed, "no bytes for stall_timeout_s"
+    # is a transport error the existing retry already knows how to handle. A provider that cannot
+    # stream sets stream = false in its role config; no branch on provider name goes in this module.
+    stream: bool = True
+    stall_timeout_s: float = 30.0
 
 
 @dataclass
@@ -50,7 +57,8 @@ def load_config(path: str, profile: str) -> dict:
     roles = {name: Role(name, r["base_url"].rstrip("/"), r["model"], r.get("api_key_env", ""), int(r["max_tokens"]),
                         int(r.get("max_concurrent", 1)), float(r.get("timeout_cap_s", 120.0)), dict(r.get("extra", {})),
                         int(r.get("transport_retries", 2)), float(r.get("transport_backoff_s", 2.0)),
-                        r.get("token_param", "max_tokens"), bool(r.get("omit_temperature", False)), float(r.get("price_in_per_m", 0.0)), float(r.get("price_out_per_m", 0.0)))
+                        r.get("token_param", "max_tokens"), bool(r.get("omit_temperature", False)), float(r.get("price_in_per_m", 0.0)), float(r.get("price_out_per_m", 0.0)),
+                        bool(r.get("stream", True)), float(r.get("stall_timeout_s", 30.0)))
              for name, r in prof.items()}
     return {"roles": roles, "limits": cfg["limits"], "phases": cfg["phases"], "profile": profile}
 
@@ -64,6 +72,40 @@ def pick_profile(path: str) -> str:
         if all(not r.get("api_key_env") or r["api_key_env"] in os.environ for r in prof.values()):
             return name
     return next(iter(profiles))
+
+
+def _read_sse(resp) -> dict:
+    """An OpenAI-compatible SSE body, folded back into the same shape a non-streamed reply has, so
+    nothing downstream knows the difference. Accumulates delta.content and delta.reasoning (OpenRouter's
+    field name; reasoning_content is accepted too) and keeps whatever usage the last chunk carries --
+    OpenAI puts it in a final chunk requested with stream_options.include_usage, OpenRouter sends it
+    top-level on the last chunk. Reading line by line is what makes the socket timeout a stall
+    detector: each readline is bounded by it."""
+    content, reasoning, usage, model = [], [], {}, None
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            chunk = json.loads(payload)
+        except ValueError:   # a keep-alive or a malformed frame is not the answer; skip it
+            continue
+        model = chunk.get("model") or model
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+        for ch in chunk.get("choices") or []:
+            d = ch.get("delta") or {}
+            if d.get("content"):
+                content.append(d["content"])
+            if d.get("reasoning") or d.get("reasoning_content"):
+                reasoning.append(d.get("reasoning") or d.get("reasoning_content"))
+    out = {"choices": [{"message": {"content": "".join(content), "reasoning": "".join(reasoning)}}], "usage": usage}
+    if model:
+        out["model"] = model
+    return out
 
 
 class LLM:
@@ -82,7 +124,8 @@ class LLM:
         r = self.roles[role]
         limit = max_tokens or r.max_tokens
         body = {"model": r.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                r.token_param: limit, "temperature": 0.2, "stream": False, **r.extra}
+                r.token_param: limit, "temperature": 0.2, "stream": r.stream,
+                **({"stream_options": {"include_usage": True}} if r.stream else {}), **r.extra}
         if r.omit_temperature:
             body.pop("temperature")
         if timeout_s <= 0:
@@ -103,8 +146,12 @@ class LLM:
 
             def work(result=result):
                 try:
-                    with urllib.request.urlopen(req, timeout=timeout_s + 5) as resp:
-                        result["data"] = json.load(resp)
+                    # Streaming: the socket timeout applies per read, so it IS the stall detector --
+                    # a gap longer than stall_timeout_s between chunks raises, and the retry below
+                    # treats it as any other transport error. The call's own timeout_s still bounds
+                    # the whole attempt, through the join() beneath.
+                    with urllib.request.urlopen(req, timeout=r.stall_timeout_s if r.stream else timeout_s + 5) as resp:
+                        result["data"] = _read_sse(resp) if r.stream else json.load(resp)
                 except urllib.error.HTTPError as e:
                     result["error"] = f"http {e.code}: {e.read().decode('utf-8', 'replace')[:300]}"
                     result["retryable"] = e.code == 429 or e.code >= 500

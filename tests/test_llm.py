@@ -41,10 +41,22 @@ class _Handler(BaseHTTPRequestHandler):
             _Handler.requests += 1
         time.sleep(_Handler.delay)
         with _Handler.lock: _Handler.active -= 1
+        model = _Handler.served_model or body["model"]
+        if body.get("stream"):
+            # Same answer, delivered as SSE: content empty, the text in the reasoning field, usage
+            # only on the final chunk (what stream_options.include_usage asks for).
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            for piece in ("===CODE===\n", "print(1)\n", "===END==="):
+                self._sse({"model": model, "choices": [{"delta": {"content": "", "reasoning": piece}}]})
+            self._sse({"model": model, "choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+            self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+            return
         resp = {"choices": [{"message": {"role": "assistant", "content": "", "reasoning_content": "===CODE===\nprint(1)\n===END==="}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5}, "model": _Handler.served_model or body["model"]}
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}, "model": model}
         data = json.dumps(resp).encode()
         self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+    def _sse(self, obj):
+        self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n"); self.wfile.flush()
     def log_message(self, *a): pass
 
 @pytest.fixture
@@ -239,3 +251,58 @@ def test_chat_no_retry_when_timeout_has_no_room(flaky):
     role = Role("fast", flaky, "m", "", 100, 1, 30.0, {}, transport_retries=2, transport_backoff_s=0.01)
     reply = LLM({"fast": role}).chat("fast", "s", "u", timeout_s=4.0)   # backoff + 5 s floor exceeds it
     assert reply.error.startswith("http 503") and _Handler.requests == 1
+
+
+# --- round 14: streamed replies, and a connection that stalls mid-answer ---
+
+class _StallHandler(_Handler):
+    """Sends the SSE headers and one chunk, then holds the connection open saying nothing."""
+    requests = 0
+    def do_POST(self):
+        json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        with _Handler.lock:
+            _StallHandler.requests += 1
+        self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+        self._sse({"choices": [{"delta": {"content": "partial"}}]})
+        time.sleep(5)   # longer than any stall_timeout_s the tests use
+
+@pytest.fixture
+def staller():
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _StallHandler); th = threading.Thread(target=srv.serve_forever, daemon=True); th.start()
+    _StallHandler.requests = 0
+    yield f"http://127.0.0.1:{srv.server_port}/v1"; srv.shutdown()
+
+def test_streamed_reply_accumulates_content_reasoning_and_usage(server):
+    role = Role("strong", server, "m", "", 100, 1, 30.0, {})
+    assert role.stream   # streaming is the default
+    r = LLM({"strong": role}).chat("strong", "s", "u", timeout_s=10)
+    b = _Handler.last_body
+    assert b["stream"] is True and b["stream_options"] == {"include_usage": True}
+    assert r.error is None and r.content == "" and r.text == "===CODE===\nprint(1)\n===END==="
+    assert r.usage["prompt_tokens"] == 10 and r.usage["completion_tokens"] == 5
+
+def test_a_role_can_opt_out_of_streaming(server):
+    role = Role("strong", server, "m", "", 100, 1, 30.0, {}, stream=False)
+    r = LLM({"strong": role}).chat("strong", "s", "u", timeout_s=10)
+    b = _Handler.last_body
+    assert b["stream"] is False and "stream_options" not in b
+    assert r.error is None and "===CODE===" in r.text
+
+def test_config_carries_stream_and_stall_timeout_per_role():
+    cfg = load_config(str(ROOT / "config.toml"), "openrouter")
+    assert cfg["roles"]["strong"].stream and cfg["roles"]["strong"].stall_timeout_s > 0
+
+def test_a_stalled_stream_aborts_and_is_retried(staller):
+    role = Role("fast", staller, "m", "", 100, 1, 30.0, {}, transport_retries=1, transport_backoff_s=0.01, stall_timeout_s=0.5)
+    t0 = time.monotonic()
+    reply = LLM({"fast": role}).chat("fast", "s", "u", timeout_s=20.0)
+    # the stall is a transport error, so the existing retry fires; both attempts stall out
+    assert reply.error.startswith("transport:") and _StallHandler.requests == 2
+    assert time.monotonic() - t0 < 10   # aborted on the stall, not on the call's own timeout
+
+def test_a_stall_that_exhausts_retries_returns_an_error_inside_the_call_timeout(staller):
+    role = Role("fast", staller, "m", "", 100, 1, 30.0, {}, transport_retries=0, transport_backoff_s=0.01, stall_timeout_s=0.4)
+    t0 = time.monotonic()
+    reply = LLM({"fast": role}).chat("fast", "s", "u", timeout_s=20.0)
+    assert reply.error.startswith("transport:") and _StallHandler.requests == 1
+    assert time.monotonic() - t0 < 20.0 and not reply.text

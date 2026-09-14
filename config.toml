@@ -108,7 +108,13 @@ repair_until = 0.81
 settle_until = 0.93
 # Cap on the concurrent solve/oracle/stress calls, as a fraction of usable_s. The three run
 # concurrently, so this phase costs max() of them, not sum() -- see solve.py's solve().
-generate_call_share = 0.55   # effective oracle timeout = min(share*usable, fast.timeout_cap_s); measured oracle max 128s needs headroom
+# The SOLVE call is the only one of the three that can create the answer -- the oracle and the
+# stress generator only measure it -- so it gets the largest share. Raised from 0.55 once gate-input
+# preparation stopped waiting for it (it now overlaps the solve call, see solve()): a candidate
+# arriving at 70% of usable still leaves one full gate pass and one repair, because the oracle tiers
+# are already built by then. Effective per-call timeout = min(share*usable, role.timeout_cap_s), so
+# the role caps still bound each one; the fast role's measured oracle max of 128s has headroom here.
+generate_call_share = 0.70
 # Cap on a single repair call, as a fraction of usable_s -- same knob shape as generate_call_share,
 # so raising/lowering it does not silently get overridden by a hardcoded fraction (see F6).
 repair_call_share = 0.25
