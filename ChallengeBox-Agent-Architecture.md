@@ -303,6 +303,18 @@ carries the same rule for the first attempt.
 
 A fourth source is a stress run that finished faster than any real work could. The timing gate times the candidate but never checked that the candidate actually *consumed* the input: on bench14 `gen_max`'s first operation named an identifier its own input never created, so the candidate discarded a 476 KB input at operation 1 and the gate recorded a pass for a solution needing ~10^11 s at the stated limits. A *passing* `stress` whose measured duration is below `[limits] stress_min_plausible_s` (default 0.01 s) now records `detail.suspicious` (`finished in <d> s on a <n>-byte input; the input may not exercise the candidate`), carries it as `detail.degraded` and is recorded as `skipped` — never as a pass. It is generic over every early-exit shape (first-invalid-index answers, validators, short-circuiting searches) and costs no tokens; its one known false positive is a genuinely O(1) closed-form answer, which loses "pass" for "degraded" and nothing else.
 
+**A suspicious measurement falls through to the next source.** The suspect in that case is the *input*, not the
+candidate, and the chain above has more of them — but until now a suspicious first source ended the timing check
+for the whole run: on bench18 `gen_max` returned 7 operations with an invalid one first, the candidate answered in
+0.000 s, the gate correctly refused the pass, and `gen(seed, "large")` sat unused. No candidate-independent
+pre-check can catch this (whether an input exercises a solution is a fact about that solution), so it is done at
+gate time: when the `stress` step comes back `suspicious` and a later source in the chain has not been tried,
+`verify.next_stress_source` advances to it (logged `stress.fallthrough from=gen_max to=gen_large`) and the step is
+re-run on the new input. The better evidence is kept — a real measurement or a degraded pass both beat a suspicious
+one, and two suspicious runs leave the run degraded exactly as one did. Bounded at **two stress runs per candidate**
+by construction: only the first result can trigger the fallthrough. `gate_inputs.stress_tried` records which
+sources have been consumed, so the next candidate resumes the chain rather than repeating it.
+
 For this to mean anything, `duration_s` had to become the candidate's own time. The Python harness started its clock before `ast.literal_eval` and `copy.deepcopy` of the arguments, which cost ~0.10 s on a 50 000-element input and are identical for every candidate — so a candidate doing no work at all and one doing all of it read as 0.103 s and 0.105 s, and `duration_s` measured input size rather than work. The clock now starts immediately before the call. The judge hands the function real objects, so that setup was never part of what is being timed.
 
 ### 5.5 Deterministic gate

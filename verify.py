@@ -53,6 +53,7 @@ class GateInputs:
     stress_degraded: bool = False
     stress_source: str = ""   # gen_max | gen_large | medium_degraded -- which generator produced the timing input
     stress_validity: str = ""   # accepted | unjudged -- what the oracle's validate() said about the timing input
+    stress_tried: list = field(default_factory=list)   # which of STRESS_SOURCES have already produced (or failed to produce) a timing input
     validate_trusted: bool = False   # the oracle's validate() accepted at least one generated input and was not distrusted
     input_skeleton: object = None   # the container shape the oracle's own gen() produces, per argument (see input_skeleton)
     validate_reject_frac: float = 0.0   # rejected/checked over small+medium: how far the oracle's validate() and gen() disagree
@@ -924,6 +925,75 @@ def _respell_edges(problem, gi: GateInputs, oracle_src: str, edges: list, limits
         log(f"oracle.edge respelled={len(taken)}")
 
 
+# The max-size timing input's sources, in the order they are tried. gen_max failed or was rejected
+# in nine of ten round-10 runs, and it is the STRESS author's only product: with it gone the timing
+# check had nothing to run on. The oracle writes a generator from the same statement, in its own
+# context, so its "large" mode is a second, independent source of a real maximum-size input -- tried
+# before falling back to a medium case, which is not one.
+STRESS_SOURCES = ("gen_max", "gen_large", "medium_degraded")
+
+
+def _try_gen_large(problem, gi: GateInputs, *, workdir: str, budget) -> bool:
+    gi.stress_tried.append("gen_large")
+    lg = run_python_cases(gi.oracle_src, "gen", [(1, "large")], workdir=os.path.join(workdir, "gen_large"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
+    if not (lg and lg[0].ok):
+        gi.notes.append("gen(large) failed: " + ((lg[0].error[-200:] if lg else "") or "no output"))
+        return False
+    if not _accept_stress_input(problem, gi, gi.oracle_src, lg[0].output, "gen_large", workdir=workdir, budget=budget):
+        return False
+    # An oracle whose gen() ignores its mode argument answers "large" with a small input, and timing a
+    # candidate on a small input is not a timing check. To count as max-size it has to be bigger than
+    # the tiers it is standing in for.
+    biggest = max((len(str(c.input)) for c in gi.cases_medium + gi.cases_small), default=0)
+    if not biggest or len(str(gi.stress_input)) <= biggest:   # no tier to compare against = no way to confirm it is large
+        gi.stress_degraded = True
+        gi.notes.append("stress input degraded: gen(large) returned an input no larger than the generated tiers (not a true max-size input)")
+    return True
+
+
+def _try_medium_degraded(problem, gi: GateInputs) -> bool:
+    """Neither generator produced a max-size input; rather than ship a correct-but-slow solution with
+    the timing check silently skipped, fall back to the largest medium case. "Largest" by
+    len(str(...)): generic across a Python argument tuple (str() of the tuple scales with its total
+    content) and a Rust stdin string (str() is the string itself), so the same one-line measure works
+    for both without knowing the problem's shape. This is NOT a true maximum-size input -- medium is
+    capped far below gen_max's target scale -- so it is marked degraded and stress()'s evidence
+    records that, so the timing it produces is never mistaken for a real max-size check."""
+    gi.stress_tried.append("medium_degraded")
+    if not gi.cases_medium:
+        return False
+    biggest = max(gi.cases_medium, key=lambda c: len(str(c.input)))
+    gi.stress_input = _clean_stdin(problem, biggest.input)
+    gi.stress_degraded = True
+    gi.stress_source = "medium_degraded"
+    gi.stress_validity = ""
+    gi.notes.append("stress input degraded: no usable gen_max or gen(large) output, using largest medium case instead (not a true max-size input)")
+    return True
+
+
+def next_stress_source(problem, gi: GateInputs, *, workdir: str, budget, log) -> bool:
+    """Move the max-size input on to the next source in STRESS_SOURCES. Called at GATE time, by the
+    one thing that can tell a bad max-size input from a good one: a candidate that answered it faster
+    than any real work could (see stress()'s `suspicious`). No candidate-independent pre-check can
+    reach that -- on bench18 gen_max returned 7 operations with an invalid one first, the candidate
+    answered in 0.000 s, the gate correctly refused to call it a pass, and the run stopped there
+    although the oracle's own gen(seed, "large") was sitting unused. Returns True when gi now holds a
+    DIFFERENT source's input; on failure everything is restored and nothing has moved."""
+    if gi.stress_source not in STRESS_SOURCES:
+        return False   # an input that did not come from the chain: there is no position to advance from
+    before = (gi.stress_input, gi.stress_source, gi.stress_degraded, gi.stress_validity)
+    for name, attempt in (("gen_large", lambda: _try_gen_large(problem, gi, workdir=workdir, budget=budget)),
+                          ("medium_degraded", lambda: _try_medium_degraded(problem, gi))):
+        if name in gi.stress_tried:
+            continue
+        gi.stress_input = None
+        if attempt() and gi.stress_input is not None and repr(gi.stress_input) != repr(before[0]):
+            log(f"stress.fallthrough from={before[1]} to={gi.stress_source}")
+            return True
+    gi.stress_input, gi.stress_source, gi.stress_degraded, gi.stress_validity = before
+    return False
+
+
 def prepare_stress_inputs(problem, gi: GateInputs, stress_src: str, limits: dict, *, workdir: str, budget, log) -> None:
     """The parts that need the STRESS reply: the edge fixtures and the max-size timing input. Fills
     `gi` in place -- GateInputs stays the single result of preparation, whichever order it was
@@ -940,6 +1010,7 @@ def prepare_stress_inputs(problem, gi: GateInputs, stress_src: str, limits: dict
             gi.cases_edge, ev = make_cases(problem, oracle_src, cleaned_edges, "edge", workdir=os.path.join(workdir, "ref_edge"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0),
                                            per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
             _log_and_note_validation(gi, ev, "edge", log)
+        gi.stress_tried.append("gen_max")
         mx = run_python_cases(stress_src, "gen_max", [(1,)], workdir=os.path.join(workdir, "genmax"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         if mx and mx[0].ok:
             _accept_stress_input(problem, gi, oracle_src, mx[0].output, "gen_max", workdir=workdir, budget=budget)
@@ -947,36 +1018,10 @@ def prepare_stress_inputs(problem, gi: GateInputs, stress_src: str, limits: dict
             gi.notes.append("gen_max failed: " + (mx[0].error[-200:] if mx else ""))
     else:
         gi.notes.append("no stress source")
-    # gen_max failed or was rejected in nine of ten round-10 runs, and it is the STRESS author's only
-    # product: with it gone the timing check had nothing to run on. The oracle writes a generator from
-    # the same statement, in its own context, so its "large" mode is a second, independent source of a
-    # real maximum-size input -- tried before falling back to a medium case, which is not one.
     if gi.stress_input is None:
-        lg = run_python_cases(oracle_src, "gen", [(1, "large")], workdir=os.path.join(workdir, "gen_large"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
-        if not (lg and lg[0].ok):
-            gi.notes.append("gen(large) failed: " + ((lg[0].error[-200:] if lg else "") or "no output"))
-        elif _accept_stress_input(problem, gi, oracle_src, lg[0].output, "gen_large", workdir=workdir, budget=budget):
-            # An oracle whose gen() ignores its mode argument answers "large" with a small input, and
-            # timing a candidate on a small input is not a timing check. To count as max-size it has
-            # to be bigger than the tiers it is standing in for.
-            biggest = max((len(str(c.input)) for c in gi.cases_medium + gi.cases_small), default=0)
-            if not biggest or len(str(gi.stress_input)) <= biggest:   # no tier to compare against = no way to confirm it is large
-                gi.stress_degraded = True
-                gi.notes.append("stress input degraded: gen(large) returned an input no larger than the generated tiers (not a true max-size input)")
-    if gi.stress_input is None and gi.cases_medium:
-        # Neither generator produced a max-size input; rather than ship a correct-but-slow solution
-        # with the timing check silently skipped, fall back to the largest medium case. "Largest" by
-        # len(str(...)): generic across a Python argument tuple (str() of the tuple scales with its
-        # total content) and a Rust stdin string (str() is the string itself), so the same one-line
-        # measure works for both without knowing the problem's shape. This is NOT a true maximum-size
-        # input -- medium is capped far below gen_max's target scale -- so it's marked degraded and
-        # stress()'s evidence records that, so the timing it produces is never mistaken for a real
-        # max-size check.
-        biggest = max(gi.cases_medium, key=lambda c: len(str(c.input)))
-        gi.stress_input = _clean_stdin(problem, biggest.input)
-        gi.stress_degraded = True
-        gi.stress_source = "medium_degraded"
-        gi.notes.append("stress input degraded: no usable gen_max or gen(large) output, using largest medium case instead (not a true max-size input)")
+        _try_gen_large(problem, gi, workdir=workdir, budget=budget)
+    if gi.stress_input is None:
+        _try_medium_degraded(problem, gi)
     if gi.stress_input is not None:
         log(f"stress.input source={gi.stress_source} validity={gi.stress_validity or 'unvalidated'} size={_input_size(gi.stress_input)}")
 
@@ -1198,6 +1243,18 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
     else:
         e = stress(problem, source, gi.stress_input, workdir=os.path.join(workdir, "stress"), limit_s=min(limit, avail), mem_mb=limits["mem_mb"], degraded=gi.stress_degraded,
                    min_plausible_s=limits.get("stress_min_plausible_s", 0.0), unjudged=gi.stress_validity == "unjudged")
+        # A suspicious measurement is no measurement, and the suspect is the INPUT: the candidate
+        # answered before any real work could have happened. The chain has more sources (§5.4), and
+        # until now a suspicious first one ended the timing check for the whole run. Try the next one
+        # and keep the better evidence -- a real measurement or a degraded pass both beat a suspicious
+        # pass, and two suspicious runs leave the run degraded exactly as one did. Bounded at two
+        # stress runs per candidate by construction: only the first result can trigger this.
+        avail2 = budget.step_timeout(limit, reserve_s=reserve)
+        if e.detail.get("suspicious") and avail2 > 0 and next_stress_source(problem, gi, workdir=os.path.join(workdir, "stress2"), budget=budget, log=log):
+            e2 = stress(problem, source, gi.stress_input, workdir=os.path.join(workdir, "stress2"), limit_s=min(limit, avail2), mem_mb=limits["mem_mb"], degraded=gi.stress_degraded,
+                        min_plausible_s=limits.get("stress_min_plausible_s", 0.0), unjudged=gi.stress_validity == "unjudged")
+            if not e2.detail.get("suspicious"):
+                e = e2
     ev.append(e); log(_gate_line(e, f"duration={e.detail.get('duration_s')}"))
     # Placed after stress (not before) so stress's timing measurement runs first, on a warm cache,
     # unaffected by this step; and so this step's own subprocess never masks a stress timeout.

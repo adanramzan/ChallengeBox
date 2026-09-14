@@ -960,3 +960,48 @@ def test_the_weak_tier_regeneration_prompt_names_the_value_and_the_rule():
     gi = V.GateInputs(weak_tiers={"small": {"share": 0.95, "count": 190, "total": 200, "value": "1", "note": "n"}})
     x = V.weak_tier_extra(gi)
     assert "190 of 200" in x and "returned 1" in x and "drawn from what the generator itself created" in x
+
+
+# --- round 14 batch 7: a suspicious max-size input falls through to the next source ---
+
+# gen_max returns an input the candidate rejects at its first element (bench18: 7 operations with an
+# invalid one first, answered in 0.000 s); gen(seed, "large") returns one it has to walk.
+EARLY_EXIT = "def add(a, b):\n    return -1 if a < 0 else sum(range(a)) + b\n"
+FALL_ORACLE = ("def reference(a, b):\n    return -1 if a < 0 else sum(range(a)) + b\n"
+               "def gen(seed, mode):\n"
+               "    if mode == 'large':\n        return (5000000, 0)\n"
+               "    return (seed % 5, 1)\n")
+FALL_LIMITS = {"cases_small": 5, "cases_medium": 2, "mem_mb": 2048, "stress_limit_python_s": 5.0,
+               "stress_limit_rust_s": 2.0, "stress_min_plausible_s": 0.01}
+FALL_STRESS = "def gen_max(seed):\n    return (-1, 0)\nEDGES = [(1, 1)]\n"
+
+def test_a_suspicious_max_size_input_falls_through_to_the_next_source(tmp_path):
+    lines = []
+    gi = V.prepare_gate_inputs(PY, FALL_ORACLE, FALL_STRESS, FALL_LIMITS, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lines.append)
+    assert gi.stress_source == "gen_max" and gi.stress_input == (-1, 0)
+    ev = {e.kind: e for e in V.run_gate(PY, EARLY_EXIT, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=FALL_LIMITS, log=lines.append)}
+    assert any("stress.fallthrough from=gen_max to=gen_large" in l for l in lines)
+    assert gi.stress_source == "gen_large" and gi.stress_input == (5000000, 0)
+    # the kept evidence is the real measurement from gen_large, not the 0.000 s one from gen_max
+    e = ev["stress"]
+    assert e.passed and not e.skipped and not e.detail.get("degraded") and e.detail["duration_s"] >= 0.01
+
+def test_two_suspicious_sources_leave_the_run_degraded(tmp_path):
+    # gen(large) is early-exiting too, so neither source measures anything
+    oracle = FALL_ORACLE.replace("        return (5000000, 0)\n", "        return (-2, 0)\n")
+    lines = []
+    gi = V.prepare_gate_inputs(PY, oracle, FALL_STRESS, FALL_LIMITS, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lines.append)
+    ev = {e.kind: e for e in V.run_gate(PY, EARLY_EXIT, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=FALL_LIMITS, log=lines.append)}
+    assert any("stress.fallthrough" in l for l in lines)
+    assert ev["stress"].passed and ev["stress"].skipped and "may not exercise the candidate" in ev["stress"].detail["degraded"]
+
+def test_with_no_further_source_a_suspicious_stress_run_is_what_it_was(tmp_path):
+    # gen(large) raises and there is no medium tier, so the chain is exhausted after gen_max
+    oracle = FALL_ORACLE.replace("        return (5000000, 0)\n", "        raise ValueError('no large')\n")
+    limits = {**FALL_LIMITS, "cases_medium": 0}
+    lines = []
+    gi = V.prepare_gate_inputs(PY, oracle, FALL_STRESS, limits, workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lines.append)
+    ev = {e.kind: e for e in V.run_gate(PY, EARLY_EXIT, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=limits, log=lines.append)}
+    assert not any("stress.fallthrough" in l for l in lines)
+    assert gi.stress_source == "gen_max" and gi.stress_input == (-1, 0)
+    assert ev["stress"].passed and ev["stress"].skipped and ev["stress"].detail.get("suspicious")
