@@ -1001,3 +1001,13 @@ def test_repair_prompt_offers_the_approach_verdict(tmp_path):
                                      "actual": "a", "details": "d", "code": "c", "agreement": "x", "reference": "r",
                                      "expected_source": "s"})
     assert "the verdict is `approach`" in rendered and "if no patch can meet the stated limits" in rendered
+
+
+def test_stress_prompt_demands_huge_bounded_quantities_and_an_input_valid_to_the_end(tmp_path):
+    # bench14: gen_max capped repetitions at 10 000 "to avoid blowup" on a statement bounding them
+    # by 10^18, and its first operation was invalid, so the candidate discarded the whole input.
+    rendered = S.render("stress", **S.prompt_vars(prob(tmp_path)))
+    assert "is a NUMBER, not work" in rendered and "at its stated maximum at least once" in rendered
+    assert "the blowup is exactly what the check exists to find" in rendered
+    assert "must stay valid, in the statement's own sense, all the way to its end" in rendered
+    assert "Put any deliberately invalid operation last" in rendered

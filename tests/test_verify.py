@@ -770,3 +770,33 @@ def test_value_disagreements_on_accepted_examples_still_dispute(tmp_path):
     ec = gi.example_checks
     assert ec["rejected"] == [] and len(ec["disagreements"]) == 2 and ec["agreements"] == 1
     assert V.examples_nonrejected(ec) == 3 and V.examples_disputed(gi)
+
+
+# --- round 14: a stress input the candidate never really processes is not a timing pass ---
+
+def test_an_implausibly_fast_stress_run_is_degraded_not_a_pass(tmp_path):
+    # bench14: gen_max's first operation named an identifier its own input never created, so the
+    # candidate discarded a 476 KB input at operation 1 and the gate recorded a 0.139 s "pass".
+    p = Problem("p", "python", "s", "f", [], 300.0)
+    early_exit = "def f(xs):\n    return 1 if xs and xs[0] < 0 else len(xs)\n"
+    big = (tuple([-1] + list(range(50000))),)
+    ev = V.stress(p, early_exit, big, workdir=str(tmp_path / "a"), limit_s=5.0, mem_mb=2048, min_plausible_s=0.01)
+    assert ev.passed and ev.skipped and "may not exercise the candidate" in ev.detail["suspicious"]
+    assert ev.detail["degraded"] == ev.detail["suspicious"]
+    # the same input, with work the candidate must actually do, is an ordinary pass
+    real = "def f(xs):\n    return sorted(i * i % 7919 for i in xs)[0]\n"
+    ev = V.stress(p, real, (tuple(range(200000)),), workdir=str(tmp_path / "b"), limit_s=5.0, mem_mb=2048, min_plausible_s=0.01)
+    assert ev.passed and not ev.skipped and "suspicious" not in ev.detail
+    # and the signal is off by default, so nothing changes for a caller that does not ask for it
+    assert not V.stress(p, early_exit, big, workdir=str(tmp_path / "c"), limit_s=5.0, mem_mb=2048).skipped
+
+def test_run_gate_marks_a_zero_work_stress_run_degraded_from_the_limit(tmp_path):
+    p = Problem("p", "python", "s", "f", [], 300.0)
+    limits = {"cases_small": 3, "cases_medium": 1, "mem_mb": 2048, "stress_limit_python_s": 5.0,
+              "stress_limit_rust_s": 2.0, "stress_min_plausible_s": 0.01}
+    gi = V.GateInputs(oracle_src=ORACLE, stress_input=(tuple([-1] + list(range(50000))),))
+    lines = []
+    ev = {e.kind: e for e in V.run_gate(p, "def f(xs):\n    return 1 if xs and xs[0] < 0 else len(xs)\n", gi,
+                                        workdir=str(tmp_path), budget=FakeBudget(), limits=limits, log=lines.append)}
+    assert ev["stress"].passed and ev["stress"].skipped and ev["stress"].detail.get("suspicious")
+    assert any("gate.stress skipped=True reason=finished in" in l for l in lines)

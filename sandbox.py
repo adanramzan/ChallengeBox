@@ -133,6 +133,12 @@ for line in open(sys.argv[3], encoding="utf-8"):
     try:
         args = ast.literal_eval(line); before = copy.deepcopy(args)
         if PER_CASE > 0: signal.setitimer(signal.ITIMER_REAL, PER_CASE)
+        # duration_s is the CANDIDATE's time, not the harness's. literal_eval plus deepcopy of a
+        # max-size input costs 0.10 s on 50k elements and is the same for every candidate, so
+        # leaving it inside made duration_s a measure of input size: a candidate doing no work at
+        # all and one doing all of it read as 0.103 vs 0.105 s. The judge hands the function real
+        # objects, so this setup is not part of what is being timed either.
+        t0 = time.perf_counter()
         out = fn(*args); ok = True; err = ""
     except _CaseTimeout:
         args = before = None; out = None; ok = False; err = "case exceeded per-case limit of %gs" % PER_CASE

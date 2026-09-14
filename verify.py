@@ -678,7 +678,7 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
         gi.notes.append(f"validate() rejected, or reference() crashed on, {rejected} of {checked} inputs its own gen() produced (small+medium)")
     return gi
 
-def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, mem_mb: int, degraded: bool = False) -> Evidence:
+def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, mem_mb: int, degraded: bool = False, min_plausible_s: float = 0.0) -> Evidence:
     if stress_input is None:
         return Evidence("stress", True, 0, 0.0, {"skipped": "no stress input"}, skipped=True)
     t0 = time.monotonic()
@@ -701,11 +701,22 @@ def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, 
               "too_slow": bool(r.timed_out or (r.ok and dur > limit_s)), "error": r.error[-400:]}
     if degraded:
         detail["degraded"] = "gen_max failed; this is the largest medium case, not a true max-size input -- this timing is not a real max-size stress check"
+    # An answer that arrives faster than any real work could is not a timing measurement, whatever
+    # the input weighed. On bench14 gen_max's first operation named an identifier the input never
+    # created, so the candidate rejected the whole 476 KB input at operation 1 in 0.000 s and the
+    # gate recorded that as evidence of speed -- for a solution that needs ~10^11 s at the stated
+    # limits. Generic over every early-exit shape (first-invalid-index, validators, short-circuiting
+    # searches): the step cannot be a pass, because nothing was actually exercised.
+    suspicious = passed and not degraded and min_plausible_s > 0 and dur < min_plausible_s
+    if suspicious:
+        detail["suspicious"] = (f"finished in {dur:.3f} s on a {_input_size(stress_input)}-byte input; "
+                                "the input may not exercise the candidate")
+        detail["degraded"] = detail["suspicious"]
     # A degraded input is not a max-size input, so a clean run on it is not evidence that the
     # candidate is fast enough: record it as a SKIPPED step, which is what the finalizer and the
     # benchmark already treat as "not checked". A degraded run that was still too slow is kept as a
     # real failure -- too slow on a smaller-than-max input is only more damning.
-    return Evidence("stress", passed, 1, time.monotonic() - t0, detail, skipped=degraded and passed)
+    return Evidence("stress", passed, 1, time.monotonic() - t0, detail, skipped=(degraded or suspicious) and passed)
 
 def overflow_check(problem, binary: str | None, stress_input, *, limit_s: float, mem_mb: int) -> Evidence:
     """Reruns the max-size stress input on the OVERFLOW-CHECKED build (the one already compiled and
@@ -859,7 +870,8 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
     if avail <= 0:
         e = Evidence("stress", True, 0, 0.0, {"skipped": "no budget"}, skipped=True)
     else:
-        e = stress(problem, source, gi.stress_input, workdir=os.path.join(workdir, "stress"), limit_s=min(limit, avail), mem_mb=limits["mem_mb"], degraded=gi.stress_degraded)
+        e = stress(problem, source, gi.stress_input, workdir=os.path.join(workdir, "stress"), limit_s=min(limit, avail), mem_mb=limits["mem_mb"], degraded=gi.stress_degraded,
+                   min_plausible_s=limits.get("stress_min_plausible_s", 0.0))
     ev.append(e); log(_gate_line(e, f"duration={e.detail.get('duration_s')}"))
     # Placed after stress (not before) so stress's timing measurement runs first, on a warm cache,
     # unaffected by this step; and so this step's own subprocess never masks a stress timeout.
