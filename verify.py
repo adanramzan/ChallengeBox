@@ -15,6 +15,24 @@ from llm import parse_blocks
 # a person would actually open, only relative to the raw text the model returned.
 _STDLIB_PREAMBLE = "import random, math, itertools, collections, string, heapq, bisect\n"
 
+# The oracle prompt now defines validate() as "reference() did not raise ValueError" and asks for this
+# text verbatim, because two functions written from one precondition list is more than a fast model
+# delivers: every model-written validate measured so far was a token/range parser, and every
+# precondition that depends on evolving state ("must currently exist", "never declared") went
+# unenforced. Appended only when the model forgot it; a validate the model did write is kept as-is
+# rather than fought. Note the cost: validation now runs reference() once per input.
+_VALIDATE_TEMPLATE = ("\n\ndef validate(*args):\n"
+                      "    try:\n"
+                      "        reference(*args)\n"
+                      "    except ValueError:\n"
+                      "        return False\n"
+                      "    return True\n")
+
+def _ensure_validate(src: str) -> str:
+    if re.search(r"^\s*def\s+validate\s*\(", src, re.M) or not re.search(r"^\s*def\s+reference\s*\(", src, re.M):
+        return src
+    return src + _VALIDATE_TEMPLATE
+
 @dataclass
 class Evidence:
     kind: str
@@ -131,7 +149,14 @@ def make_cases(problem, oracle_src: str, inputs: list, tag: str, *, workdir: str
     res = run_python_cases(oracle_src, "reference", [_ref_args(problem, i) for i in valid_inputs], workdir=workdir, timeout_s=timeout_s, per_case_s=per_case_s, max_consec_timeouts=max_consec_timeouts)
     cases = [Case(i, r.output, tag) for i, r in zip(valid_inputs, res) if r.ok]
     dropped = [r.error[-200:] for r in res if not r.ok]
-    detail = {"dropped": len(dropped), "errors": dropped[:3], "checked": checked, "invalid_dropped": invalid_dropped}
+    # A reference() that raises anything but ValueError on an input its own gen() produced is a
+    # broken reference, not an invalid input (the prompt says so, and validate() is now defined as
+    # "reference did not raise ValueError"). Counted alongside validate's rejections so a crashing
+    # reference can push the reject fraction over the regeneration threshold, which it could not do
+    # while these were only "errors".
+    crashes = sum(1 for r in res if not r.ok and "ValueError" not in r.error)
+    detail = {"dropped": len(dropped), "errors": dropped[:3], "checked": checked, "invalid_dropped": invalid_dropped,
+              "inputs": len(inputs), "reference_crashes": crashes}
     if rejected_examples:
         detail["rejected_examples"] = rejected_examples
     if validation_skipped:
@@ -261,12 +286,16 @@ def shrink(problem, source: str, oracle_src: str, case: Case, *, workdir: str, b
 
 def _log_and_note_validation(gi: GateInputs, ev: Evidence, mode: str, log) -> None:
     invalid = ev.detail.get("invalid_dropped", 0)
+    crashes = ev.detail.get("reference_crashes", 0)
     skip = ev.detail.get("validation_skipped", "")
-    log(f"oracle.{mode} cases={ev.cases} dropped={ev.detail['dropped']} invalid={invalid}" + (f" skip={skip}" if skip else ""))
+    log(f"oracle.{mode} cases={ev.cases} dropped={ev.detail['dropped']} invalid={invalid}" + (f" crashes={crashes}" if crashes else "") + (f" skip={skip}" if skip else ""))
     # Only a validate() that actually ran and was not distrusted has a verdict worth counting; a tier
-    # where it was absent or rejected everything says nothing about gen/validate *disagreeing*.
-    if ev.detail.get("checked") and not skip:
-        gi.validate_rejects[mode] = (ev.detail["checked"], invalid, ev.detail.get("rejected_examples", []))
+    # where it was absent or rejected everything says nothing about gen/validate *disagreeing*. A
+    # reference() that crashed on its own gen() input is counted either way: that is the oracle being
+    # unusable, which is what the regeneration threshold exists to catch.
+    checked = ev.detail.get("checked") or ev.detail.get("inputs", 0)
+    if checked and (not skip or crashes):
+        gi.validate_rejects[mode] = (checked, invalid + crashes, ev.detail.get("rejected_examples", []))
     if invalid:
         gi.notes.append(f"{mode}: dropped {invalid} of {ev.detail.get('checked', 0)} generated inputs as invalid (failed validate())")
     if ev.detail.get("unusable"):
@@ -401,12 +430,13 @@ def selfrepair_extra(gi: GateInputs) -> str:
         edge = gi.validate_rejects.get("edge")
         independent = f" (and {edge[1]} of {edge[0]} inputs from an independent generator)" if edge else ""
         shown = "\n".join(f"- {_fmt(e)}" for e in examples) or "(none captured)"
-        return (f"\n\nYour validate() rejected {rejected} of {checked} inputs that your own gen() produced"
+        return (f"\n\nYour reference() rejected as invalid, or crashed on, {rejected} of {checked} inputs that your own gen() produced"
                 f"{independent}. Both were written from the statement's preconditions, so at least one of them "
-                "misreads a precondition. Here are rejected inputs:\n"
+                "misreads a precondition (or the reference has a bug that is not a precondition check at all). "
+                "Here are inputs it rejected:\n"
                 f"{shown}\n"
-                "Re-list the preconditions from the statement, then write validate() and gen() from that one "
-                "list, and trace one gen() output through validate() before answering.\n")
+                "Re-list the preconditions from the statement, then write reference() and gen() from that one "
+                "list, and trace one gen() output through reference() before answering.\n")
     notes = "\n".join(f"- {n}" for n in gi.notes) or "(no details captured)"
     return ("\n\nYour previous reference()/gen()/validate() code crashed instead of running -- these "
             "are the actual errors your code produced when executed on real inputs. Fix these specific "
@@ -456,7 +486,7 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
         log(f"public_examples parsed={len(gi.cases_public)} skipped={len(parse_notes)}")
     if not oracle_src.strip():
         gi.notes.append("no oracle source"); return gi
-    oracle_src = _STDLIB_PREAMBLE + oracle_src
+    oracle_src = _ensure_validate(_STDLIB_PREAMBLE + oracle_src)
     gi.oracle_src = oracle_src
     if gi.cases_public:
         _check_public_against_oracle(problem, gi, oracle_src, workdir=workdir, budget=budget, log=log)
@@ -530,7 +560,7 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
     rejected = sum(r for _, r, _ in gen_tiers)
     if checked and rejected:
         gi.validate_reject_frac = rejected / checked
-        gi.notes.append(f"validate() rejected {rejected} of {checked} inputs its own gen() produced (small+medium)")
+        gi.notes.append(f"validate() rejected, or reference() crashed on, {rejected} of {checked} inputs its own gen() produced (small+medium)")
     return gi
 
 def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, mem_mb: int, degraded: bool = False) -> Evidence:

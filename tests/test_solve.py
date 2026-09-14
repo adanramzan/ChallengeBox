@@ -736,12 +736,12 @@ def test_an_ungated_second_attempt_is_never_a_full_pass(tmp_path):
 
 # --- round 8: prompt rules ---
 
-def test_oracle_prompt_ties_validate_and_gen_to_one_precondition_list(tmp_path):
+def test_oracle_prompt_ties_the_reference_and_gen_to_one_precondition_list(tmp_path):
     # bench8: oracles whose validate() re-modelled the state more loosely than gen(), rejecting most
-    # of what they generated. Both must be written from the same list, and traced against each other.
+    # of what they generated. There is now one function, so gen() is tied to reference() instead.
     rendered = S.render("oracle", **S.prompt_vars(prob(tmp_path)))
-    assert "`validate()` and `gen()` must agree" in rendered
-    assert "trace one `gen()` output through `validate()` by hand" in rendered
+    assert "`reference()` and `gen()` must agree" in rendered
+    assert "raise on every entry of it in `reference()`" in rendered
 
 def test_stress_prompt_forbids_work_at_import_time(tmp_path):
     # bench8/1ba0d34fae43: the STRESS module asserted its own EDGES at module level against rules the
@@ -839,3 +839,24 @@ def test_examples_alone_are_real_evidence_when_the_oracle_is_dead(tmp_path):
     ev = {e["kind"]: e for e in rep["evidence"]["c1"]}
     assert ev["diff_examples"]["passed"] and not ev["diff_examples"]["skipped"] and ev["diff_examples"]["cases"] == 3
     assert not any("gate.unverifiable" in l for l in rep["events"])
+
+
+# --- round 13: validate() is "reference() did not raise ValueError" ---
+
+ORACLE_CRASHES_ON_MOST = ("===ORACLE===\ndef reference(a, b):\n    if a: raise KeyError('missing')\n    return a + b\n"
+                          "def gen(seed, mode):\n    return (seed, 1)\n===END===\n")
+
+def test_a_crashing_reference_triggers_the_oracle_regeneration(tmp_path):
+    # Before this, a reference that raised on most of its own gen() inputs was recorded as "errors"
+    # and nothing reacted: the reject fraction only counted validate()'s verdicts.
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_CRASHES_ON_MOST, ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["oracle_selfrepaired"] == 1
+    assert len([c for c in rep["calls"] if c["tag"] == "oracle"]) == 2
+    assert rep["gate_inputs"]["small"] == 5   # recovered on the replacement oracle
+
+def test_oracle_prompt_defines_validate_as_the_reference_not_raising(tmp_path):
+    rendered = S.render("oracle", **S.prompt_vars(prob(tmp_path)))
+    assert "raise ValueError" in rendered
+    assert "def validate(*args):" in rendered and "except ValueError:" in rendered
+    assert "is a bug in your reference, not an invalid input" in rendered

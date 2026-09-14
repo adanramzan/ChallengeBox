@@ -573,3 +573,40 @@ def test_oracle_checked_against_every_candidates_examples(tmp_path):
     ok = V.prepare_gate_inputs(PY, ORACLE, "", limits, workdir=str(tmp_path / "b"), budget=FakeBudget(), log=lambda m: None, examples=examples)
     assert ok.example_checks["disagreements"] == [] and not V.examples_disputed(ok)
     assert not V.examples_disputed(V.GateInputs())   # no examples at all: never disputed
+
+
+# --- round 13: validate() is "reference() did not raise ValueError" ---
+
+ORACLE_NO_VALIDATE_RAISES = ("def reference(a, b):\n"
+                             "    if a > 10: raise ValueError('a out of range')\n"
+                             "    return a + b\n"
+                             "def gen(seed, mode):\n    return (seed * 5, 1)\n")
+
+def test_validate_template_is_appended_when_the_oracle_defines_none(tmp_path):
+    src = "def reference(a, b):\n    return a + b\n"
+    out = V._ensure_validate(src)
+    assert "def validate(*args):" in out and "except ValueError:" in out
+    # already has one -> kept verbatim, we do not fight the model
+    own = src + "def validate(a, b):\n    return a < 3\n"
+    assert V._ensure_validate(own) == own
+    # nothing to wrap
+    assert V._ensure_validate("def gen(seed, mode):\n    return (1, 2)\n") == "def gen(seed, mode):\n    return (1, 2)\n"
+
+def test_a_reference_raising_valueerror_makes_validate_false_and_drops_the_input(tmp_path):
+    limits = {"cases_small": 4, "cases_medium": 0, "mem_mb": 2048}
+    gi = V.prepare_gate_inputs(PY, ORACLE_NO_VALIDATE_RAISES, "", limits, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+    # gen gives a = 0, 5, 10, 15; only a > 10 raises, so exactly one input is invalid
+    assert [c.input for c in gi.cases_small] == [(0, 1), (5, 1), (10, 1)]
+    assert gi.validate_trusted and gi.validate_rejects["small"][1] == 1
+
+ORACLE_CRASHES_ON_MOST = ("def reference(a, b):\n"
+                          "    if a: raise KeyError('missing')\n"
+                          "    return a + b\n"
+                          "def gen(seed, mode):\n    return (seed, 1)\n")
+
+def test_a_reference_crashing_on_its_own_gen_inputs_counts_toward_the_reject_fraction(tmp_path):
+    limits = {"cases_small": 5, "cases_medium": 2, "mem_mb": 2048}
+    gi = V.prepare_gate_inputs(PY, ORACLE_CRASHES_ON_MOST, "", limits, workdir=str(tmp_path), budget=FakeBudget(), log=lambda m: None)
+    assert gi.cases_small and not V.oracle_unusable(gi)   # seed 0 survives: not the "no usable case" trigger
+    assert gi.validate_reject_frac > 0.5                  # a KeyError is a broken reference, not an invalid input
+    assert any("crashed on" in n for n in gi.notes)
