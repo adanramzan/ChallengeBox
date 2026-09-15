@@ -332,7 +332,8 @@ def test_tag_extra_reaches_the_request_body_only_for_the_mapped_tag(server):
 
 def test_config_gives_the_thinking_role_per_tag_efforts_and_a_repair_cap():
     strong = load_config(str(ROOT / "config.toml"), "openrouter")["roles"]["strong"]
-    assert strong.tag_extra == {"stress": {"reasoning": {"effort": "low"}},
+    assert strong.tag_extra == {"oracle": {"reasoning": {"effort": "low"}},
+                                "stress": {"reasoning": {"effort": "low"}},
                                 "repair": {"reasoning": {"effort": "low"}},
                                 "solve_fresh": {"reasoning": {"effort": "low"}}}
     assert strong.repair_cap_s == 120.0
@@ -340,7 +341,9 @@ def test_config_gives_the_thinking_role_per_tag_efforts_and_a_repair_cap():
 
 def test_config_carries_the_prompt_to_role_mapping():
     cfg = load_config(str(ROOT / "config.toml"), "openrouter")
-    assert cfg["prompt_roles"] == {"solve": "strong", "oracle": "fast", "stress": "strong", "repair": "strong"}
+    # the oracle moved to the strong role: in bench19 and bench20 the qwen-authored oracle was the
+    # primary or the only remaining cause of the run shipping unverified.
+    assert cfg["prompt_roles"] == {"solve": "strong", "oracle": "strong", "stress": "strong", "repair": "strong"}
     assert set(cfg["prompt_roles"].values()) <= set(cfg["roles"])   # every mapped role exists in the profile
 
 

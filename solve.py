@@ -275,14 +275,15 @@ def oracle_afford_s(run, key: str) -> float:
     """How much budget an optional ORACLE-shaped call -- the retry, a self-repair, a dispute
     regeneration -- must still have before it is worth starting.
 
-    The [limits] values were tuned to a fast model measured at up to 128 s per call. qwen3-coder
-    returns in 12-45 s, and a 130 s threshold then means a run more than half way through its
-    deadline can never regenerate an oracle it already knows is broken: bench19 kept a weak,
-    self-rejecting oracle for the whole run because the check first ran at 180 s with 105 s left.
-    So the requirement follows the role's OWN measured ceiling -- half its cap (a call that runs to
+    The [limits] values were tuned to a model measured at up to 128 s per call, and a 130 s
+    threshold means a run more than half way through its deadline can never regenerate an oracle it
+    already knows is broken: bench19 kept a weak, self-rejecting oracle for the whole run because
+    the check first ran at 180 s with 105 s left. So the requirement follows the measured ceiling of
+    whichever role the [roles] table sends the ORACLE prompt to -- half its cap (a call that runs to
     the cap is the pathological case, not the median) plus the time to use what comes back -- and
-    the config value is a ceiling on that, never a floor. A client with no role table (FakeLLM)
-    keeps the configured number."""
+    the config value is a ceiling on that, never a floor. Remapping the prompt to another role
+    re-tunes the threshold by itself. A client with no role table (FakeLLM) keeps the configured
+    number."""
     role = (getattr(run.llm, "roles", None) or {}).get(run.role("oracle"))
     configured = float(run.cfg["limits"][key])
     return min(configured, role.timeout_cap_s * 0.5 + 30.0) if role is not None else configured

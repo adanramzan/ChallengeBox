@@ -100,10 +100,10 @@ validate_reject_frac_regen = 0.5
 
 # Minimum remaining budget (seconds) required before starting another ORACLE call after the first
 # one produced no ===ORACLE=== block (timeout or empty reply). This is a CEILING, not the whole
-# rule: solve.oracle_afford_s takes the smaller of it and the fast role's own measured cap
-# (timeout_cap_s * 0.5 + 30), so swapping in a slower or faster model re-tunes the threshold by
-# itself. It was 130.0, the deepseek-era worst case; qwen3-coder answers an oracle call in 12-45s,
-# and a 130s threshold refuses a retry through the whole second half of a 300s deadline.
+# rule: solve.oracle_afford_s takes the smaller of it and the measured cap of whichever role the
+# [roles] table sends the oracle prompt to (timeout_cap_s * 0.5 + 30), so remapping the prompt or
+# swapping the model re-tunes the threshold by itself. It was 130.0, the deepseek-era worst case,
+# which refuses a retry through the whole second half of a 300s deadline.
 oracle_retry_afford_s = 60.0
 # Minimum remaining budget (seconds) required before an ORACLE retry is worth making after a
 # TIMED-OUT first call: the retry's own cap plus this, so the oracle is only re-asked while there is
@@ -123,7 +123,8 @@ repair_afford_s = 60.0
 # the same reference+gen+validate functions; independent of, and can fire alongside, the adjudication
 # regeneration in the repair loop (that one has no separate afford threshold -- it's gated by the
 # repair loop's own repair_afford_s check instead).
-# Same ceiling rule and the same reason as oracle_retry_afford_s above: it was 130.0, which on
+# Same ceiling rule and the same reason as oracle_retry_afford_s above (and it follows whichever
+# role [roles] maps the oracle prompt to): it was 130.0, which on
 # bench19 refused a regeneration at 180s with 105s still on the clock, for an oracle prep had
 # already reported as weak AND self-rejecting at 18s. The health triggers now fire during the
 # generate-phase overlap, where the remaining budget is nearly the whole deadline, so this number
@@ -150,15 +151,33 @@ generate_call_share = 0.70
 repair_call_share = 0.25
 
 # Which model role each PROMPT is sent to. Defaults (this table absent) are solve/repair -> strong,
-# oracle/stress -> fast; solve.PROMPT_ROLES holds them. The STRESS call is mapped to the strong role
-# here because it was the primary cause in three of three Opus-era runs of one focus problem (an
+# oracle/stress -> fast; solve.PROMPT_ROLES holds them. Both measuring calls are mapped to the strong
+# role here, each for the same reason and each at the cheapest effort the strong role's tag_extra
+# offers: they are OFF the critical path (preparation overlaps the solve call), so a slower, better
+# author costs no wall time, and each of them was the run-ending fault in an Opus-era benchmark.
+#
+# STRESS moved first, after three of three Opus-era runs of one focus problem died on its input (an
 # input nested 3333x over the stated cap, a 7-operation input whose first operation was invalid,
-# twice, and eight mis-shaped EDGES), and it is the one generation call that is OFF the critical
-# path: preparation overlaps the solve call, so a slower, better author costs no wall time. It runs
-# at the cheaper effort the strong role's tag_extra selects, and its cap stays the generate share.
+# twice, and eight mis-shaped EDGES). It worked: in bench19 and bench20 the Opus-authored stress
+# module was valid and inside every stated bound, and checked its own bounds in code before
+# returning.
+#
+# ORACLE follows for the same measured reason in the other direction: the qwen-authored oracle was
+# the primary or the only remaining cause of an unverified run in both bench19 and bench20. Its
+# reference() rejected half of what its own gen() produced; 192 of 200 small answers were identical,
+# because gen() invented identifiers instead of drawing them from the state it had just built, so a
+# 200-case tier asserted one fact; and the regenerated replacement came back unusable. The oracle is
+# the ground truth of the whole system -- every differential tier is worth exactly what it is worth --
+# and no prompt or gate change reaches a reference with no code path for half the statement.
+#
+# Two costs, both accepted. The oracle call now competes with solve and stress for the strong role's
+# max_concurrent = 3, which is exactly three calls, so the three still start together and none
+# queues. And preparation now starts at the oracle's latency -- expected 60-90 s at low effort,
+# rather than qwen's ~18 s -- which still lands well inside the solve call's measured 165-240 s, so
+# the tiers are built before the candidate arrives exactly as before.
 [roles]
 solve = "strong"
-oracle = "fast"
+oracle = "strong"
 stress = "strong"
 repair = "strong"
 
@@ -200,9 +219,11 @@ usage_lookup_url = "https://openrouter.ai/api/v1/generation?id={id}"
 # measured in tens of seconds, not hundreds, so the two post-gate calls (repair, solve_fresh) think
 # at low effort instead: at medium effort a solve call measured 150-200s, and a repair at low effort
 # is expected to be about half that, which is what repair_cap_s below is set against. The stress call
-# is here for the opposite reason -- it is a long call that costs no wall time (it overlaps the
-# solve), so it buys this model's reading of the statement at the cheapest effort that gets it.
-tag_extra = { stress = { reasoning = { effort = "low" } }, repair = { reasoning = { effort = "low" } }, solve_fresh = { reasoning = { effort = "low" } } }
+# and oracle calls are here for the opposite reason -- they are long calls that cost no wall time
+# (they overlap the solve), so they buy this model's reading of the statement at the cheapest effort
+# that gets it. Low effort is also what keeps the oracle's latency near 60-90 s, which is what makes
+# it safe to put preparation behind it.
+tag_extra = { oracle = { reasoning = { effort = "low" } }, stress = { reasoning = { effort = "low" } }, repair = { reasoning = { effort = "low" } }, solve_fresh = { reasoning = { effort = "low" } } }
 # Floor for the repair/fresh-solve call cap (verify.repair_cap takes the larger of this and
 # [phases] repair_call_share * usable). The fraction alone is 0.25 * 285 = 71s, tuned when the
 # strong role was a 12-17s non-reasoning coder model; against this role it is a guaranteed timeout,
@@ -212,14 +233,17 @@ repair_cap_s = 120.0
 
 [profiles.openrouter.fast]
 base_url = "https://openrouter.ai/api/v1"
-# The oracle and the stress generator are measurement, not invention: they need a model that reads
-# a statement literally and returns fast, not one that reasons. deepseek produced three unusable
-# oracles for one problem across rounds 10 and 13 -- constant-answer or 45% wrong against an
-# independent reference -- at 106-128s per call, so most oracle calls were lost to the cap and the
-# ones that arrived were not ground truth. qwen3-coder returns in 17-24s and read the same
-# statement correctly, including on 5cb294c18288 in round 14.
-# It was briefly the strong role's model too, which risked candidate and oracle sharing one
-# misreading; with a thinking model now in the strong role the two sides are again independent.
+# Nothing in this profile's [roles] table is sent here any more: both measuring calls now go to the
+# strong role (see [roles] above). The role is kept because it is what a profile with no [roles]
+# table falls back to (solve.PROMPT_ROLES), and because the choice of model is what the history
+# below is about. deepseek produced three unusable oracles for one problem across rounds 10 and 13
+# -- constant-answer or 45% wrong against an independent reference -- at 106-128s per call, so most
+# oracle calls were lost to the cap and the ones that arrived were not ground truth. qwen3-coder
+# returns in 17-24s and read some statements correctly, but in bench19 and bench20 its oracle was
+# the primary or the only remaining cause of the run shipping unverified: a reference() that
+# rejected half its own gen() output, 192 of 200 identical small answers, an unusable regeneration.
+# The lesson is the one the strong role was introduced for -- returning fast is not the same as
+# reading the statement -- and it applies to the ground truth at least as hard as to the candidate.
 model = "qwen/qwen3-coder"
 api_key_env = "OPENROUTER_API_KEY"
 max_tokens = 8000
