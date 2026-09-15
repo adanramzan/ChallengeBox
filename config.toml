@@ -102,8 +102,9 @@ validate_reject_frac_regen = 0.5
 # one produced no ===ORACLE=== block (timeout or empty reply). This is a CEILING, not the whole
 # rule: solve.oracle_afford_s takes the smaller of it and the measured cap of whichever role the
 # [roles] table sends the oracle prompt to (timeout_cap_s * 0.5 + 30), so remapping the prompt or
-# swapping the model re-tunes the threshold by itself. It was 130.0, the deepseek-era worst case,
-# which refuses a retry through the whole second half of a 300s deadline.
+# swapping the model re-tunes the threshold by itself -- it has followed the oracle prompt to the
+# strong role and back to the fast one without being touched. It was 130.0, the deepseek-era worst
+# case, which refuses a retry through the whole second half of a 300s deadline.
 oracle_retry_afford_s = 60.0
 # Minimum remaining budget (seconds) required before an ORACLE retry is worth making after a
 # TIMED-OUT first call: the retry's own cap plus this, so the oracle is only re-asked while there is
@@ -123,8 +124,8 @@ repair_afford_s = 60.0
 # the same reference+gen+validate functions; independent of, and can fire alongside, the adjudication
 # regeneration in the repair loop (that one has no separate afford threshold -- it's gated by the
 # repair loop's own repair_afford_s check instead).
-# Same ceiling rule and the same reason as oracle_retry_afford_s above (and it follows whichever
-# role [roles] maps the oracle prompt to): it was 130.0, which on
+# Same ceiling rule and the same reason as oracle_retry_afford_s above, and it follows whichever
+# role [roles] maps the oracle prompt to rather than naming a model: it was 130.0, which on
 # bench19 refused a regeneration at 180s with 105s still on the clock, for an oracle prep had
 # already reported as weak AND self-rejecting at 18s. The health triggers now fire during the
 # generate-phase overlap, where the remaining budget is nearly the whole deadline, so this number
@@ -144,41 +145,34 @@ settle_until = 0.93
 # preparation stopped waiting for it (it now overlaps the solve call, see solve()): a candidate
 # arriving at 70% of usable still leaves one full gate pass and one repair, because the oracle tiers
 # are already built by then. Effective per-call timeout = min(share*usable, role.timeout_cap_s), so
-# the role caps still bound each one; the fast role's measured oracle max of 128s has headroom here.
+# the role caps still bound each one; the fast role's 150 s cap is what binds its two calls in practice.
 generate_call_share = 0.70
 # Cap on a single repair call, as a fraction of usable_s -- same knob shape as generate_call_share,
 # so raising/lowering it does not silently get overridden by a hardcoded fraction (see F6).
 repair_call_share = 0.25
 
 # Which model role each PROMPT is sent to. Defaults (this table absent) are solve/repair -> strong,
-# oracle/stress -> fast; solve.PROMPT_ROLES holds them. Both measuring calls are mapped to the strong
-# role here, each for the same reason and each at the cheapest effort the strong role's tag_extra
-# offers: they are OFF the critical path (preparation overlaps the solve call), so a slower, better
-# author costs no wall time, and each of them was the run-ending fault in an Opus-era benchmark.
+# oracle/stress -> fast; solve.PROMPT_ROLES holds them, and the shipped table below is the same
+# mapping.
 #
-# STRESS moved first, after three of three Opus-era runs of one focus problem died on its input (an
-# input nested 3333x over the stated cap, a 7-operation input whose first operation was invalid,
-# twice, and eight mis-shaped EDGES). It worked: in bench19 and bench20 the Opus-authored stress
-# module was valid and inside every stated bound, and checked its own bounds in code before
-# returning.
+# The two measuring calls are what the FAST role exists for, and the constraint on it is latency, not
+# price: preparation cannot start until the ORACLE reply lands, so the oracle's latency is dead time
+# added to the front of every run unless it returns well inside the solve call's own 152-240 s.
+# Round 15 measured both ways of getting that wrong. qwen3-coder returned in 17-24 s and wrote
+# oracles that were not ground truth (bench19/bench20: a reference() that rejected half its own gen()
+# output, 192 of 200 identical small answers, an unusable regeneration), so the prompts were moved to
+# the strong role. That fixed the reading and broke the overlap: in bench21 the Opus oracle at LOW
+# effort took 155 s, so preparation began at 155 s instead of ~18 s, and three strong-role calls
+# exactly filled max_concurrent = 3.
 #
-# ORACLE follows for the same measured reason in the other direction: the qwen-authored oracle was
-# the primary or the only remaining cause of an unverified run in both bench19 and bench20. Its
-# reference() rejected half of what its own gen() produced; 192 of 200 small answers were identical,
-# because gen() invented identifiers instead of drawing them from the state it had just built, so a
-# 200-case tier asserted one fact; and the regenerated replacement came back unusable. The oracle is
-# the ground truth of the whole system -- every differential tier is worth exactly what it is worth --
-# and no prompt or gate change reaches a reference with no code path for half the statement.
-#
-# Two costs, both accepted. The oracle call now competes with solve and stress for the strong role's
-# max_concurrent = 3, which is exactly three calls, so the three still start together and none
-# queues. And preparation now starts at the oracle's latency -- expected 60-90 s at low effort,
-# rather than qwen's ~18 s -- which still lands well inside the solve call's measured 165-240 s, so
-# the tiers are built before the candidate arrives exactly as before.
+# So the fast role stays the author of both, and the fast role is now a model that reads the
+# statement AND returns in under a minute (see [profiles.openrouter.fast]). Returning fast is not the
+# same as reading the statement -- but neither is reading the statement worth a minute of the
+# deadline spent before any tier exists.
 [roles]
 solve = "strong"
-oracle = "strong"
-stress = "strong"
+oracle = "fast"
+stress = "fast"
 repair = "strong"
 
 # Any OpenAI-compatible endpoint can be added as another [profiles.<name>.<role>] table.
@@ -217,13 +211,11 @@ extra = { reasoning = { effort = "medium" } }
 usage_lookup_url = "https://openrouter.ai/api/v1/generation?id={id}"
 # Per-tag overrides merged over `extra`, one entry per prompt tag. After the gate the deadline is
 # measured in tens of seconds, not hundreds, so the two post-gate calls (repair, solve_fresh) think
-# at low effort instead: at medium effort a solve call measured 150-200s, and a repair at low effort
-# is expected to be about half that, which is what repair_cap_s below is set against. The stress call
-# and oracle calls are here for the opposite reason -- they are long calls that cost no wall time
-# (they overlap the solve), so they buy this model's reading of the statement at the cheapest effort
-# that gets it. Low effort is also what keeps the oracle's latency near 60-90 s, which is what makes
-# it safe to put preparation behind it.
-tag_extra = { oracle = { reasoning = { effort = "low" } }, stress = { reasoning = { effort = "low" } }, repair = { reasoning = { effort = "low" } }, solve_fresh = { reasoning = { effort = "low" } } }
+# at low effort instead: at medium effort a solve call measured 152-240s, and a repair at low effort
+# is expected to be about half that, which is what repair_cap_s below is set against. There are no
+# oracle/stress entries here any more -- [roles] sends both to the fast role, because this model's
+# oracle at low effort still measured 155s (bench21) and preparation waits on it.
+tag_extra = { repair = { reasoning = { effort = "low" } }, solve_fresh = { reasoning = { effort = "low" } } }
 # Floor for the repair/fresh-solve call cap (verify.repair_cap takes the larger of this and
 # [phases] repair_call_share * usable). The fraction alone is 0.25 * 285 = 71s, tuned when the
 # strong role was a 12-17s non-reasoning coder model; against this role it is a guaranteed timeout,
@@ -231,25 +223,33 @@ tag_extra = { oracle = { reasoning = { effort = "low" } }, stress = { reasoning 
 # half of that at the low effort repair_extra selects above.
 repair_cap_s = 120.0
 
+# The author of the ORACLE and the STRESS module ([roles] above). A THINKING model at low effort:
+# it has to read the statement as carefully as the solver does -- the oracle is the ground truth of
+# the whole system, and every differential tier is worth exactly what the reference is worth -- and
+# it has to come back in well under the solve call's own latency, because preparation cannot start
+# before the oracle reply lands.
+#
+# Three models measured against those two requirements. deepseek: three unusable oracles for one
+# problem across rounds 10 and 13 (constant-answer, or 45% wrong against an independent reference)
+# at 106-128s per call. qwen3-coder: 17-24s, but in bench19 and bench20 its oracle was the primary
+# or the only remaining cause of the run shipping unverified -- a reference() that rejected half its
+# own gen() output, 192 of 200 identical small answers, an unusable regeneration. Opus at low effort
+# in the strong role read the statement, and took 155s (bench21 oracle) -- preparation started at
+# 155s instead of ~18s, and the three concurrent calls exactly filled the strong role's
+# max_concurrent = 3. sonnet-5 at low effort is the trade: the same family's reading of the statement
+# at roughly a third of the latency and a fifth of the price.
 [profiles.openrouter.fast]
 base_url = "https://openrouter.ai/api/v1"
-# Nothing in this profile's [roles] table is sent here any more: both measuring calls now go to the
-# strong role (see [roles] above). The role is kept because it is what a profile with no [roles]
-# table falls back to (solve.PROMPT_ROLES), and because the choice of model is what the history
-# below is about. deepseek produced three unusable oracles for one problem across rounds 10 and 13
-# -- constant-answer or 45% wrong against an independent reference -- at 106-128s per call, so most
-# oracle calls were lost to the cap and the ones that arrived were not ground truth. qwen3-coder
-# returns in 17-24s and read some statements correctly, but in bench19 and bench20 its oracle was
-# the primary or the only remaining cause of the run shipping unverified: a reference() that
-# rejected half its own gen() output, 192 of 200 identical small answers, an unusable regeneration.
-# The lesson is the one the strong role was introduced for -- returning fast is not the same as
-# reading the statement -- and it applies to the ground truth at least as hard as to the candidate.
-model = "qwen/qwen3-coder"
+model = "anthropic/claude-sonnet-5"
 api_key_env = "OPENROUTER_API_KEY"
-max_tokens = 8000
+max_tokens = 12000   # reasoning tokens count against it: the thinking AND the reference+gen+validate
 max_concurrent = 3
-timeout_cap_s = 150.0   # oracle writes reference+gen+validate; round 13 measured 106-128s, so the cap sits above it
-extra = {}   # non-reasoning model: reasoning params are ignored and burn the whole budget
+timeout_cap_s = 150.0   # a ceiling, not an expectation: a call that needs this long has already cost the overlap
+stall_timeout_s = 45.0  # time-to-first-token is longer with thinking; only a real stall should abort
+price_in_per_m = 3.0
+price_out_per_m = 15.0  # OpenRouter reports usage.cost and the client prefers it; these are the fallback
+omit_temperature = true  # Claude 5 takes no sampling temperature once thinking is on
+extra = { reasoning = { effort = "low" } }
 usage_lookup_url = "https://openrouter.ai/api/v1/generation?id={id}"
 
 # Anthropic, through its OpenAI-compatible endpoint (which Anthropic describes as a layer for testing

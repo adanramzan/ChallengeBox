@@ -332,19 +332,23 @@ def test_tag_extra_reaches_the_request_body_only_for_the_mapped_tag(server):
 
 def test_config_gives_the_thinking_role_per_tag_efforts_and_a_repair_cap():
     strong = load_config(str(ROOT / "config.toml"), "openrouter")["roles"]["strong"]
-    assert strong.tag_extra == {"oracle": {"reasoning": {"effort": "low"}},
-                                "stress": {"reasoning": {"effort": "low"}},
-                                "repair": {"reasoning": {"effort": "low"}},
+    # only the POST-gate calls: the oracle/stress entries went with the prompts, back to the fast role
+    assert strong.tag_extra == {"repair": {"reasoning": {"effort": "low"}},
                                 "solve_fresh": {"reasoning": {"effort": "low"}}}
     assert strong.repair_cap_s == 120.0
     assert load_config(str(ROOT / "config.toml"), "openai")["roles"]["strong"].tag_extra == {}
 
 def test_config_carries_the_prompt_to_role_mapping():
     cfg = load_config(str(ROOT / "config.toml"), "openrouter")
-    # the oracle moved to the strong role: in bench19 and bench20 the qwen-authored oracle was the
-    # primary or the only remaining cause of the run shipping unverified.
-    assert cfg["prompt_roles"] == {"solve": "strong", "oracle": "strong", "stress": "strong", "repair": "strong"}
+    # The two measuring calls are back on the fast role, which is now a thinking model at low effort
+    # (anthropic/claude-sonnet-5) rather than a non-reasoning coder. Preparation cannot start before
+    # the ORACLE reply lands, and in bench21 the strong role's oracle at low effort took 155 s -- so
+    # the oracle's author has to read the statement AND return in well under the solve's 152-240 s.
+    assert cfg["prompt_roles"] == {"solve": "strong", "oracle": "fast", "stress": "fast", "repair": "strong"}
     assert set(cfg["prompt_roles"].values()) <= set(cfg["roles"])   # every mapped role exists in the profile
+    fast = cfg["roles"]["fast"]
+    assert fast.extra == {"reasoning": {"effort": "low"}} and fast.omit_temperature
+    assert fast.timeout_cap_s == 150.0 and fast.max_tokens == 12000
 
 
 # --- round 14 batch 6: a timed-out stream is salvaged when its CODE block closed ---

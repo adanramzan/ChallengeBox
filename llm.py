@@ -34,13 +34,12 @@ class Role:
     # stream sets stream = false in its role config; no branch on provider name goes in this module.
     stream: bool = True
     stall_timeout_s: float = 30.0
-    # {tag: extra} merged over `extra` for that tag's request only. Two uses so far, both about
-    # effort: the post-gate calls (`repair`, `solve_fresh`), where what is left of the deadline is
-    # measured in tens of seconds rather than hundreds and a thinking model at its solve-time effort
-    # cannot finish one (bench16 gave a repair 67 s against a role whose completed call that run took
-    # 168 s); and `stress`, which is off the critical path and can take a slower, better author at a
-    # cheaper effort. Which knob to turn is the provider's business and stays in config; llm.py only
-    # knows that a tag may carry its own extra.
+    # {tag: extra} merged over `extra` for that tag's request only. One use so far, about effort: the
+    # post-gate calls (`repair`, `solve_fresh`), where what is left of the deadline is measured in
+    # tens of seconds rather than hundreds and a thinking model at its solve-time effort cannot
+    # finish one (bench16 gave a repair 67 s against a role whose completed call that run took
+    # 168 s). Which knob to turn is the provider's business and stays in config; llm.py only knows
+    # that a tag may carry its own extra.
     tag_extra: dict = field(default_factory=dict)
     # Floor for the repair/fresh-solve call cap in seconds (see verify.repair_cap): the phase
     # fraction alone is tuned to the deadline, not to the model, and for a thinking model it is far
