@@ -1,7 +1,7 @@
 import json, threading, time, pathlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
-from llm import LLM, Role, FakeLLM, parse_blocks, terminated_blocks, salvageable, load_config, pick_profile
+from llm import LLM, Role, FakeLLM, parse_blocks, partial_blocks, terminated_blocks, salvageable, load_config, pick_profile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -427,6 +427,35 @@ def test_an_abandoned_stream_does_not_write_into_a_later_calls_buffer(partial_se
     r1 = llm.chat("strong", "s", "u", timeout_s=1.0)
     r2 = llm.chat("strong", "s", "u", timeout_s=1.0)   # r1's thread is still streaming into its own buffer
     assert r1.partial and r2.partial and r2.text == r1.text
+
+# --- round 15 batch 10: a cut-off reply reports where it stopped ---
+
+def test_a_cut_off_calls_record_names_the_block_it_stopped_in(partial_server):
+    role = Role("strong", partial_server, "m", "", 100, 3, 30.0, {}, transport_retries=0, stall_timeout_s=10.0)
+    llm = LLM({"strong": role})
+    r = llm.chat("strong", "s", "u", timeout_s=1.0)
+    # CODE closed, the stream stopped inside TRAPS: a benchmark table can say the call was short of
+    # commentary, not short of a solution
+    assert llm.calls[-1]["partial_blocks"] == {"complete": ["CODE"], "cut_in": "TRAPS", "chars": len(r.text)}
+
+def test_a_cut_inside_the_code_block_is_reported_as_such(partial_server):
+    _PartialHandler.close_code = False
+    role = Role("strong", partial_server, "m", "", 100, 3, 30.0, {}, transport_retries=0, stall_timeout_s=10.0)
+    llm = LLM({"strong": role})
+    r = llm.chat("strong", "s", "u", timeout_s=1.0)
+    assert llm.calls[-1]["partial_blocks"] == {"complete": [], "cut_in": "CODE", "chars": len(r.text)}
+
+def test_a_call_that_finished_carries_no_partial_blocks(server):
+    llm = LLM({"strong": Role("strong", server, "m", "", 100, 1, 30.0, {})})
+    assert llm.chat("strong", "s", "u", timeout_s=10).error is None
+    assert "partial_blocks" not in llm.calls[-1]
+
+def test_partial_blocks_is_order_independent_and_survives_a_bare_prefix():
+    # no marker at all yet, and a reply whose blocks came in some other order
+    assert partial_blocks("thinking out loud") == {"complete": [], "cut_in": "none", "chars": 17}
+    t = "===VERDICT===\ncandidate\n===END===\n===CODE===\nx = 1\n===END===\n===NOTES===\nhalf"
+    assert partial_blocks(t) == {"complete": ["VERDICT", "CODE"], "cut_in": "NOTES", "chars": len(t)}
+
 
 def test_terminated_blocks_reads_the_last_occurrence_like_parse_blocks():
     t = "===CODE===\ndraft\n===END===\n===CODE===\nfinal but cut off"

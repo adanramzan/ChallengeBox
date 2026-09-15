@@ -37,7 +37,7 @@ class Budget:
         return self.remaining() >= seconds
 
 
-from llm import LLM, load_config, parse_blocks, pick_profile, salvageable, terminated_blocks
+from llm import LLM, load_config, parse_blocks, partial_blocks, pick_profile, salvageable, terminated_blocks
 from sandbox import Problem, python_static, rust_static
 import verify as V
 
@@ -379,7 +379,8 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         # raw-reply fallback below would write that verbatim as the solution.
         partial = bool(r_solve.partial)
         if partial and not salvageable(r_solve):
-            run.log(f"solve.partial attempt={attempt} discarded: the reply was cut off before ===CODE=== closed")
+            run.log(f"solve.partial attempt={attempt} discarded: the reply was cut off before ===CODE=== closed "
+                    f"blocks={partial_blocks(r_solve.text)}")
             return None
         if not code.strip() and r_solve.text.strip() and not partial:
             code = r_solve.text.strip()   # no ===CODE=== block parsed at all: fall back to the raw reply so a file is still emitted

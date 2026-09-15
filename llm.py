@@ -283,6 +283,10 @@ class LLM:
                "error": reply.error, "timed_out": timed_out, "partial": reply.partial, "max_tokens": limit}
         if estimated:
             rec["estimated"] = True
+        if reply.partial:
+            # Where the cut landed, so report.json's `calls` says how far this reply got rather than
+            # only that it was cut. Nothing reads it to make a decision -- `salvageable` does that.
+            rec["partial_blocks"] = partial_blocks(reply.text)
         self.calls.append(rec)
         return reply
 
@@ -331,6 +335,27 @@ def terminated_blocks(text: str) -> set[str]:
         if name != "END":
             closed[name] = bool(end)
     return {n for n, ok in closed.items() if ok}
+
+
+def partial_blocks(text: str) -> dict:
+    """How far a reply got: `{complete: [...], cut_in: "<block or none>", chars: N}`.
+
+    `salvageable` answers yes/no; this answers *where it stopped*, which is what a benchmark table
+    needs to tell "the call was 20 s short" from "the model was still writing rules at the cap".
+    Structural, like terminated_blocks: block names in the order they appear, the one block that
+    opened and never closed (only the last one can be, since the text ends there), and the raw
+    character count. Derived from the same regex, so it knows nothing about any prompt's order."""
+    complete: list[str] = []
+    cut_in = None
+    for name, _body, end in _BLOCK.findall(text):
+        if name == "END":
+            continue
+        if end:
+            if name not in complete:
+                complete.append(name)
+        else:
+            cut_in = name
+    return {"complete": complete, "cut_in": cut_in or "none", "chars": len(text)}
 
 
 def salvageable(reply) -> bool:
