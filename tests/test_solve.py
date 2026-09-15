@@ -935,12 +935,11 @@ def test_generator_prompts_require_reaching_the_bound(tmp_path):
 def test_solve_prompt_asks_a_thinking_model_for_the_code_first(tmp_path):
     from llm import load_config
 
-    # The initial solve must leave OpenRouter's strong model room to write the code after it stops
-    # thinking, because the prompt demands code before prose. That is answer_reserve_s, and the
-    # thinking itself is a BOUNDED token budget rather than an open-ended effort level.
+    # OpenRouter's strong model thinks at a fixed medium effort (the only level the classifier
+    # accepts, and its token budget is advisory), so nothing reserves room for the answer except the
+    # prompt order: CODE first means a reply cut at the cap still carries the code (llm.salvageable).
     strong = load_config("config.toml", "openrouter")["roles"]["strong"]
-    assert strong.reasoning_budget["answer_reserve_s"] > 0
-    assert "reasoning" not in strong.extra
+    assert strong.extra == {"reasoning": {"effort": "medium"}}
 
     # ...and the prompt must not contradict itself by telling the model to
     # think everything through before writing anything.

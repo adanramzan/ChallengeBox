@@ -363,19 +363,19 @@ def test_a_role_with_no_reasoning_budget_sends_what_it_always_sent(server):
     llm.chat("fast", "s", "u", timeout_s=250.0, tag="oracle")
     assert _Handler.last_body["reasoning"] == {"effort": "low"}
 
-def test_config_gives_the_thinking_role_a_reasoning_budget_and_a_repair_cap():
+def test_config_gives_the_thinking_role_a_medium_effort_and_a_repair_cap():
     strong = load_config(str(ROOT / "config.toml"), "openrouter")["roles"]["strong"]
-    # The thinking knob is the budget, not a fixed effort, and not a per-tag effort table: a repair's
-    # smaller timeout is what makes it think less, so the tag_extra that used to do it is gone.
-    assert "reasoning" not in strong.extra and strong.tag_extra == {}
-    b = strong.reasoning_budget
-    assert b["tokens_per_s"] > 0 and b["answer_reserve_s"] > 0
-    assert 0 < b["min_tokens"] < b["max_tokens"] < strong.max_tokens   # thinking AND answer share max_tokens
+    # The thinking knob on claude-opus-5 is an EFFORT level and nothing else: reasoning.max_tokens is
+    # advisory there (a probe asking 3000 inside a 3600-token call spent 3600 on reasoning and
+    # returned no content), so no reasoning_budget on this role. Of the three effort levels the
+    # classifier refuses low and minimal, which leaves medium -- not a per-tag table either, since
+    # the lower efforts a tag would drop to are the refused ones.
+    assert strong.extra == {"reasoning": {"effort": "medium"}} and strong.tag_extra == {}
+    assert strong.reasoning_budget == {}
     assert strong.repair_cap_s == 120.0
-    # The refusal retry's shape: a BOUNDED reasoning budget, not an effort (low and minimal are both
-    # refused on the prompt this fires for) and not an absent reasoning key (that means adaptive
-    # thinking, which spent a whole 239 s budget live and returned nothing).
-    assert list(strong.refusal_extra) == ["reasoning"] and "max_tokens" in strong.refusal_extra["reasoning"]
+    # No refusal retry shape: every shape available is an effort this model refuses, so a refusal
+    # skips the first rung and goes straight to the [roles] fallback role.
+    assert strong.refusal_extra == {}
     assert load_config(str(ROOT / "config.toml"), "openai")["roles"]["strong"].tag_extra == {}
     assert load_config(str(ROOT / "config.toml"), "openai")["roles"]["strong"].refusal_extra == {}
 

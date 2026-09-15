@@ -233,9 +233,8 @@ fallback = "fast"
 # prompt size" -- was measured with max_tokens at 12000, which the reasoning tokens spend before any
 # ===CODE=== block is written; the call then runs to its cap and returns nothing. Reasoning tokens
 # count against max_tokens, so the budget has to cover the thinking AND the answer: 24000 here. How
-# much of that goes to THINKING is no longer a fixed effort level but reasoning_budget below -- at
-# medium effort the call on 5cb294c18288 was cut at 239.4s with no closed CODE block, and medium
-# overran the 240s cap in 3 of 10 runs, while low fit easily and sometimes underthought.
+# much of that goes to THINKING is an effort level, and on this model it can only be an effort
+# level -- see `extra` below.
 [profiles.openrouter.strong]
 base_url = "https://openrouter.ai/api/v1"
 model = "anthropic/claude-opus-5"
@@ -245,7 +244,7 @@ max_concurrent = 3
 timeout_cap_s = 240.0   # A LATENCY ceiling in absolute seconds, not a share: this model does not
                         # answer faster because the deadline is shorter. The share is [limits]
                         # solve_reserve_frac, and Run.chat takes the min() of the two.
-                        # Measured 152-200+ s at medium effort (and twice at the cap); with the
+                        # Measured 152-196 s at medium effort (cut at this cap in 3 of 10); with the
                         # salvage of a cut-off stream (llm.salvageable) a call clipped at this cap
                         # still yields the code when ===CODE=== was emitted, so the cap can sit above
                         # the measured spread. [limits] solve_reserve_frac is what binds first.
@@ -254,49 +253,49 @@ stall_timeout_s = 45.0  # absolute: time-to-first-token is a network/model laten
 price_in_per_m = 5.0
 price_out_per_m = 25.0  # OpenRouter reports usage.cost and the client prefers it; these are the fallback
 omit_temperature = true  # Claude 5 takes no sampling temperature once thinking is on (same reason as [profiles.anthropic.strong])
-extra = {}   # the thinking knob is reasoning_budget, not a fixed effort; nothing else to send
-# How much THINKING each call gets, computed from THAT call's timeout (llm._thinking_tokens):
-# N = clamp(tokens_per_s * (timeout_s - answer_reserve_s), min_tokens, max_tokens), sent as
-# reasoning = { max_tokens = N }. A fixed effort level is wrong for some problem on every deadline --
-# medium overran the 240s cap in 3 of 10 runs and low fit easily, and which of the two a statement
-# needs is not knowable before the call. The deadline enters through the call timeout, the same way
-# every other budget here is a fraction of it, so a 120s deadline and a 900s one buy different
-# amounts of thinking without a second table; a repair, whose timeout is a fraction of a solve's,
-# gets a proportionally smaller N for free.
+# THINKING is an EFFORT level here, because on this model a token budget is not a knob at all.
+# `reasoning = { max_tokens = N }` is NOT binding on anthropic/claude-opus-5 through OpenRouter:
+# a probe asking for 3000 reasoning tokens inside a 3600-token call came back finish_reason=length
+# with reasoning_tokens=3600 and zero content, and a live run with a computed budget of 11 363
+# thought for the whole 239 s cap and emitted no block. The number is advisory; the model stops
+# thinking when it is done or when max_tokens runs out, whichever comes first -- and if that is
+# max_tokens, the answer never gets written. Only effort levels bind on Claude 5.
 #
-# tokens_per_s is a measured constant of the MODEL and does NOT scale with the deadline: output runs
-# ~70-80 tok/s including reasoning (bench22: 8 805 completion tokens in 107.7s; medium-effort runs
-# 13-16k tokens in 152-240s), and 60 leaves headroom under that. answer_reserve_s is the code that
-# still has to be written after the thinking stops. max_tokens stays well under the role's 24000
-# completion cap, which has to hold the thinking AND the answer.
-reasoning_budget = { tokens_per_s = 60.0, answer_reserve_s = 50.0, min_tokens = 2000, max_tokens = 16000 }
-# The request shape a REFUSED call is retried with, merged shallowly over `extra` so this `reasoning`
-# table REPLACES the budget above for that one retry (solve.Run.chat's first rung). Measured live on the
-# prompt this model refuses: effort "low" refused 4 of 4 and "minimal" refused, so an effort rung is
-# not a rung at all; { max_tokens = 4000 } passed and { effort = "medium" } passed. Omitting the
-# reasoning key also passes the classifier, but it turns on ADAPTIVE thinking -- one live run at that
-# rung thought for the whole 239 s budget (4 449 tokens of reasoning summary, no content) and shipped
-# nothing. So a bounded token budget: it clears the classifier and keeps latency near low effort,
-# which is what the retry has to fit inside what is left of the deadline. No key here = no first rung.
-refusal_extra = { reasoning = { max_tokens = 6000 } }
+# That leaves three values, and the provider's classifier refuses two of them: effort "low" refused
+# 4 of 4 on one problem's prompt and "minimal" refused, while "medium" passed 1 of 1. So medium is
+# not a choice, it is the only setting this model will take.
+#
+# It fits, with salvage behind it. Medium ran 152-196 s on the focus problem and 167-173 s on two
+# others in round 14, against timeout_cap_s = 240; it was cut at the cap in 3 of 10 runs, which is
+# why the user lowered the effort to low on 2026-09-15. Medium is back because low is refused, and
+# because a cut reply is no longer a lost run: the SOLVE prompt asks for CODE first and
+# llm.salvageable recovers a reply whose ===CODE=== block closed before the cut, so what a cut
+# costs is the tail of the reasoning, not the answer. Opus's measured output rate today is 71
+# tokens/s, so 240 s of it fits inside the 24000-token cap above -- the clock binds, not the cap.
+#
+# No reasoning_budget on this role: the mechanism stays in llm.py for a provider whose token budget
+# actually binds, and the fast role keeps its own effort. No refusal_extra either -- every shape
+# that could go in it is an effort level this model refuses, so a refusal at medium skips straight
+# to the [roles] fallback rung (solve.Run.has_refusal_extra: no table, no first rung).
+extra = { reasoning = { effort = "medium" } }
 # What a call really cost, asked of the provider when the stream was cut off before its usage chunk
 # arrived. The buffer estimate llm.py falls back to ignores reasoning tokens entirely, so a salvaged
 # thinking call under-reports by an order of magnitude: bench17 and bench18 reported $0.12 between
 # them and the key's usage rose by $0.32. One GET, never retried, failure ignored.
 usage_lookup_url = "https://openrouter.ai/api/v1/generation?id={id}"
 # No tag_extra here any more. It existed to drop the two post-gate calls (repair, solve_fresh) to a
-# lower effort than the solve, and reasoning_budget does that by construction: after the gate the
-# deadline is measured in tens of seconds, those calls get a smaller timeout, and a smaller timeout
-# is a smaller N. A tag that needs a shape of its own can still pin `reasoning` here and the budget
-# will leave it alone.
+# lower effort than the solve, and the lower efforts are exactly the ones the classifier refuses.
+# What bounds those calls now is their own timeout (repair_cap_s below), not a smaller effort. A tag
+# that needs a shape of its own can still pin `reasoning` here.
 # Floor for the repair/fresh-solve call cap (verify.repair_cap takes the larger of this and
 # [phases] repair_call_share * usable). Absolute seconds on purpose: this is the measured LATENCY of
 # a repair by THIS model, which is a fact about the model and not about the deadline. The share is
 # the other half of the max(), which is what keeps a short deadline from promising a call it cannot
 # fit. The fraction alone is 0.25 * 285 = 71s, tuned when the strong role was a 12-17s non-reasoning
 # coder model; against this role it is a guaranteed timeout, and bench16 spent one that way.
-# Measured 150-200s per solve at medium effort, expected roughly half of that at the thinking
-# budget a cap this size buys (reasoning_budget above: 60 * (120 - 50) = 4200 tokens).
+# Measured 152-196s per solve at medium effort, on a much larger prompt than a repair's; a repair
+# runs at the same effort (there is no lower one this model accepts) and is bounded by this cap,
+# with salvage recovering a repair whose CODE block closed before the cut.
 repair_cap_s = 120.0
 
 # The author of the ORACLE and the STRESS module ([roles] above). A THINKING model at low effort:
