@@ -518,7 +518,7 @@ def _check_public_against_oracle(problem, gi: GateInputs, oracle_src: str, *, wo
     oracle is not. A disagreement means the ORACLE is wrong: it's recorded as a note and attached to
     the diff_public evidence (see run_gate), and the public example is kept exactly as given."""
     ref_res = run_python_cases(oracle_src, "reference", [_ref_args(problem, c.input) for c in gi.cases_public],
-                                workdir=os.path.join(workdir, "ref_public"), timeout_s=budget.step_timeout(30.0, reserve_s=10.0))
+                                workdir=os.path.join(workdir, "ref_public"), timeout_s=budget.grant("short", "call_reserve"))
     for c, r in zip(gi.cases_public, ref_res):
         if same(problem, r, c.expected):
             continue
@@ -670,7 +670,7 @@ def _check_examples_against_oracle(problem, gi: GateInputs, oracle_src: str, exa
         return
     per_case = limits.get("per_case_limit_s", 0.0)
     consec = limits.get("max_consecutive_case_timeouts", 0)
-    step = lambda: budget.step_timeout(30.0, reserve_s=20.0)
+    step = lambda: budget.grant("short", "short_reserve")
     verdicts, _ = _validate_inputs(problem, oracle_src, [c.input for c in cases], workdir=os.path.join(workdir, "validate_examples"),
                                    timeout_s=step(), per_case_s=per_case, max_consec_timeouts=consec)
     # One respelling attempt, for the rejected inputs only, in one batch.
@@ -956,7 +956,7 @@ def _accept_stress_input(problem, gi: GateInputs, oracle_src: str, value, source
     verdicts = None
     if gi.validate_trusted:
         verdicts, _ = _validate_inputs(problem, oracle_src, [value], workdir=os.path.join(workdir, f"{source}_validate"),
-                                       timeout_s=budget.step_timeout(20.0, reserve_s=20.0))
+                                       timeout_s=budget.grant("tiny", "batch_reserve"))
     verdict = ("accepted" if verdicts and verdicts[0] is True else
                "rejected" if verdicts and verdicts[0] is False else "unjudged")
     if verdict == "rejected":
@@ -964,7 +964,7 @@ def _accept_stress_input(problem, gi: GateInputs, oracle_src: str, value, source
         return False
     if verdict == "unjudged":
         b = bounds_verdicts(problem, oracle_src, [value], workdir=os.path.join(workdir, f"{source}_bounds"),
-                            timeout_s=budget.step_timeout(20.0, reserve_s=20.0))[0]
+                            timeout_s=budget.grant("tiny", "batch_reserve"))[0]
         if isinstance(b, str):
             gi.notes.append(f"{source} output rejected by bounds(): {b}; not used")
             if log: log(f"stress.input source={source} rejected_by=bounds reason={b}")
@@ -1007,17 +1007,19 @@ def prepare_oracle_tiers(problem, oracle_src: str, limits: dict, *, workdir: str
         # 6 cases and the run never recovered that time, and then the re-prep after an oracle
         # regeneration dropped medium entirely because the budget had moved on -- so the run's only
         # mid-size tier was paid for twice and delivered nothing. Both batches are capped at
-        # [limits] medium_tier_budget_s; if the generator alone spends it, medium ships 0 cases and
-        # says so, rather than eating the gate's and the repair loop's time as well.
-        box = float(limits.get("medium_tier_budget_s", 20.0)) if mode == "medium" else 60.0
+        # [limits] medium_tier_frac of usable time; if the generator alone spends it, medium ships 0
+        # cases and says so, rather than eating the gate's and the repair loop's time as well. A
+        # fraction, not a number of seconds, for the same reason every other grant is one: the tier's
+        # cost is a share of the run, and the run's length is whatever the problem file says.
+        box = (float(limits.get("medium_tier_frac", 0.07)) * budget.usable_s) if mode == "medium" else budget.frac("batch")
         t_mode = time.monotonic()
-        gen = run_python_cases(oracle_src, "gen", [(s, mode) for s in range(n)], workdir=os.path.join(workdir, f"gen_{mode}"), timeout_s=budget.step_timeout(min(60.0, box), reserve_s=20.0))
+        gen = run_python_cases(oracle_src, "gen", [(s, mode) for s in range(n)], workdir=os.path.join(workdir, f"gen_{mode}"), timeout_s=budget.step_timeout(min(budget.frac("batch"), box), reserve_s=budget.frac("batch_reserve")))
         inputs = [r.output for r in gen if r.ok]
         if not inputs:
             gi.notes.append(f"gen({mode}) produced nothing: {(gen[0].error if gen else '')[-200:]}"); continue
         if mode == "medium" and time.monotonic() - t_mode >= box:
             gi.notes.append("medium tier: time box exhausted"); continue
-        cases, ev = make_cases(problem, oracle_src, inputs, mode, workdir=os.path.join(workdir, f"ref_{mode}"), timeout_s=budget.step_timeout(min(60.0, box), reserve_s=20.0),
+        cases, ev = make_cases(problem, oracle_src, inputs, mode, workdir=os.path.join(workdir, f"ref_{mode}"), timeout_s=budget.step_timeout(min(budget.frac("batch"), box), reserve_s=budget.frac("batch_reserve")),
                                per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
         if not cases: gi.notes.append(f"reference failed on all {mode} inputs: {ev.detail['errors']}")
         # "Trusted" = this validate() actually ran and accepted something in at least one tier, so a
@@ -1061,7 +1063,7 @@ def _respell_edges(problem, gi: GateInputs, oracle_src: str, edges: list, limits
     respell into."""
     if not edges or not gi.input_skeleton:
         return
-    step = budget.step_timeout(30.0, reserve_s=20.0)
+    step = budget.grant("short", "short_reserve")
     if step <= 0:
         return
     per_case, consec = limits.get("per_case_limit_s", 0.0), limits.get("max_consecutive_case_timeouts", 0)
@@ -1086,7 +1088,7 @@ STRESS_SOURCES = ("gen_max", "gen_large", "medium_degraded")
 
 def _try_gen_large(problem, gi: GateInputs, *, workdir: str, budget, log=None) -> bool:
     gi.stress_tried.append("gen_large")
-    lg = run_python_cases(gi.oracle_src, "gen", [(1, "large")], workdir=os.path.join(workdir, "gen_large"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
+    lg = run_python_cases(gi.oracle_src, "gen", [(1, "large")], workdir=os.path.join(workdir, "gen_large"), timeout_s=budget.grant("batch", "batch_reserve"))
     if not (lg and lg[0].ok):
         gi.notes.append("gen(large) failed: " + ((lg[0].error[-200:] if lg else "") or "no output"))
         return False
@@ -1155,7 +1157,7 @@ def prepare_stress_inputs(problem, gi: GateInputs, stress_src: str, limits: dict
     if stress_src.strip():
         stress_src = _STDLIB_PREAMBLE + stress_src
         gi.stress_expected = expected_max(stress_src)
-        edges = run_python_cases(stress_src + "\ndef _edges():\n    return list(EDGES)\n", "_edges", [()], workdir=os.path.join(workdir, "edges"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
+        edges = run_python_cases(stress_src + "\ndef _edges():\n    return list(EDGES)\n", "_edges", [()], workdir=os.path.join(workdir, "edges"), timeout_s=budget.grant("batch", "batch_reserve"))
         if edges and edges[0].ok and isinstance(edges[0].output, list):
             cleaned_edges = [_clean_stdin(problem, s) for s in edges[0].output]
             _respell_edges(problem, gi, oracle_src, cleaned_edges, limits, workdir=workdir, budget=budget, log=log)
@@ -1163,16 +1165,16 @@ def prepare_stress_inputs(problem, gi: GateInputs, stress_src: str, limits: dict
             # out-of-bounds edge anyway (it raises ValueError and make_cases drops it), so this buys
             # no coverage -- only a note that names the bound instead of a bare "dropped".
             bad = {i: b for i, b in enumerate(bounds_verdicts(problem, oracle_src, cleaned_edges, workdir=os.path.join(workdir, "bounds_edges"),
-                                                              timeout_s=budget.step_timeout(20.0, reserve_s=20.0))) if isinstance(b, str)}
+                                                              timeout_s=budget.grant("tiny", "batch_reserve"))) if isinstance(b, str)}
             if bad:
                 gi.notes.append(f"{len(bad)} edge case(s) dropped by bounds(): " + "; ".join(list(bad.values())[:2]))
                 log(f"oracle.edge dropped_by_bounds={len(bad)}")
                 cleaned_edges = [v for i, v in enumerate(cleaned_edges) if i not in bad]
-            gi.cases_edge, ev = make_cases(problem, oracle_src, cleaned_edges, "edge", workdir=os.path.join(workdir, "ref_edge"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0),
+            gi.cases_edge, ev = make_cases(problem, oracle_src, cleaned_edges, "edge", workdir=os.path.join(workdir, "ref_edge"), timeout_s=budget.grant("batch", "batch_reserve"),
                                            per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
             _log_and_note_validation(gi, ev, "edge", log)
         gi.stress_tried.append("gen_max")
-        mx = run_python_cases(stress_src, "gen_max", [(1,)], workdir=os.path.join(workdir, "genmax"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
+        mx = run_python_cases(stress_src, "gen_max", [(1,)], workdir=os.path.join(workdir, "genmax"), timeout_s=budget.grant("batch", "batch_reserve"))
         if mx and mx[0].ok:
             _accept_stress_input(problem, gi, oracle_src, mx[0].output, "gen_max", workdir=workdir, budget=budget, log=log)
         else:
@@ -1360,7 +1362,7 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
     ev: list[Evidence] = []
     binary = None
     if problem.language == "rust":
-        t0 = time.monotonic(); binary, err, fixed = compile_rust_with_imports(source, overflow_checks=True, workdir=workdir, timeout_s=budget.step_timeout(90.0))
+        t0 = time.monotonic(); binary, err, fixed = compile_rust_with_imports(source, overflow_checks=True, workdir=workdir, timeout_s=budget.grant("rust_compile"))
         detail = {"stderr": err[-1500:]}
         if fixed != source:
             # rustc named the missing `use` and the retry compiled: every later step -- stress's
@@ -1371,7 +1373,7 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
         ev.append(Evidence("compile", binary is not None, 0, time.monotonic() - t0, detail))
         if binary is None: return ev
     else:
-        e = python_import_check(source, problem.entrypoint, gi, workdir=os.path.join(workdir, "compile"), timeout_s=budget.step_timeout(30.0, reserve_s=20.0), mem_mb=limits["mem_mb"])
+        e = python_import_check(source, problem.entrypoint, gi, workdir=os.path.join(workdir, "compile"), timeout_s=budget.grant("short", "short_reserve"), mem_mb=limits["mem_mb"])
         ev.append(e); log(_gate_line(e))
         if not e.passed: return ev
     # Past compile, every step the inputs allow runs, and the list is complete rather than truncated
@@ -1387,7 +1389,7 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
     # differential step that cannot be poisoned by a wrong reference. Skipped when this candidate
     # has no examples (an older candidate, a reply with no ===EXAMPLES=== block).
     e = differential(problem, source, examples or [], "diff_examples", workdir=os.path.join(workdir, "diff_examples"),
-                     timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"],
+                     timeout_s=budget.grant("batch", "batch_reserve"), binary=binary, mem_mb=limits["mem_mb"],
                      per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
     ev.append(e); log(_gate_line(e, f"cases={e.cases}"))
     # Public examples (ground truth from the problem itself, not the model-written oracle) run first,
@@ -1395,7 +1397,7 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
     # trustworthy evidence available. Absent entirely (the common case), this step is not added at
     # all, so behavior is exactly what it was before this existed.
     if gi.cases_public:
-        e = differential(problem, source, gi.cases_public, "diff_public", workdir=os.path.join(workdir, "diff_public"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"],
+        e = differential(problem, source, gi.cases_public, "diff_public", workdir=os.path.join(workdir, "diff_public"), timeout_s=budget.grant("batch", "batch_reserve"), binary=binary, mem_mb=limits["mem_mb"],
                          per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
         if gi.public_disagreements:
             e.detail = {**e.detail, "oracle_disagreements": gi.public_disagreements}
@@ -1403,7 +1405,7 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
             e.detail["degraded"] = gi.diff_degraded
         ev.append(e); log(_gate_line(e, f"cases={e.cases}"))
     for kind, cases in (("diff_edge", gi.regressions + gi.cases_edge), ("diff_small", gi.cases_small), ("diff_medium", gi.cases_medium)):
-        e = differential(problem, source, cases, kind, workdir=os.path.join(workdir, kind), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"],
+        e = differential(problem, source, cases, kind, workdir=os.path.join(workdir, kind), timeout_s=budget.grant("batch", "batch_reserve"), binary=binary, mem_mb=limits["mem_mb"],
                          per_case_s=limits.get("per_case_limit_s", 0.0), max_consec_timeouts=limits.get("max_consecutive_case_timeouts", 0))
         # A generated tier that agreed on a handful of cases is thin evidence, not coverage: the
         # oracle's gen() mostly crashed or its validate() rejected most of what it produced. Mark it
@@ -1419,12 +1421,15 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
             e.detail["degraded"] = gi.diff_degraded
         ev.append(e); log(_gate_line(e, f"cases={e.cases}"))
     e = behavior(problem, source, gi.cases_small or gi.cases_edge or gi.cases_public or gi.cases_medium,
-                 workdir=os.path.join(workdir, "behavior"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0), binary=binary, mem_mb=limits["mem_mb"], per_case_s=limits.get("per_case_limit_s", 0.0))
+                 workdir=os.path.join(workdir, "behavior"), timeout_s=budget.grant("batch", "batch_reserve"), binary=binary, mem_mb=limits["mem_mb"], per_case_s=limits.get("per_case_limit_s", 0.0))
     ev.append(e); log(_gate_line(e, f"detail={e.detail.get('check','')}"))
     limit = limits["stress_limit_python_s"] if problem.language == "python" else limits["stress_limit_rust_s"]
-    # A hung Python stress call can itself run up to limit_s + 15s (see stress() above), so reserve
-    # enough margin that it can't eat the whole safety margin; Rust's call is bounded by limit_s exactly.
-    reserve = limit + 20.0 if problem.language == "python" else 15.0
+    # A hung Python stress call can itself run past limit_s (see stress() above), so reserve enough
+    # margin on top of the limit that it can't eat the whole safety margin; Rust's call is bounded by
+    # limit_s exactly and needs only the smaller reserve. `limit` itself is an absolute number of
+    # seconds -- it is the judge's time limit, not a share of our deadline -- while what we hold back
+    # around it is a share, so the two are added rather than one being derived from the other.
+    reserve = limit + budget.frac("stress_reserve") if problem.language == "python" else budget.frac("rust_reserve")
     avail = budget.step_timeout(limit, reserve_s=reserve)
     if avail <= 0:
         e = Evidence("stress", True, 0, 0.0, {"skipped": "no budget"}, skipped=True)
@@ -1466,7 +1471,7 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
     # Placed after stress (not before) so stress's timing measurement runs first, on a warm cache,
     # unaffected by this step; and so this step's own subprocess never masks a stress timeout.
     if problem.language == "rust":
-        ov_avail = budget.step_timeout(limits["stress_limit_rust_s"], reserve_s=15.0)
+        ov_avail = budget.step_timeout(limits["stress_limit_rust_s"], reserve_s=budget.frac("rust_reserve"))
         if ov_avail <= 0:
             eo = Evidence("overflow", True, 0, 0.0, {"skipped": "no budget"}, skipped=True)
         else:
@@ -1608,7 +1613,7 @@ def _agreement_note(run, cand, failed: Evidence, gi: GateInputs, detail: dict) -
         return f"disagrees with the reference on {detail.get('mismatches', 0)} of {detail['cases']} {failed.kind[5:]} inputs"
     if failed.kind in ("diff_edge", "diff_public", "diff_examples") and gi.cases_small:
         e = differential(run.p, cand.source, gi.cases_small, "agreement", workdir=os.path.join(run.dir, cand.id),
-                         timeout_s=run.budget.step_timeout(30.0, reserve_s=20.0), mem_mb=run.cfg["limits"]["mem_mb"],
+                         timeout_s=run.budget.grant("short", "short_reserve"), mem_mb=run.cfg["limits"]["mem_mb"],
                          per_case_s=run.cfg["limits"].get("per_case_limit_s", 0.0))
         if e.cases:
             return f"disagrees with the reference on {e.detail.get('mismatches', 0)} of {e.cases} small inputs"
@@ -1617,11 +1622,13 @@ def _agreement_note(run, cand, failed: Evidence, gi: GateInputs, detail: dict) -
 def repair_cap(run) -> float:
     """The wall cap for one repair or fresh-solve call: the larger of the phase fraction
     ([phases] repair_call_share, which is tuned to the DEADLINE) and the repair role's own
-    repair_cap_s (which is tuned to the MODEL). Both are needed: the fraction alone gave bench16 a
-    67 s cap against a role whose completed solve that run took 168 s, so the repair could only time
-    out; a fixed floor alone would ignore a shorter deadline. solve() uses the same number to decide
-    whether a repair can be afforded at all, so the call is never started against a cap the budget
-    cannot cover."""
+    repair_cap_s (which is a measured LATENCY floor -- how long that model actually takes to write a
+    repair, which does not change when the deadline does, and so is the one part of this number that
+    is rightly written in absolute seconds). Both are needed: the fraction alone gave bench16 a 67 s
+    cap against a role whose completed solve that run took 168 s, so the repair could only time out;
+    the floor alone would ignore a shorter deadline, which is why it is a max() and not a constant.
+    solve() uses the same number to decide whether a repair can be afforded at all, so the call is
+    never started against a cap the budget cannot cover."""
     roles = getattr(run.llm, "roles", None) or {}
     floor = float(getattr(roles.get(run.role("repair")), "repair_cap_s", 0.0) or 0.0)
     return max(run.cfg["phases"]["repair_call_share"] * run.budget.usable_s, floor)
@@ -1728,7 +1735,7 @@ def regenerate_oracle(run, gi: GateInputs, extra: str, pv: dict, *, counter: str
     new.regen_failed = False
     # re-derive edge expectations with the new reference
     if gi.cases_edge:
-        new.cases_edge, _ = make_cases(run.p, new.oracle_src, [c.input for c in gi.cases_edge], "edge", workdir=os.path.join(run.dir, workdir_tag, "edge"), timeout_s=run.budget.step_timeout(30.0))
+        new.cases_edge, _ = make_cases(run.p, new.oracle_src, [c.input for c in gi.cases_edge], "edge", workdir=os.path.join(run.dir, workdir_tag, "edge"), timeout_s=run.budget.grant("short"))
     # Cross-check the new reference against the one it replaces on the OLD small inputs. Two
     # references written by the same model from the same prose that disagree on most tiny inputs
     # cannot both be near-correct, so the run has no ground truth left: the differential evidence the
@@ -1736,7 +1743,7 @@ def regenerate_oracle(run, gi: GateInputs, extra: str, pv: dict, *, counter: str
     # passed_all_gates). Control flow is otherwise unchanged -- the new oracle is still used.
     if gi.cases_small:
         res = run_python_cases(new.oracle_src, "reference", [_ref_args(run.p, c.input) for c in gi.cases_small],
-                               workdir=os.path.join(run.dir, workdir_tag, "crosscheck"), timeout_s=run.budget.step_timeout(30.0, reserve_s=20.0))
+                               workdir=os.path.join(run.dir, workdir_tag, "crosscheck"), timeout_s=run.budget.grant("short", "short_reserve"))
         n = len(gi.cases_small)
         k = sum(1 for c, r in zip(gi.cases_small, res) if not same(run.p, r, c.expected))
         run.log(f"oracle.{label} disagreement={k}/{n}")

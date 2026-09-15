@@ -88,7 +88,8 @@ def load_config(path: str, profile: str) -> dict:
     # `roles` is the per-role model config above; `prompt_roles` is the [roles] table -- which model
     # role each PROMPT is sent to (solve.PROMPT_ROLES holds the defaults when it is absent). Two
     # different things with one natural name; the return keys are what keeps them apart.
-    return {"roles": roles, "prompt_roles": dict(cfg.get("roles", {})), "limits": cfg["limits"], "phases": cfg["phases"], "profile": profile}
+    return {"roles": roles, "prompt_roles": dict(cfg.get("roles", {})), "limits": cfg["limits"], "phases": cfg["phases"],
+            "grants": dict(cfg.get("grants", {})), "profile": profile}
 
 
 def pick_profile(path: str) -> str:

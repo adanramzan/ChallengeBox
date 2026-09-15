@@ -9,6 +9,9 @@ cases_medium = 20
 # a full pass. Tuned against the 200/20 targets -- raise these together with those.
 min_cases_small = 30
 min_cases_medium = 5
+# ABSOLUTE seconds, deliberately: the statement gives no time limit, so these are our judgment of
+# what a hidden judge would allow, and a judge's limit does not grow because our own deadline did.
+# They are what the stress step measures the candidate against, not a share of our budget.
 stress_limit_python_s = 5.0
 stress_limit_rust_s = 2.0
 # Below this measured duration a PASSING stress run is not a timing measurement and is recorded as
@@ -21,15 +24,24 @@ stress_limit_rust_s = 2.0
 # down if a problem set is full of such answers -- 0 disables the signal entirely.
 stress_min_plausible_s = 0.01
 max_repairs = 2
-# What the SOLVE call must leave behind, in seconds. With solve_attempts = 1 the solve call is the
-# only thing in the run that can produce an answer, so its ceiling is "everything except what a gate
-# pass and emission need" rather than a share of the generate phase: one gate pass is 2-30 s
-# including a Rust compile, plus the emit margin. bench17 gave one Opus attempt 200 s
-# ([phases] generate_call_share 0.70 * 285 s usable), it timed out at 199.5 s, and 85 s of the
-# budget went unused. The oracle and stress calls keep generate_call_share -- once preparation
-# overlaps the solve call they are no longer on the critical path. Raise this if a gate pass on the
-# problem set regularly costs more than a Rust compile plus one differential tier.
-solve_reserve_s = 45.0
+# What the SOLVE call must leave behind, as a FRACTION of usable time (0.16 * 285 = 45.6 s at the
+# 300 s deadline it was calibrated on). With solve_attempts = 1 the solve call is the only thing in
+# the run that can produce an answer, so its ceiling is "everything except what a gate pass and
+# emission need" rather than a share of the generate phase: one gate pass is 2-30 s including a Rust
+# compile, plus the emit margin. bench17 gave one Opus attempt 200 s ([phases] generate_call_share
+# 0.70 * 285 s usable), it timed out at 199.5 s, and 85 s of the budget went unused. A fraction
+# rather than 45 s because what it reserves -- a gate pass -- is itself a share of the run (see
+# gate_pass_frac below and [grants]), so a fixed reserve would swallow a short deadline and waste a
+# long one. The oracle and stress calls keep generate_call_share -- once preparation overlaps the
+# solve call they are no longer on the critical path. Raise it if a gate pass on the problem set
+# regularly costs more than a Rust compile plus one differential tier.
+solve_reserve_frac = 0.16
+# What one gate pass costs, as a fraction of usable time (0.21 * 285 = 59.9 s), used by the
+# affordability checks before a repair and before a fresh solve. A gate pass is one differential tier
+# after another and each of those is itself a [grants] share, so the whole pass scales with the
+# deadline exactly as its parts do. Calibrated on the measured shape at 300 s: a tier bounded at 60 s,
+# with the expensive ones (an 82 s medium pass, a 60.9 s edge pass) dominating.
+gate_pass_frac = 0.21
 # Independent SOLVE attempts, issued concurrently and gated against the same oracle as each reply
 # lands; best_candidate() keeps whichever passes the most gates. Two attempts were tuned to a 17s
 # non-reasoning coder model, where the second one was free: N attempts cost max() latency, not
@@ -71,14 +83,16 @@ per_case_limit_s = 10.0
 # 60 s grant, left 5 usable cases, and the gate started at 244 s of 285. Tuned against per_case_limit_s.
 max_consecutive_case_timeouts = 5
 shrink_budget_s = 3.0
-# Wall budget for the whole medium tier -- the gen batch and the reference batch together. Medium is
-# the most expensive evidence per second (literal loops over 10^4-10^5 multipliers) and the least
-# decisive; on bench14 gen(seed, "medium") took 60.3 s to produce 6 cases and the run never got that
-# time back. It used to be dropped outright once the budget left the gate phase, which cost that same
-# run its only mid-size tier a second time when the re-prep after an oracle regeneration skipped it
-# with time still on the clock. A box bounds the cost without ever silently dropping the tier: if the
-# generator alone spends it, medium ships 0 cases with the note "medium tier: time box exhausted".
-medium_tier_budget_s = 20.0
+# Wall budget for the whole medium tier -- the gen batch and the reference batch together -- as a
+# fraction of usable time (0.07 * 285 = 20 s). Medium is the most expensive evidence per second
+# (literal loops over 10^4-10^5 multipliers) and the least decisive; on bench14 gen(seed, "medium")
+# took 60.3 s to produce 6 cases and the run never got that time back. It used to be dropped outright
+# once the budget left the gate phase, which cost that same run its only mid-size tier a second time
+# when the re-prep after an oracle regeneration skipped it with time still on the clock. A box bounds
+# the cost without ever silently dropping the tier: if the generator alone spends it, medium ships 0
+# cases with the note "medium tier: time box exhausted". A fraction because the tier's cost is a share
+# of the run, like every other grant.
+medium_tier_frac = 0.07
 # A thinking strong model at $5/$25 per 1M costs far more per problem than the coder model it
 # replaces: two concurrent solves plus up to two repairs, each carrying the statement and up to
 # 24000 tokens of thinking and answer. Raised from 0.50 so the cap bounds a runaway rather than
@@ -131,6 +145,28 @@ repair_afford_s = 60.0
 # generate-phase overlap, where the remaining budget is nearly the whole deadline, so this number
 # only ever binds a LATE trigger (the example dispute, a two-candidate agreement).
 oracle_selfrepair_afford_s = 60.0
+
+# Every per-step subprocess grant and reserve, as a FRACTION of usable time (deadline*scale - margin).
+# The seconds in each comment are what the value came out to at the 300 s deadline (285 s usable)
+# these were calibrated against; solve.DEFAULT_GRANTS holds the same numbers for a config without
+# this table.
+#
+# The problem file supplies only deadline_s. A step budget written as fixed seconds therefore
+# misallocates on every deadline but one: a 60 s batch grant is more than half of a 120 s run and a
+# twelfth of a 900 s one, and the 20 s it leaves behind stops being a reserve in the first case and
+# stops being worth anything in the second. Nothing here is a physical latency -- those (a process
+# start-up, a model's time-to-first-token, a judge's time limit) stay absolute seconds in [limits]
+# and in the role config, each with a comment saying why.
+[grants]
+batch = 0.21           # ~60 s: one differential tier, one reference batch, one EDGES build
+short = 0.105          # ~30 s: a validate/respell pass, a python import check, an oracle cross-check
+tiny = 0.07            # ~20 s: a one-call probe (a single gen(), a skeleton read)
+rust_compile = 0.32    # ~90 s: rustc on one candidate, the slowest single subprocess in a run
+batch_reserve = 0.07   # ~20 s left behind by a batch-sized step
+short_reserve = 0.07   # ~20 s left behind by a short step
+call_reserve = 0.035   # ~10 s left behind by a MODEL call, which the finalizer needs in order to emit
+stress_reserve = 0.07  # ~20 s on top of the stress limit: a hung python stress call overruns by that much
+rust_reserve = 0.053   # ~15 s for the rust stress and overflow calls, which are bounded by limit_s exactly
 
 # Phase boundaries as fractions of usable time (deadline*scale - margin)
 [phases]
@@ -195,11 +231,15 @@ model = "anthropic/claude-opus-5"
 api_key_env = "OPENROUTER_API_KEY"
 max_tokens = 24000
 max_concurrent = 3
-timeout_cap_s = 240.0   # measured 152-200+ s at medium effort (and twice at the cap); with the
+timeout_cap_s = 240.0   # A LATENCY ceiling in absolute seconds, not a share: this model does not
+                        # answer faster because the deadline is shorter. The share is [limits]
+                        # solve_reserve_frac, and Run.chat takes the min() of the two.
+                        # Measured 152-200+ s at medium effort (and twice at the cap); with the
                         # salvage of a cut-off stream (llm.salvageable) a call clipped at this cap
                         # still yields the code when ===CODE=== was emitted, so the cap can sit above
-                        # the measured spread. [limits] solve_reserve_s is what binds first.
-stall_timeout_s = 45.0  # time-to-first-token is longer with thinking; only a real stall should abort
+                        # the measured spread. [limits] solve_reserve_frac is what binds first.
+stall_timeout_s = 45.0  # absolute: time-to-first-token is a network/model latency, not a share of the
+                        # deadline. Longer with thinking, so only a real stall should abort.
 price_in_per_m = 5.0
 price_out_per_m = 25.0  # OpenRouter reports usage.cost and the client prefers it; these are the fallback
 omit_temperature = true  # Claude 5 takes no sampling temperature once thinking is on (same reason as [profiles.anthropic.strong])
@@ -217,10 +257,13 @@ usage_lookup_url = "https://openrouter.ai/api/v1/generation?id={id}"
 # oracle at low effort still measured 155s (bench21) and preparation waits on it.
 tag_extra = { repair = { reasoning = { effort = "low" } }, solve_fresh = { reasoning = { effort = "low" } } }
 # Floor for the repair/fresh-solve call cap (verify.repair_cap takes the larger of this and
-# [phases] repair_call_share * usable). The fraction alone is 0.25 * 285 = 71s, tuned when the
-# strong role was a 12-17s non-reasoning coder model; against this role it is a guaranteed timeout,
-# and bench16 spent one that way. Measured 150-200s per solve at medium effort, expected roughly
-# half of that at the low effort repair_extra selects above.
+# [phases] repair_call_share * usable). Absolute seconds on purpose: this is the measured LATENCY of
+# a repair by THIS model, which is a fact about the model and not about the deadline. The share is
+# the other half of the max(), which is what keeps a short deadline from promising a call it cannot
+# fit. The fraction alone is 0.25 * 285 = 71s, tuned when the strong role was a 12-17s non-reasoning
+# coder model; against this role it is a guaranteed timeout, and bench16 spent one that way.
+# Measured 150-200s per solve at medium effort, expected roughly half of that at the low effort
+# tag_extra selects above.
 repair_cap_s = 120.0
 
 # The author of the ORACLE and the STRESS module ([roles] above). A THINKING model at low effort:
@@ -244,8 +287,11 @@ model = "anthropic/claude-sonnet-5"
 api_key_env = "OPENROUTER_API_KEY"
 max_tokens = 12000   # reasoning tokens count against it: the thinking AND the reference+gen+validate
 max_concurrent = 3
-timeout_cap_s = 150.0   # a ceiling, not an expectation: a call that needs this long has already cost the overlap
-stall_timeout_s = 45.0  # time-to-first-token is longer with thinking; only a real stall should abort
+timeout_cap_s = 150.0   # a LATENCY ceiling in absolute seconds (a model's speed does not follow the
+                        # deadline), and an expectation of nothing: a call that needs this long has
+                        # already cost the overlap preparation depends on
+stall_timeout_s = 45.0  # absolute: time-to-first-token is a network/model latency, not a share of the
+                        # deadline. Longer with thinking, so only a real stall should abort.
 price_in_per_m = 3.0
 price_out_per_m = 15.0  # OpenRouter reports usage.cost and the client prefers it; these are the fallback
 omit_temperature = true  # Claude 5 takes no sampling temperature once thinking is on

@@ -1,5 +1,6 @@
 import os, time, shutil, pytest
 from sandbox import Problem
+import solve as S
 import verify as V
 
 needs_rustc = pytest.mark.skipif(shutil.which("rustc") is None, reason="rustc not installed")
@@ -10,6 +11,12 @@ GOOD = "def add(a, b):\n    return a + b\n"
 BUG = "def add(a, b):\n    return a + b if a < 15 else a + b + 1\n"   # planted off-by-one for a >= 15
 
 class FakeBudget:
+    """A 300 s run (285 s usable) with no clock. `frac`/`grant` are the real Budget's, so a subclass
+    that overrides step_timeout still sees every named grant flow through it."""
+    usable_s = 285.0
+    grants = S.DEFAULT_GRANTS
+    frac = S.Budget.frac
+    grant = S.Budget.grant
     def step_timeout(self, cap, reserve_s=0.0): return cap
     def remaining(self): return 1e9
     def phase(self): return "gate"
@@ -212,9 +219,10 @@ def test_prepare_gate_inputs_reads_step_timeout_fresh_per_site(tmp_path):
     V.prepare_gate_inputs(PY, ORACLE, stress, limits, workdir=str(tmp_path), budget=b, log=lambda m: None)
     assert b.n >= 6
 
-def test_run_gate_reserves_stress_limit_plus_20_for_python(tmp_path):
-    # C4(c): stress() can itself run up to limit_s + 15s, so the reserve at the call site must be more
-    # than that (limit_s + 20), not the flat 15s reserved by every other gate step.
+def test_run_gate_reserves_stress_limit_plus_the_stress_share_for_python(tmp_path):
+    # C4(c): stress() can itself run past limit_s, so the reserve at the call site must be more than
+    # that (limit_s + the stress_reserve share, ~20 s at a 300 s deadline), not the smaller rust_reserve
+    # every other bounded step leaves.
     limits = {"cases_small": 0, "cases_medium": 0, "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0, "mem_mb": 2048, "shrink_budget_s": 1.0}
     seen = {}
     class SpyBudget(FakeBudget):
@@ -223,7 +231,8 @@ def test_run_gate_reserves_stress_limit_plus_20_for_python(tmp_path):
             return 5.0
     gi = V.GateInputs(oracle_src="x")
     V.run_gate(PY, GOOD, gi, workdir=str(tmp_path), budget=SpyBudget(), limits=limits, log=lambda m: None)
-    assert seen.get("reserve") == 25.0
+    assert seen.get("reserve") == pytest.approx(5.0 + S.DEFAULT_GRANTS["stress_reserve"] * 285.0)
+    assert 24.0 < seen["reserve"] < 26.0   # the 300 s calibration this was measured at
 
 # --- overflow gate: max-scale i64 wrap is invisible to timing-only stress, caught by a checked rerun ---
 
@@ -529,7 +538,7 @@ def test_a_genuinely_constant_answer_survives_when_validate_accepts(tmp_path):
 def test_medium_tier_is_time_boxed_rather_than_skipped_by_phase(tmp_path):
     # The medium tier used to be dropped outright once the budget left the gate phase, which cost
     # bench14 its only mid-size tier on the re-prep after an oracle regeneration -- with time still
-    # on the clock. It is now bounded by limits.medium_tier_budget_s instead, so a late budget still
+    # on the clock. It is now bounded by limits.medium_tier_frac of usable instead, so a late budget still
     # gets medium coverage, and a slow gen() cannot spend more than the box.
     class LateBudget(FakeBudget):
         def phase(self): return "repair"
@@ -538,7 +547,7 @@ def test_medium_tier_is_time_boxed_rather_than_skipped_by_phase(tmp_path):
     assert len(gi.cases_small) == 5 and len(gi.cases_medium) == 3
     # a gen() whose medium mode alone spends the box yields 0 medium cases, and says why
     slow = ORACLE.replace("def gen(seed, mode):\n", "import time\ndef gen(seed, mode):\n    if mode == 'medium':\n        time.sleep(0.4)\n")
-    boxed = dict(limits, medium_tier_budget_s=0.5)
+    boxed = dict(limits, medium_tier_frac=0.5 / 285.0)   # the box is a share now; 0.5 s of a 300 s run
     gi2 = V.prepare_gate_inputs(PY, slow, "", boxed, workdir=str(tmp_path / "gi2"), budget=FakeBudget(), log=lambda m: None)
     assert len(gi2.cases_small) == 5 and gi2.cases_medium == []
     assert any("medium tier: time box exhausted" in n or "gen(medium) produced nothing" in n for n in gi2.notes)

@@ -105,9 +105,9 @@ Usable time is `deadline_s` minus a 15-second safety margin. Phases are expresse
 | Window (s) | Share | Phase | Allowed |
 |---:|---:|---|---|
 | 0–5 | 2% | intake | parse, validate, build contract, start clock |
-| 5–95 | 30% | generate | three concurrent model calls — since they run concurrently, the phase costs max() of the three, not their sum, so each can get most of the phase rather than a third of it. The ORACLE and STRESS calls are capped at `[phases].generate_call_share` (config.toml, default 0.70) of usable time. The SOLVE call is capped at `usable − [limits].solve_reserve_s` (default 45 s) instead: at `solve_attempts = 1` it is the only call that can produce an answer, so its ceiling is everything except what a gate pass and emission need. Role caps underneath: strong 240 s, fast 150 s |
+| 5–95 | 30% | generate | three concurrent model calls — since they run concurrently, the phase costs max() of the three, not their sum, so each can get most of the phase rather than a third of it. The ORACLE and STRESS calls are capped at `[phases].generate_call_share` (config.toml, default 0.70) of usable time. The SOLVE call is capped at `usable × (1 − [limits].solve_reserve_frac)` (0.84, ≈240 s here) instead: at `solve_attempts = 1` it is the only call that can produce an answer, so its ceiling is everything except what a gate pass and emission need. Role caps underneath: strong 240 s, fast 150 s |
 | 95–115 | 7% | gate | compile, contract checks, differential, stress |
-| 115–235 | 40% | repair | up to two shrink → repair → gate cycles, each capped at `verify.repair_cap` and started only while that cap plus one gate pass (~60 s) still fits, plus at most one fresh solve (§5.7) under the same rule with the generate cap |
+| 115–235 | 40% | repair | up to two shrink → repair → gate cycles, each capped at `verify.repair_cap` and started only while that cap plus one gate pass (`[limits].gate_pass_frac`, 0.21 of usable ≈ 60 s here) still fits, plus at most one fresh solve (§5.7) under the same rule with the generate cap |
 | 235–270 | 12% | settle | no new model calls; the last gate result stands; write report |
 | 270–285 | 5% | emit | write the solution file atomically |
 | 285–300 | 5% | margin | reserved; never scheduled |
@@ -121,6 +121,39 @@ capped at the remaining time minus a reserve — plus the `safety_margin_s` that
 `deadline_s` before any of this arithmetic, not the phase table. That is deliberate: enforcing the
 generate window as a hard cutoff would kill the ORACLE call at ~95 s, below its measured 38–128 s
 latency, and a run with no oracle verifies nothing.
+
+**Every per-step grant is a share, never a number of seconds.** The problem file supplies only
+`deadline_s`, so a step budget written as fixed seconds is correct for exactly one deadline: a 60 s
+differential-tier grant is more than half of a 120 s run and a twelfth of a 900 s one, and the 20 s
+it leaves behind stops being a reserve in the first case and stops being worth holding in the second.
+`config.toml`'s **`[grants]`** table (mirrored by `solve.DEFAULT_GRANTS` for a config without it) is
+the single place those shares live — `batch` 0.21, `short` 0.105, `tiny` 0.07, `rust_compile` 0.32,
+plus the reserves `batch_reserve`/`short_reserve` 0.07, `call_reserve` 0.035, `stress_reserve` 0.07
+and `rust_reserve` 0.053 — and `Budget.grant(name, reserve)` resolves a pair of them against *this*
+run's `usable_s` and hands the result to `step_timeout`. Every timed subprocess in `verify.py` and
+every model call in `solve.py` goes through it, so no literal second count is left in the code. The
+comment on each entry gives what it came out to at the 300 s deadline the values were calibrated
+against (285 s usable), which is the behaviour these replaced unchanged. `[limits]` carries the same
+conversion for the three larger shares: `solve_reserve_frac` 0.16, `gate_pass_frac` 0.21 (the
+affordability price of one gate pass, §5.7) and `medium_tier_frac` 0.07 (§5.3).
+
+What stays in **absolute seconds** is what does not scale with the deadline, each with a comment in
+`config.toml` saying why:
+
+- `safety_margin_s`, `per_case_limit_s`, `shrink_budget_s` — a process's own cost and a bound on one
+  pathological case, not a share of anything.
+- `stress_limit_python_s` / `stress_limit_rust_s` and `stress_min_plausible_s` — the statement gives
+  no time limit at all, so these are *our judgment of a hidden judge*, and a judge's limit does not
+  grow because our deadline did. They are what the candidate is measured against, not what we spend.
+- `stall_timeout_s` and each role's `timeout_cap_s` — network and model latency. A model does not
+  answer faster because the deadline is shorter; `Run.chat` takes the `min()` of the cap and the
+  share, so the ceiling binds when it is the smaller of the two.
+- `repair_cap_s` — the measured latency of a repair by *that* model, used as the floor half of
+  `max(repair_call_share × usable, repair_cap_s)`. The fraction is the other half, which is what
+  keeps a short deadline from promising a call it cannot fit (§5.7).
+- `oracle_retry_afford_s`, `oracle_selfrepair_afford_s`, `repair_afford_s` — ceilings over rules that
+  already read the mapped role's own cap (§5.3.1), so they re-tune themselves when the model changes
+  and never need to follow the deadline.
 
 ### 4.2 Why this fits
 
@@ -263,7 +296,7 @@ Before any generated oracle or stress source is executed, a fixed preamble — `
 
 **Each candidate is gated as its own reply arrives.** The orchestrator used to join on every SOLVE attempt before gating any of them, which idled 43 s on bench15 and 31 s on bench16 — with a thinking model in the strong role one attempt can be 40 s behind the other or run all the way into its cap and return nothing. The solve futures are now consumed with `as_completed`: each reply is turned into a candidate (examples parsed, `check_oracle_examples` run over the examples of every candidate so far) and put through a full gate pass immediately, logged as `gate.early cand=<id> solve_pending=<n>`; a reply that timed out or carried no code simply produces no candidate. Two consequences are worth naming. Candidate ids follow the order replies *land*, not the order attempts were submitted. And the example check accumulates while the dispute decision does not: a verdict reached on the first candidate is not re-opened by the second unless that second candidate contributed a value disagreement nobody had seen, and the one oracle self-repair a run is allowed stays one.
 
-**The `medium` tier is time-boxed, not phase-gated.** It is the most expensive evidence per second and the least decisive, so it gets at most `[limits] medium_tier_budget_s` (default 20 s) for the generator batch and the reference batch together; if the generator alone spends it, medium ships 0 cases with the note `medium tier: time box exhausted`. It used to be *dropped* once the budget left the `gate` phase, which cost bench14 its only mid-size tier twice over: 60.3 s to produce 6 cases, which the oracle regeneration then discarded, and the re-prep skipped the tier entirely with time still on the clock. A box bounds the cost without ever silently dropping the tier, and the same rule applies to a regenerated oracle's re-prep.
+**The `medium` tier is time-boxed, not phase-gated.** It is the most expensive evidence per second and the least decisive, so it gets at most `[limits] medium_tier_frac` of usable time (0.07, ≈20 s at a 300 s deadline) for the generator batch and the reference batch together; if the generator alone spends it, medium ships 0 cases with the note `medium tier: time box exhausted`. It used to be *dropped* once the budget left the `gate` phase, which cost bench14 its only mid-size tier twice over: 60.3 s to produce 6 cases, which the oracle regeneration then discarded, and the re-prep skipped the tier entirely with time still on the clock. A box bounds the cost without ever silently dropping the tier, and the same rule applies to a regenerated oracle's re-prep.
 
 #### 5.3.1 Oracle self-repair: the CALL can succeed while the CODE is unusable
 
@@ -391,7 +424,7 @@ On a differential failure, a bounded greedy shrink (max 3 seconds): drop list el
 
 Input: statement, the current code, the gate step that failed, the shrunk input, expected vs actual (each shown as `repr()` *and* its Python type, so an empty tuple and an empty list — indistinguishable by eye, `()` vs `[]`, but not by type — can't be mistaken for the same value), and the time remaining. Instruction: smallest change that fixes the demonstrated failure; keep the public contract; do not switch algorithms unless the failure proves the algorithm wrong. The model is first required to name, in one sentence, the specific expression or line producing the wrong value, then change only what that sentence names — a whole-approach rewrite is almost never the right response to one failing input, and a model that believes the approach itself is wrong is told to say so rather than rewrite silently. When the candidate being repaired is itself the output of an earlier repair, the prompt says so explicitly: the earlier failing input, a diff of what that repair changed, and a flat statement that the change did not fix the case — so the model doesn't re-propose the same edit.
 
-**Two counters, not one.** A gate failure of kind `static` or `compile` is mechanical (a missing import, a missing `mut`) rather than a semantic defect, and is charged against `[limits].max_syntax_repairs` (default 2). Every other failure kind (`diff_*`, `behavior`, `stress`, `overflow`) is charged against `[limits].max_repairs` (default 2). The two budgets are independent — a run can spend up to `max_syntax_repairs` fixing compile errors *and* up to `max_repairs` fixing an algorithmic bug, but a `static` failure can never crowd out a semantic repair attempt or vice versa. Both counts (`repairs`, `syntax_repairs`) are in the report. The overall repair loop is still bounded by the same phase and cost checks (`run.budget.phase()`, `max_cost_usd_per_problem`), and by one budget rule that now follows the configured model rather than a literal. **A repair call is capped at `verify.repair_cap` — the larger of `[phases] repair_call_share * usable` and the strong role's own `repair_cap_s` — and is started only while `budget.remaining()` covers that cap plus one gate pass; otherwise the loop logs `repair.skipped reason=budget` and the call is never made.** The fraction alone gave bench16 a 67 s repair against a role whose completed solve that run took 168 s: the call could only time out, and the 67 s were spent proving it. The same rule governs a fresh solve, with the full generate cap as its price. **A repair call that errors — transport failure, 4xx/5xx, timeout, or a reply with no marker block — yields no verdict at all**: it is logged as `repair.error`, mints no child, and the loop stops as if the repair had been skipped. It used to fall through to the default verdict `candidate` ("the reference is right"), which on bench16-1dea was recorded for a 403 on a run whose oracle was the wrong side.
+**Two counters, not one.** A gate failure of kind `static` or `compile` is mechanical (a missing import, a missing `mut`) rather than a semantic defect, and is charged against `[limits].max_syntax_repairs` (default 2). Every other failure kind (`diff_*`, `behavior`, `stress`, `overflow`) is charged against `[limits].max_repairs` (default 2). The two budgets are independent — a run can spend up to `max_syntax_repairs` fixing compile errors *and* up to `max_repairs` fixing an algorithmic bug, but a `static` failure can never crowd out a semantic repair attempt or vice versa. Both counts (`repairs`, `syntax_repairs`) are in the report. The overall repair loop is still bounded by the same phase and cost checks (`run.budget.phase()`, `max_cost_usd_per_problem`), and by one budget rule that now follows the configured model rather than a literal. **A repair call is capped at `verify.repair_cap` — the larger of `[phases] repair_call_share * usable` and the strong role's own `repair_cap_s` (a measured model latency, the one absolute second-count in this path, §4.1) — and is started only while `budget.remaining()` covers that cap plus one gate pass (`[limits] gate_pass_frac × usable`); otherwise the loop logs `repair.skipped reason=budget` and the call is never made.** The fraction alone gave bench16 a 67 s repair against a role whose completed solve that run took 168 s: the call could only time out, and the 67 s were spent proving it. The same rule governs a fresh solve, with the full generate cap as its price. **A repair call that errors — transport failure, 4xx/5xx, timeout, or a reply with no marker block — yields no verdict at all**: it is logged as `repair.error`, mints no child, and the loop stops as if the repair had been skipped. It used to fall through to the default verdict `candidate` ("the reference is right"), which on bench16-1dea was recorded for a 403 on a run whose oracle was the wrong side.
 
 **Post-gate calls think less.** `Role.tag_extra` (a TOML table per role, keyed by prompt tag) is merged over `Role.extra` for that tag's request only, and `config.toml` sets `reasoning = { effort = "low" }` under `repair` and `solve_fresh` for the OpenRouter strong role, against `medium` for the initial solve. After the gate the deadline is measured in tens of seconds, not hundreds. Which knob a provider takes stays in role config, never in a branch in `llm.py`, which only knows that a tag may carry its own extra; a fresh solve therefore carries its own tag (`solve_fresh`) through `Run.chat`, the log, `report.json`'s `calls` and the `FakeLLM` script. It is now the only use of `tag_extra`: the ORACLE and STRESS calls take their effort from the fast role's own `extra` instead — see §8.1.
 
@@ -436,7 +469,7 @@ algorithm has to be cheap in.
 The result is a **root** candidate (`parent` is `None`, `replaces` names the attempt it answers, both
 in the report): it is not a repair of anything, it is gated like any other attempt, and it competes
 for emission through `candidate_score` on its own evidence. A fresh solve costs one strong call plus
-a gate pass on its result, so it starts only while `budget.can_afford(generate cap + ~60 s)`, the
+a gate pass on its result, so it starts only while `budget.can_afford(generate cap + gate_pass_frac × usable)`, the
 cost cap allows it, and `max_fresh_solves` is not yet spent; otherwise the loop stops and the best
 candidate so far is emitted.
 

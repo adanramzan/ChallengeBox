@@ -1367,21 +1367,23 @@ def _sent_timeout(events, tag):
 
 def test_the_solve_call_may_use_the_budget_up_to_the_gate_reserve(tmp_path):
     from llm import Role
-    c = cfg(); c["limits"]["solve_reserve_s"] = 45.0
+    c = cfg(); c["limits"]["solve_reserve_frac"] = 0.16
     llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
     # a role cap well above the budget, so the reserve is what binds
     llm.roles = {"strong": Role("strong", "", "m", "", 100, 3, 240.0, {}),
                  "fast": Role("fast", "", "m", "", 100, 3, 150.0, {})}
     rep = S.solve(prob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     usable = 300.0 - c["limits"]["safety_margin_s"]
-    assert S.solve_call_cap(c, S.Budget(300.0, margin_s=15.0, phases=c["phases"])) == usable - 45.0
-    assert _sent_timeout(rep["events"], "solve") == round(usable - 45.0)
+    cap = S.solve_call_cap(c, S.Budget(300.0, margin_s=15.0, phases=c["phases"]))
+    assert cap == pytest.approx(usable * 0.84)
+    assert abs(cap - (usable - 45.0)) < 1.0        # the 300 s calibration the fraction replaces
+    assert _sent_timeout(rep["events"], "solve") == round(cap)
     # the measuring calls keep the generate share, and a repair keeps its own cap
     assert _sent_timeout(rep["events"], "oracle") == round(c["phases"]["generate_call_share"] * usable)
 
 def test_the_role_cap_still_binds_the_solve_call_when_it_is_the_smaller_of_the_two(tmp_path):
     from llm import Role
-    c = cfg(); c["limits"]["solve_reserve_s"] = 45.0
+    c = cfg(); c["limits"]["solve_reserve_frac"] = 0.16
     llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
     llm.roles = {"strong": Role("strong", "", "m", "", 100, 3, 90.0, {}),
                  "fast": Role("fast", "", "m", "", 100, 3, 150.0, {})}
@@ -1391,10 +1393,48 @@ def test_the_role_cap_still_binds_the_solve_call_when_it_is_the_smaller_of_the_t
 def test_config_ships_a_gate_reserve_for_the_solve_call():
     import tomllib
     cfg_toml = tomllib.loads((pathlib.Path(S.__file__).parent / "config.toml").read_text())
-    reserve = cfg_toml["limits"]["solve_reserve_s"]
-    assert 0 < reserve < cfg_toml["limits"]["safety_margin_s"] * 10
-    # the role cap must sit above the measured solve latency, not below it
+    reserve = cfg_toml["limits"]["solve_reserve_frac"]
+    assert 0 < reserve < 0.5          # a fraction of usable time, not a number of seconds
+    # the role cap must sit above the measured solve latency, not below it. It is the one ABSOLUTE
+    # ceiling in this path: a model's latency does not follow the deadline.
     assert cfg_toml["profiles"]["openrouter"]["strong"]["timeout_cap_s"] == 240.0
+
+
+# --- round 15 batch 10: budget shares are fractions of the deadline, never fixed seconds ---
+
+def test_every_grant_is_the_same_share_of_usable_at_any_deadline():
+    # The problem file supplies only deadline_s. A grant written as fixed seconds is more than half of
+    # a 120 s run and a twelfth of a 900 s one; a share is the same evidence either way.
+    c = cfg()
+    short, long_ = S.Budget(120.0, margin_s=15.0, phases=c["phases"]), S.Budget(900.0, margin_s=15.0, phases=c["phases"])
+    assert short.usable_s == 105.0 and long_.usable_s == 885.0
+    for name in S.DEFAULT_GRANTS:
+        assert short.frac(name) / short.usable_s == pytest.approx(long_.frac(name) / long_.usable_s)
+    assert short.grant("batch", "batch_reserve") == pytest.approx(0.21 * 105.0)
+    assert long_.grant("batch", "batch_reserve") == pytest.approx(0.21 * 885.0)
+    # and the 300 s calibration still lands on the seconds these were measured at
+    cal = S.Budget(300.0, margin_s=15.0, phases=c["phases"])
+    for name, seconds in (("batch", 60.0), ("short", 30.0), ("tiny", 20.0), ("rust_compile", 90.0),
+                          ("batch_reserve", 20.0), ("call_reserve", 10.0), ("rust_reserve", 15.0)):
+        assert abs(cal.frac(name) - seconds) < 1.5, name
+
+def test_config_grants_override_the_defaults_and_stay_fractions():
+    from llm import load_config
+    grants = load_config(str(pathlib.Path(S.__file__).parent / "config.toml"), "openrouter")["grants"]
+    assert grants and set(grants) == set(S.DEFAULT_GRANTS) and grants == S.DEFAULT_GRANTS
+    assert all(0.0 < v < 1.0 for v in grants.values())   # fractions, never seconds
+    b = S.Budget(600.0, margin_s=15.0, phases=cfg()["phases"], grants={"batch": 0.5})
+    assert b.frac("batch") == pytest.approx(0.5 * 585.0) and b.frac("short") == pytest.approx(0.105 * 585.0)
+
+def test_a_model_calls_reserve_is_a_share_too(tmp_path):
+    from llm import Role
+    llm = FakeLLM({"solve": [SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    llm.roles = {"strong": Role("strong", "", "m", "", 100, 3, 1e6, {}), "fast": Role("fast", "", "m", "", 100, 3, 1e6, {})}
+    p = Problem("pid", "python", "Return a+b for ints a,b. At most 10^18.", "add", [], 900.0)
+    rep = S.solve(p, llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    usable = 885.0
+    # the oracle call gets the generate share of a LONGER deadline, and its 10 s reserve scaled with it
+    assert _sent_timeout(rep["events"], "oracle") == round(cfg()["phases"]["generate_call_share"] * usable)
 
 
 # --- round 14 batch 7: a small tier whose answers barely vary regenerates the oracle ---

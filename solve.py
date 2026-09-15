@@ -5,12 +5,39 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 
 
+# Every per-step subprocess grant and reserve, as a FRACTION of usable_s. The seconds in the comments
+# are what each one came out to at the 300 s deadline (285 s usable) they were calibrated against.
+#
+# The problem file supplies only `deadline_s`, so anything that is really a SHARE of the run but is
+# written as fixed seconds misallocates on every other deadline: a 60 s batch grant is more than half
+# of a 120 s run and a twelfth of a 900 s one, and the reserve it leaves behind stops being a reserve
+# in the first case and stops being useful in the second. Physical latencies do NOT belong here --
+# a subprocess start-up, a model's time-to-first-token and a judge's time limit do not grow because
+# the deadline did; those stay absolute seconds in [limits] and in the role config, each with a
+# comment saying so.
+#
+# config.toml's [grants] table overrides this wholesale. It is kept here so a config without the
+# table -- and every test that builds a Budget directly -- still gets the calibrated shares.
+DEFAULT_GRANTS = {
+    "batch": 0.21,           # ~60 s: one differential tier, one reference batch, one EDGES build
+    "short": 0.105,          # ~30 s: a validate/respell pass, a python import check, a cross-check
+    "tiny": 0.07,            # ~20 s: a one-call probe (a single gen(), a skeleton read)
+    "rust_compile": 0.32,    # ~90 s: rustc on one candidate, the slowest single subprocess in a run
+    "batch_reserve": 0.07,   # ~20 s left behind by a batch-sized step
+    "short_reserve": 0.07,   # ~20 s left behind by a short step
+    "call_reserve": 0.035,   # ~10 s left behind by a MODEL call, which the finalizer needs to emit
+    "stress_reserve": 0.07,  # ~20 s on top of the stress limit: a hung python stress call overruns by that much
+    "rust_reserve": 0.053,   # ~15 s for the rust stress and overflow calls, which are bounded by limit_s exactly
+}
+
+
 class Budget:
-    def __init__(self, deadline_s: float, *, margin_s: float, phases: dict, clock=time.monotonic):
+    def __init__(self, deadline_s: float, *, margin_s: float, phases: dict, grants: dict | None = None, clock=time.monotonic):
         self._clock = clock
         self.start = clock()
         self.usable_s = max(0.0, deadline_s - margin_s)
         self.phases = phases
+        self.grants = {**DEFAULT_GRANTS, **(grants or {})}
 
     def elapsed(self) -> float:
         return self._clock() - self.start
@@ -32,6 +59,16 @@ class Budget:
 
     def step_timeout(self, cap_s: float, reserve_s: float = 0.0) -> float:
         return max(0.0, min(cap_s, self.remaining() - reserve_s))
+
+    def frac(self, name: str) -> float:
+        """One [grants] fraction, in seconds, against THIS run's usable time."""
+        return self.grants[name] * self.usable_s
+
+    def grant(self, name: str, reserve: str = "") -> float:
+        """A named subprocess grant: step_timeout over two [grants] fractions rather than two
+        literals. Every timed step goes through this, so a deadline other than the 300 s these were
+        calibrated on gets the same SHARE of the run rather than the same number of seconds."""
+        return self.step_timeout(self.frac(name), reserve_s=self.frac(reserve) if reserve else 0.0)
 
     def can_afford(self, seconds: float) -> bool:
         return self.remaining() >= seconds
@@ -120,7 +157,7 @@ class Run:
     """Per-problem state: budget, log, candidates, artifacts."""
     def __init__(self, problem: Problem, llm, cfg: dict, run_dir: str, deadline_scale: float, clock):
         self.p, self.llm, self.cfg, self.dir = problem, llm, cfg, run_dir
-        self.budget = Budget(problem.deadline_s * deadline_scale, margin_s=cfg["limits"]["safety_margin_s"], phases=cfg["phases"], clock=clock)
+        self.budget = Budget(problem.deadline_s * deadline_scale, margin_s=cfg["limits"]["safety_margin_s"], phases=cfg["phases"], grants=cfg.get("grants"), clock=clock)
         self.scale = deadline_scale
         self.cands: list[Candidate] = []
         self.events: list[str] = []
@@ -192,7 +229,8 @@ class Run:
         # the role's tag_extra. It is what the log line, report.json's `calls` and the FakeLLM script
         # are keyed on, so the two are distinguishable everywhere.
         tag = tag or prompt_name
-        timeout = self.budget.step_timeout(min(cap_s, self.llm.roles[role].timeout_cap_s if hasattr(self.llm, "roles") else cap_s), reserve_s=10.0)
+        timeout = self.budget.step_timeout(min(cap_s, self.llm.roles[role].timeout_cap_s if hasattr(self.llm, "roles") else cap_s),
+                                           reserve_s=self.budget.frac("call_reserve"))
         self.log(f"{tag}.sent role={role} timeout={timeout:.0f}")
         prompt = render(prompt_name, **vars)
         r = self.llm.chat(role, "You are a precise competitive-programming engineer.", prompt, timeout_s=timeout, tag=tag)
@@ -264,11 +302,16 @@ def best_candidate(cands: list[Candidate]) -> Candidate | None:
     return best
 
 
-# One gate pass, for the affordability check before a fresh solve. Taken from the measured numbers
-# in config.toml's comments -- a differential tier is bounded at 60 s and the expensive ones (an 82 s
-# medium pass, a 60.9 s edge pass) are what dominate -- not from a knob, because a fresh solve's real
-# cost is one strong call (repair_afford_s covers that shape) plus re-gating the result.
-GATE_PASS_ESTIMATE_S = 60.0
+def gate_pass_estimate(cfg: dict, budget) -> float:
+    """What one gate pass costs, for the affordability checks before a repair or a fresh solve.
+
+    A share of the run, not a number of seconds ([limits] gate_pass_frac, ~60 s at the 300 s deadline
+    it was measured on): a gate pass is one differential tier after another, and every one of those
+    is itself a share of the budget (see DEFAULT_GRANTS), so the whole pass scales with the deadline
+    exactly as its parts do. The measured shape at 300 s is what the fraction is calibrated to -- a
+    tier bounded at 60 s, with the expensive ones (an 82 s medium pass, a 60.9 s edge pass)
+    dominating."""
+    return cfg["limits"].get("gate_pass_frac", 0.21) * budget.usable_s
 
 
 def oracle_afford_s(run, key: str) -> float:
@@ -295,11 +338,14 @@ def solve_call_cap(cfg: dict, budget) -> float:
     At solve_attempts = 1 this call is the only thing in the run that can produce an answer, so a
     fixed share of the generate phase is the wrong shape for it -- bench17 capped one Opus attempt at
     200 s ([phases] generate_call_share 0.70 of 285 s usable), it timed out at 199.5 s, and 85 s of
-    the budget were never spent. [limits] solve_reserve_s is what the call must leave behind. The
-    ORACLE and STRESS calls keep generate_call_share: once preparation overlaps the solve call they
-    are no longer on the critical path. Run.chat still takes the min() with the role's own
-    timeout_cap_s, which is where the model's measured ceiling lives."""
-    return max(0.0, budget.usable_s - cfg["limits"].get("solve_reserve_s", 45.0))
+    the budget were never spent. [limits] solve_reserve_frac is what the call must leave behind, as a
+    FRACTION of usable time rather than a number of seconds: what a gate pass and an emission cost is
+    itself a share of the run (see gate_pass_estimate), so reserving a fixed 45 s would leave a 120 s
+    run almost no solve and a 900 s run a reserve it cannot use. The ORACLE and STRESS calls keep
+    generate_call_share: once preparation overlaps the solve call they are no longer on the critical
+    path. Run.chat still takes the min() with the role's own timeout_cap_s, which is an absolute
+    LATENCY ceiling -- a model does not answer more slowly because the deadline is longer."""
+    return max(0.0, budget.usable_s * (1.0 - cfg["limits"].get("solve_reserve_frac", 0.16)))
 
 
 def fresh_solve_cap(cfg: dict, budget) -> float:
@@ -654,7 +700,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         """What starting a repair costs: the call at its own cap (V.repair_cap, which follows the
         configured model, not just the deadline) plus the gate pass its result needs. A call that
         cannot fit its cap can only time out, and bench16 spent 67 s of a 285 s run proving it."""
-        return V.repair_cap(run) + GATE_PASS_ESTIMATE_S
+        return V.repair_cap(run) + gate_pass_estimate(cfg, run.budget)
 
     def can_fresh_solve() -> bool:
         """A fresh solve costs one strong call at the full generate cap plus a gate pass on its
@@ -662,7 +708,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         per-run count allow it)."""
         if fresh_solves >= cfg["limits"].get("max_fresh_solves", 1) or run.over_cost():
             return False
-        need = fresh_solve_cap(cfg, run.budget) + GATE_PASS_ESTIMATE_S
+        need = fresh_solve_cap(cfg, run.budget) + gate_pass_estimate(cfg, run.budget)
         if not run.budget.can_afford(need):
             run.log(f"solve.fresh skipped reason=budget need={need:.0f} remaining={run.budget.remaining():.0f}")
             return False
