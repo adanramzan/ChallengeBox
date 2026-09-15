@@ -68,6 +68,11 @@ class Reply:
     # {id, cost} when the real cost of this call was fetched from the provider after the fact (see
     # _lookup_usage). None when it was not asked for, or the lookup failed and `usage` is an estimate.
     cost_lookup: dict | None = None
+    # True when the provider answered with a REFUSAL rather than an answer: delta.refusal text, or
+    # finish_reason "content_filter". Measured as a classifier false positive on this tool's own
+    # prompt scaffold, and deterministic -- so unlike a transport failure it is never retried
+    # verbatim; solve.Run.chat changes the request shape instead.
+    refused: bool = False
 
     @property
     def text(self) -> str:
@@ -109,7 +114,8 @@ def _new_acc() -> dict:
     abandoned. `content`/`reasoning` are lists because list.append and the reader's slice copy are
     each atomic under the GIL -- that is the whole of the thread safety needed here, and one is
     created per attempt so an abandoned thread can never write into a later call's buffer."""
-    return {"content": [], "reasoning": [], "usage": {}, "model": None, "id": None}
+    return {"content": [], "reasoning": [], "usage": {}, "model": None, "id": None, "error": None,
+            "refusal": [], "refused": False}
 
 
 def _acc_text(acc: dict) -> tuple[str, str]:
@@ -123,8 +129,12 @@ def _read_sse(resp, acc: dict) -> dict:
     carries -- OpenAI puts it in a final chunk requested with stream_options.include_usage, OpenRouter
     sends it top-level on the last chunk. Reading line by line is what makes the socket timeout a stall
     detector: each readline is bounded by it."""
+    event = ""
     for raw in resp:
         line = raw.decode("utf-8", "replace").strip()
+        if line.startswith("event:"):
+            event = line[6:].strip()
+            continue
         if not line.startswith("data:"):
             continue
         payload = line[5:].strip()
@@ -134,12 +144,22 @@ def _read_sse(resp, acc: dict) -> dict:
             chunk = json.loads(payload)
         except ValueError:   # a keep-alive or a malformed frame is not the answer; skip it
             continue
+        if chunk.get("error") or event == "error":
+            # A provider failure delivered INSIDE a 200 stream (OpenRouter sends {"error": {...}}
+            # mid-answer when the upstream it routed to fails). Nothing else is coming, so stop
+            # reading and let chat() decide whether it is worth retrying.
+            acc["error"] = chunk.get("error") or chunk
+            break
         acc["model"] = chunk.get("model") or acc["model"]
         acc["id"] = acc["id"] or chunk.get("id")   # what _lookup_usage asks the provider about
         if chunk.get("usage"):
             acc["usage"] = chunk["usage"]
         for ch in chunk.get("choices") or []:
             d = ch.get("delta") or {}
+            if d.get("refusal"):
+                acc["refusal"].append(d["refusal"]); acc["refused"] = True
+            if ch.get("finish_reason") == "content_filter" or ch.get("native_finish_reason") == "refusal":
+                acc["refused"] = True
             if d.get("content"):
                 acc["content"].append(d["content"])
             if d.get("reasoning") or d.get("reasoning_content"):
@@ -149,6 +169,19 @@ def _read_sse(resp, acc: dict) -> dict:
     if acc["model"]:
         out["model"] = acc["model"]
     return out
+
+
+def _sse_error(err) -> tuple[str, bool]:
+    """(message, retryable) for an error the stream carried. Retryable on 429, on 5xx and on a code
+    that cannot be read at all -- those are the provider's side; any other 4xx is this request's own
+    fault and repeating it verbatim only wastes the deadline. Same rule as the HTTPError branch."""
+    if not isinstance(err, dict):
+        err = {"message": str(err)}
+    try:
+        code = int(err.get("code") or err.get("status") or 0)
+    except (TypeError, ValueError):
+        code = 0
+    return f"stream error {code or '?'}: {err.get('message') or err}"[:200], code == 0 or code == 429 or code >= 500
 
 
 def _lookup_usage(r: Role, gen_id: str, headers: dict) -> dict | None:
@@ -200,10 +233,15 @@ class LLM:
         for key, n in limits.items():
             self._sems[key] = threading.Semaphore(n)
 
-    def chat(self, role: str, system: str, user: str, *, timeout_s: float, max_tokens: int | None = None, tag: str = "") -> Reply:
+    def chat(self, role: str, system: str, user: str, *, timeout_s: float, max_tokens: int | None = None, tag: str = "", no_reasoning: bool = False) -> Reply:
         r = self.roles[role]
         limit = max_tokens or r.max_tokens
         extra = {**r.extra, **r.tag_extra[tag]} if tag in r.tag_extra else r.extra
+        if no_reasoning:
+            # The one request-shape change a refusal retry makes (see solve.Run.chat): the same
+            # prompt that was refused with reasoning.effort set was answered with the parameter
+            # absent. Sending effort = "none" is not the same request and was not what was measured.
+            extra = {k: v for k, v in extra.items() if k != "reasoning"}
         body = {"model": r.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 r.token_param: limit, "temperature": 0.2, "stream": r.stream,
                 **({"stream_options": {"include_usage": True}} if r.stream else {}), **extra}
@@ -235,6 +273,24 @@ class LLM:
                     # whenever this thread finally leaves, abandoned or not.
                     with urllib.request.urlopen(req, timeout=r.stall_timeout_s if r.stream else timeout_s + 5) as resp:
                         result["data"] = _read_sse(resp, acc) if r.stream else json.load(resp)
+                    if acc["refused"]:
+                        # A refusal arrives as a perfectly healthy 200 stream with no answer in it,
+                        # so it has to be read before the empty-stream check below -- and it is NOT
+                        # retryable: the same request reproduces it every time.
+                        result.pop("data", None)
+                        result["error"] = f"refusal: {''.join(acc['refusal']) or 'content_filter'}"[:200]
+                        result["refused"], result["retryable"] = True, False
+                    elif acc["error"]:
+                        del result["data"]
+                        result["error"], result["retryable"] = _sse_error(acc["error"])
+                    elif r.stream and not (acc["content"] or acc["reasoning"] or acc["usage"]):
+                        # A stream that closed cleanly having said nothing at all is not an empty
+                        # answer, it is a connection that died quietly: a live run got one back in
+                        # 2.5 s with no text and no usage, and the orchestrator spent the rest of
+                        # the deadline treating it as a reply. Same handling as any other transport
+                        # failure -- retry it inside this call.
+                        del result["data"]
+                        result["error"], result["retryable"] = "transport: empty stream", True
                 except urllib.error.HTTPError as e:
                     result["error"] = f"http {e.code}: {e.read().decode('utf-8', 'replace')[:300]}"
                     result["retryable"] = e.code == 429 or e.code >= 500
@@ -268,7 +324,7 @@ class LLM:
                 usage, estimated = {"completion_tokens": len(content or reasoning) // 4}, True
             reply = Reply(content, reasoning, _fill_cost(usage, r), latency, acc["model"] or r.model, "timeout", partial)
         elif "error" in result:
-            reply = Reply("", "", {}, latency, r.model, result["error"])
+            reply = Reply("", "", {}, latency, r.model, result["error"], refused=bool(result.get("refused")))
         else:
             d = result["data"]; msg = d["choices"][0]["message"]
             reply = Reply(msg.get("content") or "", msg.get("reasoning_content") or msg.get("reasoning") or "",
@@ -284,6 +340,8 @@ class LLM:
                "error": reply.error, "timed_out": timed_out, "partial": reply.partial, "max_tokens": limit}
         if estimated:
             rec["estimated"] = True
+        if reply.refused:
+            rec["refused"] = True
         if reply.partial:
             # Where the cut landed, so report.json's `calls` says how far this reply got rather than
             # only that it was cut. Nothing reads it to make a decision -- `salvageable` does that.
@@ -378,11 +436,11 @@ class FakeLLM:
         if cost is not None:
             self.usage["cost"] = cost   # lets a test drive Run.cost_usd() past the cap
 
-    def chat(self, role: str, system: str, user: str, *, timeout_s: float, max_tokens: int | None = None, tag: str = "") -> Reply:
+    def chat(self, role: str, system: str, user: str, *, timeout_s: float, max_tokens: int | None = None, tag: str = "", no_reasoning: bool = False) -> Reply:
         with self._lock:
             key = tag if tag in self.script else role
             assert self.script.get(key), f"FakeLLM: no scripted reply left for {key!r} (tag={tag!r}, role={role!r})"
             text = self.script[key].pop(0)
             self.prompts.append((role, system, user))
-            self.calls.append({"role": role, "tag": tag, "model": "fake", "latency_s": 0.0, "usage": dict(self.usage), "error": None, "timed_out": False})
+            self.calls.append({"role": role, "tag": tag, "model": "fake", "latency_s": 0.0, "usage": dict(self.usage), "error": None, "timed_out": False, "no_reasoning": no_reasoning})
         return Reply(text, "", dict(self.usage), 0.0, "fake", None)

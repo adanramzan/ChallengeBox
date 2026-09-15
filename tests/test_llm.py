@@ -502,3 +502,89 @@ def test_config_gives_the_openrouter_roles_a_usage_lookup_url():
     roles = load_config(str(ROOT / "config.toml"), "openrouter")["roles"]
     assert all(r.usage_lookup_url == "https://openrouter.ai/api/v1/generation?id={id}" for r in roles.values())
     assert load_config(str(ROOT / "config.toml"), "openai")["roles"]["strong"].usage_lookup_url == ""
+
+
+# --- a 200 stream that says nothing, or carries a provider error mid-answer ---
+
+class _StreamPlanHandler(_Handler):
+    """Serves `plan` one entry per request: "empty" (a 200 SSE body with no chunks at all),
+    "refusal" (the provider's content filter, as anthropic/claude-opus-5 returns it), an int (a
+    mid-stream {"error": {...}} with that code), anything else -- or an exhausted plan -- the
+    parent's normal streamed answer."""
+    plan: list = []
+    def do_POST(self):
+        what = _StreamPlanHandler.plan.pop(0) if _StreamPlanHandler.plan else "good"
+        if what == "good":
+            super().do_POST(); return
+        json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        with _Handler.lock:
+            _Handler.requests += 1
+        self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+        if what == "refusal":
+            # Exactly the shape measured live: refusal text in the first delta with empty content,
+            # then a chunk that finishes with content_filter, then [DONE]. A healthy 200 throughout.
+            self._sse({"choices": [{"delta": {"content": "", "refusal": "blocked by the terms of service classifier"}}]})
+            self._sse({"choices": [{"delta": {}, "finish_reason": "content_filter", "native_finish_reason": "refusal"}]})
+        elif what != "empty":
+            self._sse({"error": {"code": what, "message": "upstream exploded"}})
+        self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+
+@pytest.fixture
+def planned():
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _StreamPlanHandler); th = threading.Thread(target=srv.serve_forever, daemon=True); th.start()
+    _Handler.requests = 0; _Handler.delay = 0.0; _StreamPlanHandler.plan = []
+    yield f"http://127.0.0.1:{srv.server_port}/v1"
+    srv.shutdown(); _Handler.delay = 0.3; _StreamPlanHandler.plan = []
+
+def _planned_role(url):
+    return Role("strong", url, "m", "", 100, 1, 30.0, {}, transport_retries=2, transport_backoff_s=0.01)
+
+def test_an_empty_stream_is_retried_like_any_transport_failure(planned):
+    # A live run got one of these back in 2.5 s: no content, no reasoning, no usage, no error --
+    # and the orchestrator treated it as a reply that simply had no code in it.
+    _StreamPlanHandler.plan = ["empty"]
+    llm = LLM({"strong": _planned_role(planned)})
+    r = llm.chat("strong", "s", "u", timeout_s=30.0)
+    assert r.error is None and "===CODE===" in r.text
+    assert _Handler.requests == 2 and len(llm.calls) == 1   # one logical call, two attempts
+
+def test_an_empty_stream_that_exhausts_its_retries_is_an_error_reply(planned):
+    _StreamPlanHandler.plan = ["empty"] * 3
+    llm = LLM({"strong": _planned_role(planned)})
+    r = llm.chat("strong", "s", "u", timeout_s=30.0)
+    assert r.error == "transport: empty stream" and not r.text
+    assert _Handler.requests == 3 and llm.calls[-1]["error"] == "transport: empty stream"
+
+def test_a_mid_stream_provider_error_is_retried_on_5xx(planned):
+    _StreamPlanHandler.plan = [503]
+    llm = LLM({"strong": _planned_role(planned)})
+    r = llm.chat("strong", "s", "u", timeout_s=30.0)
+    assert r.error is None and "===CODE===" in r.text and _Handler.requests == 2
+
+def test_a_mid_stream_provider_error_is_not_retried_on_4xx(planned):
+    _StreamPlanHandler.plan = [400, 400, 400]
+    llm = LLM({"strong": _planned_role(planned)})
+    r = llm.chat("strong", "s", "u", timeout_s=30.0)
+    assert r.error.startswith("stream error 400") and "upstream exploded" in r.error
+    assert len(r.error) <= 200 and _Handler.requests == 1
+    assert llm.calls[-1]["error"] == r.error   # the provider's message reaches the call record
+
+def test_a_refusal_is_not_retried_and_is_reported_as_one(planned):
+    # Measured live: the classifier refuses this tool's own prompt scaffold deterministically, so
+    # repeating the request only burns the deadline. It must come back as a refusal, not as the
+    # empty stream it otherwise looks exactly like.
+    _StreamPlanHandler.plan = ["refusal", "refusal", "refusal"]
+    llm = LLM({"strong": _planned_role(planned)})
+    r = llm.chat("strong", "s", "u", timeout_s=30.0)
+    assert r.refused and r.error.startswith("refusal: blocked by the terms") and len(r.error) <= 200
+    assert not r.text and _Handler.requests == 1
+    assert llm.calls[-1]["refused"] and llm.calls[-1]["error"] == r.error
+
+def test_no_reasoning_drops_only_the_reasoning_extra(planned):
+    role = Role("strong", planned, "m", "", 100, 1, 30.0, {"reasoning": {"effort": "low"}, "usage": {"include": True}},
+                tag_extra={"solve": {"reasoning": {"effort": "high"}}})
+    llm = LLM({"strong": role})
+    llm.chat("strong", "s", "u", timeout_s=30.0, tag="solve", no_reasoning=True)
+    assert "reasoning" not in _Handler.last_body and _Handler.last_body["usage"] == {"include": True}
+    llm.chat("strong", "s", "u", timeout_s=30.0, tag="solve")
+    assert _Handler.last_body["reasoning"] == {"effort": "high"}
