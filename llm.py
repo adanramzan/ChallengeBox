@@ -56,6 +56,12 @@ class Role:
     # in kind, not in one field. Empty (the default) means this role has no first rung and a refusal
     # goes straight to the fallback role.
     refusal_extra: dict = field(default_factory=dict)
+    # How much THINKING each call may spend, as a function of that call's own timeout rather than as
+    # a fixed effort level (see _thinking_tokens). {tokens_per_s, answer_reserve_s, min_tokens,
+    # max_tokens}; empty (the default) leaves whatever `extra` configures alone. tokens_per_s is a
+    # measured latency constant of the MODEL and does not scale with the deadline; the deadline
+    # enters through timeout_s, the same way every other budget in this tool is a fraction of it.
+    reasoning_budget: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -95,7 +101,7 @@ def load_config(path: str, profile: str) -> dict:
                         r.get("token_param", "max_tokens"), bool(r.get("omit_temperature", False)), float(r.get("price_in_per_m", 0.0)), float(r.get("price_out_per_m", 0.0)),
                         bool(r.get("stream", True)), float(r.get("stall_timeout_s", 30.0)),
                         dict(r.get("tag_extra", {})), float(r.get("repair_cap_s", 0.0)), r.get("usage_lookup_url", ""),
-                        dict(r.get("refusal_extra", {})))
+                        dict(r.get("refusal_extra", {})), dict(r.get("reasoning_budget", {})))
              for name, r in prof.items()}
     # `roles` is the per-role model config above; `prompt_roles` is the [roles] table -- which model
     # role each PROMPT is sent to (solve.PROMPT_ROLES holds the defaults when it is absent). Two
@@ -228,6 +234,24 @@ def _fill_cost(usage: dict, r: Role) -> dict:
     return usage
 
 
+def _thinking_tokens(b: dict, timeout_s: float) -> int:
+    """How many reasoning tokens ONE call can afford, from that call's own timeout.
+
+    A fixed effort level cannot be right for every problem on every deadline: whether a statement
+    needs more thinking is not knowable before the call, and the same level that fits a 300 s
+    deadline is a guaranteed cut-off on a 120 s one. Measured on anthropic/claude-opus-5: output
+    runs ~70-80 tok/s including reasoning (bench22: 8 805 completion tokens in 107.7 s; medium-effort
+    runs 13-16k tokens in 152-240 s), and medium effort overran the 240 s cap in 3 of 10 runs while
+    low fit easily. What IS known before the call is its timeout, and at a measured rate that
+    converts straight into tokens -- minus `answer_reserve_s`, because the answer still has to be
+    written after the thinking stops. tokens_per_s is deliberately set below the measured rate; the
+    clamp keeps a very short deadline from buying no thinking at all and a very long one from buying
+    more than the model will use. Repairs and fresh solves get a smaller number automatically,
+    because their timeouts are smaller -- no per-tag effort table needed."""
+    n = int(float(b.get("tokens_per_s", 60.0)) * (timeout_s - float(b.get("answer_reserve_s", 50.0))))
+    return max(int(b.get("min_tokens", 2000)), min(n, int(b.get("max_tokens", 16000))))
+
+
 class LLM:
     def __init__(self, roles: dict[str, Role]):
         self.roles = roles
@@ -244,6 +268,11 @@ class LLM:
         r = self.roles[role]
         limit = max_tokens or r.max_tokens
         extra = {**r.extra, **r.tag_extra[tag]} if tag in r.tag_extra else r.extra
+        if r.reasoning_budget and "reasoning" not in r.tag_extra.get(tag, {}):
+            # The thinking this call can afford, in tokens, from its own timeout -- replacing any
+            # fixed effort the role's `extra` carries. A tag that pins its own `reasoning` in
+            # tag_extra keeps it: an explicit per-tag shape is a decision, not a default.
+            extra = {**extra, "reasoning": {"max_tokens": _thinking_tokens(r.reasoning_budget, timeout_s)}}
         if refusal_retry:
             # The one request-shape change a refusal retry makes (see solve.Run.chat). Shallow on
             # purpose: refusal_extra's `reasoning` replaces the role's whole reasoning table, so the
@@ -345,6 +374,10 @@ class LLM:
                 reply.cost_lookup = {"id": acc["id"], "cost": found.get("cost")}
         rec = {"role": role, "tag": tag, "model": reply.model, "latency_s": round(latency, 2), "usage": reply.usage,
                "error": reply.error, "timed_out": timed_out, "partial": reply.partial, "max_tokens": limit}
+        if isinstance(extra.get("reasoning"), dict) and "max_tokens" in extra["reasoning"]:
+            # What this call was allowed to think, next to what it actually spent: the two together
+            # are what says whether the budget or the model's own stopping point ended the thinking.
+            rec["reasoning_max_tokens"] = extra["reasoning"]["max_tokens"]
         if estimated:
             rec["estimated"] = True
         if reply.refused:

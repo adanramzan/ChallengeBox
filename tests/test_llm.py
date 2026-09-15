@@ -330,11 +330,47 @@ def test_tag_extra_reaches_the_request_body_only_for_the_mapped_tag(server):
     plain.chat("strong", "s", "u", timeout_s=10, tag="repair")
     assert _Handler.last_body["reasoning"] == {"effort": "medium"}
 
-def test_config_gives_the_thinking_role_per_tag_efforts_and_a_repair_cap():
+BUDGET = {"tokens_per_s": 60.0, "answer_reserve_s": 50.0, "min_tokens": 2000, "max_tokens": 16000}
+
+def test_the_thinking_budget_is_computed_from_this_calls_timeout(server):
+    # A fixed effort is right for one deadline and wrong for the next; the call's own timeout is the
+    # only thing about the deadline that is known before the call, so that is what buys the thinking.
+    llm = LLM({"strong": Role("strong", server, "m", "", 100, 1, 900.0, {"reasoning": {"effort": "low"}},
+                              reasoning_budget=BUDGET)})
+    llm.chat("strong", "s", "u", timeout_s=250.0, tag="solve")     # 60 * (250 - 50) = 12000
+    assert _Handler.last_body["reasoning"] == {"max_tokens": 12000}
+    assert llm.calls[-1]["reasoning_max_tokens"] == 12000           # what it was allowed, in the record
+    llm.chat("strong", "s", "u", timeout_s=100.0, tag="repair")     # a repair's smaller cap thinks less
+    assert _Handler.last_body["reasoning"] == {"max_tokens": 3000}
+    # clamped at both ends: a tiny deadline still buys some thinking, a huge one buys no more than
+    # the model will use -- and the effort the role's `extra` carried is gone either way.
+    llm.chat("strong", "s", "u", timeout_s=55.0)
+    assert _Handler.last_body["reasoning"] == {"max_tokens": 2000}
+    llm.chat("strong", "s", "u", timeout_s=800.0)
+    assert _Handler.last_body["reasoning"] == {"max_tokens": 16000}
+
+def test_a_tag_that_pins_its_own_reasoning_keeps_it_over_the_budget(server):
+    # An explicit per-tag shape is a decision; the budget is only the default.
+    llm = LLM({"strong": Role("strong", server, "m", "", 100, 1, 300.0, {},
+                              tag_extra={"stress": {"reasoning": {"effort": "minimal"}}}, reasoning_budget=BUDGET)})
+    llm.chat("strong", "s", "u", timeout_s=250.0, tag="stress")
+    assert _Handler.last_body["reasoning"] == {"effort": "minimal"} and "reasoning_max_tokens" not in llm.calls[-1]
+    llm.chat("strong", "s", "u", timeout_s=250.0, tag="solve")
+    assert _Handler.last_body["reasoning"] == {"max_tokens": 12000}
+
+def test_a_role_with_no_reasoning_budget_sends_what_it_always_sent(server):
+    llm = LLM({"fast": Role("fast", server, "m", "", 100, 1, 300.0, {"reasoning": {"effort": "low"}})})
+    llm.chat("fast", "s", "u", timeout_s=250.0, tag="oracle")
+    assert _Handler.last_body["reasoning"] == {"effort": "low"}
+
+def test_config_gives_the_thinking_role_a_reasoning_budget_and_a_repair_cap():
     strong = load_config(str(ROOT / "config.toml"), "openrouter")["roles"]["strong"]
-    # only the POST-gate calls: the oracle/stress entries went with the prompts, back to the fast role
-    assert strong.tag_extra == {"repair": {"reasoning": {"effort": "low"}},
-                                "solve_fresh": {"reasoning": {"effort": "low"}}}
+    # The thinking knob is the budget, not a fixed effort, and not a per-tag effort table: a repair's
+    # smaller timeout is what makes it think less, so the tag_extra that used to do it is gone.
+    assert "reasoning" not in strong.extra and strong.tag_extra == {}
+    b = strong.reasoning_budget
+    assert b["tokens_per_s"] > 0 and b["answer_reserve_s"] > 0
+    assert 0 < b["min_tokens"] < b["max_tokens"] < strong.max_tokens   # thinking AND answer share max_tokens
     assert strong.repair_cap_s == 120.0
     # The refusal retry's shape: a BOUNDED reasoning budget, not an effort (low and minimal are both
     # refused on the prompt this fires for) and not an absent reasoning key (that means adaptive
