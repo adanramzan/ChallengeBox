@@ -2,16 +2,14 @@ You are solving a hard algorithmic problem. The statement below is the only spec
 
 Target language: {{language}}. Contract: {{contract}}
 
-Restate the rules first, then design, then write the code. Respond with exactly these blocks, in order, each terminated by a line `===END===`. Keep the design compact but explicit.
+Think the whole thing through before you write anything: the statement's rules, the trap list further
+down, and the cost of your approach at the stated maxima. Reject, before the first line of code, any
+approach that iterates a count or capacity the statement bounds by a huge number, materializes or
+rescans a structure whose described size exceeds memory, or recurses to a depth proportional to the
+input. Then emit ===CODE=== FIRST. The blocks after it are a record of the thinking you have already
+done, not a plan for it -- keep each one inside its stated length.
 
-===RULES===
-Numbered restatement of every behavioral sentence of the statement, quoting the text. List ambiguities separately with the reading you chose.
-Behavioral sentences only -- the ones that change what the answer is. Quote, number, and stop: at most about 25 lines, no restating of the setup, no plan for the code.
-===END===
-
-===DESIGN===
-State representation, the invariant for every operation, the maximum-constraint complexity, and one hand trace of the hardest boundary case. Before writing code, reject any approach that iterates a count or capacity the statement bounds by a huge number, materializes or rescans a structure whose described size exceeds memory, or recurses to a depth proportional to the input.
-===END===
+Respond with exactly these blocks, in this order, each terminated by a line `===END===`.
 
 ===CODE===
 The complete solution, and nothing else. {{language_rules}}
@@ -36,8 +34,22 @@ whose answer is cheap to reason about; and the input you consider most likely to
 deepest state the statement reaches, or the clause a naive reading gets wrong.
 ===END===
 
+===RULES===
+Numbered restatement of the behavioral sentences of the statement — the ones that change what the
+answer is — quoting the text. At most 15 numbered lines, one line each, ambiguities included: list
+an ambiguity as its own numbered line with the reading you chose. No setup, no plan for the code.
+===END===
+
+===DESIGN===
+At most 20 lines: the state representation, the invariant every operation maintains, the
+per-operation complexity against the stated maximum sizes, how overflow and recursion depth are
+treated, and one hand trace of the hardest boundary case. A record of the reasoning behind the code
+above, not a plan for it.
+===END===
+
 ===TRAPS===
-For EACH item below, one line: what a naive solution would do and why it fails here, or "n/a".
+One line for each item below that ACTUALLY APPLIES to this problem: what a naive solution would do
+and why it fails here. Skip every item that does not apply — do not write "n/a" lines for them.
 - counts/repetitions/capacities up to 10^18 that must not be iterated
 - structures that must not be materialized (enormous layouts, exponential unfoldings, cell enumeration)
 - persistence/branching across versions
@@ -46,10 +58,6 @@ For EACH item below, one line: what a naive solution would do and why it fails h
 - integer overflow (Rust i64) — use i128/u128 for sums of 10^18 quantities
 - custom Unicode/grapheme/byte rules that differ from the standard library
 - wording that redefines behavior after exhaustion, reset, or removal
-===END===
-
-===ALGORITHM===
-Data structures, per-operation complexity against the stated maximum sizes, overflow and recursion treatment. Written as a record of the reasoning behind the code above, not a plan for it.
 ===END===
 
 {{previous_attempt}}

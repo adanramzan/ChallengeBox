@@ -52,7 +52,7 @@ class Candidate:
     evidence: list = field(default_factory=list)
     examples: list = field(default_factory=list)   # the author's hand-traced (input, expected) cases
     examples_dropped: int = 0                      # lines of the ===EXAMPLES=== block that did not parse
-    algorithm: str = ""                            # the reply's ===ALGORITHM=== (or ===DESIGN===) block
+    algorithm: str = ""                            # the reply's ===DESIGN=== block: the reasoning behind the code
     replaces: str | None = None                    # set on a fresh solve: the candidate whose failure asked for this one
 
     def passed_count(self) -> int:
@@ -205,7 +205,7 @@ class Run:
 
 # The SOLVE prompt's blocks, in the order it asks for them. Used only to name what a reply cut off
 # at its timeout kept and what it lost; CODE is the only one the gate cannot do without.
-SOLVE_BLOCKS = ("RULES", "DESIGN", "CODE", "EXAMPLES", "TRAPS", "ALGORITHM")
+SOLVE_BLOCKS = ("CODE", "EXAMPLES", "RULES", "DESIGN", "TRAPS")
 
 
 def log_salvage(run, cand_id: str, text: str) -> None:
@@ -333,7 +333,7 @@ def fresh_solve(run, prev_cand, failed, gi, pv) -> "Candidate | None":
     # reply carried none, so the new candidate is held to the same hand trace.
     nc.examples = V.parse_examples(run.p, ex_block) or prev_cand.examples
     nc.examples_dropped = max(0, V.example_line_count(ex_block) - len(nc.examples))
-    nc.algorithm = blocks.get("ALGORITHM") or blocks.get("DESIGN", "")
+    nc.algorithm = blocks.get("DESIGN", "")
     if r.partial:
         log_salvage(run, nc.id, r.text)
     run.log(f"solve.fresh candidate={nc.id} replaces={prev_cand.id} examples={len(nc.examples)}")
@@ -397,7 +397,7 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         ex_block = blocks.get("EXAMPLES", "")
         cand.examples = V.parse_examples(problem, ex_block)
         cand.examples_dropped = max(0, V.example_line_count(ex_block) - len(cand.examples))
-        cand.algorithm = blocks.get("ALGORITHM") or blocks.get("DESIGN", "")
+        cand.algorithm = blocks.get("DESIGN", "")
         if partial:
             log_salvage(run, cand.id, r_solve.text)
         run.log(f"solve.examples id={cand.id} parsed={len(cand.examples)} dropped={cand.examples_dropped}")

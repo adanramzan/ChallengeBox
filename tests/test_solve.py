@@ -11,7 +11,7 @@ def cfg():
             "phases": {"generate_until": 0.32, "gate_until": 0.39, "repair_until": 0.81, "settle_until": 0.93, "generate_call_share": 0.45, "repair_call_share": 0.25}, "profile": "fake"}
 
 # A SOLVE reply with no ===EXAMPLES=== block: the diff_examples gate step is then skipped.
-SOLVE_NO_EXAMPLES = "===RULES===\nr\n===END===\n===TRAPS===\nt\n===END===\n===ALGORITHM===\na\n===END===\n===CODE===\n```python\ndef add(a, b):\n    return a + b\n```\n===END===\n"
+SOLVE_NO_EXAMPLES = "===CODE===\n```python\ndef add(a, b):\n    return a + b\n```\n===END===\n===RULES===\nr\n===END===\n===TRAPS===\nt\n===END===\n"
 # Hand-traced examples, all with a < 15 so the planted a>=15 bug below is still caught by EDGES
 # (15, 0) at diff_edge rather than short-circuiting the gate at diff_examples.
 EXAMPLES_BLOCK = "===EXAMPLES===\n((0, 0), 0)\n((1, 2), 3)\n((3, 4), 7)\n===END===\n"
@@ -302,7 +302,7 @@ def test_write_solution_creates_missing_directories(tmp_path):
 def test_solve_falls_back_to_raw_reply_when_no_code_block_parsed(tmp_path):
     # A SOLVE reply with no ===CODE=== block at all must still produce a candidate (and a file) instead
     # of leaving the run with zero candidates.
-    NO_CODE = "===RULES===\nr\n===END===\n===TRAPS===\nt\n===END===\n===ALGORITHM===\na\n===END===\n"
+    NO_CODE = "===RULES===\nr\n===END===\n===TRAPS===\nt\n===END===\n===DESIGN===\nd\n===END===\n"
     llm = FakeLLM({"solve": [NO_CODE], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
     rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert rep["final_candidate"] == "c1"
@@ -932,13 +932,20 @@ def test_generator_prompts_require_reaching_the_bound(tmp_path):
     assert "to its bound at least once" in oracle and "to its bound at least once" in stress
     assert "at the maximum that mode allows" in oracle
 
-def test_solve_prompt_restates_the_rules_before_the_code(tmp_path):
-    # RULES is what catches a misreading, and it used to be written after the code -- so the model
-    # coded before it had read carefully. FakeLLM scripts parse by marker, so order is free to change.
+def test_solve_prompt_asks_a_thinking_model_for_the_code_first(tmp_path):
+    # A reasoning model reads in its reasoning tokens, so RULES and DESIGN before CODE are a second
+    # pass that costs 1-2k output tokens (30-60 s at measured rates) before the first line of code --
+    # in bench21 the code block had not closed at the 240 s cap and salvage recovered nothing. The
+    # blocks after CODE are a record of the thinking, not a plan for it. Parsing is by marker, so the
+    # order is a prompt decision only.
     rendered = S.render("solve", **S.prompt_vars(prob(tmp_path)))
     order = [m.group(1) for m in re.finditer(r"^===([A-Z]+)===$", rendered, re.M) if m.group(1) != "END"]
-    assert order == ["RULES", "DESIGN", "CODE", "EXAMPLES", "TRAPS", "ALGORITHM"]
-    assert "at most about 25 lines" in rendered
+    assert order == list(S.SOLVE_BLOCKS) == ["CODE", "EXAMPLES", "RULES", "DESIGN", "TRAPS"]
+    assert "ALGORITHM" not in rendered          # folded into DESIGN: one block, not two
+    assert "At most 15 numbered lines" in rendered and "At most 20 lines" in rendered
+    assert 'do not write "n/a" lines' in rendered
+    # the complexity rejection rule moved ahead of CODE with the block it used to live in
+    assert rendered.index("iterates a count or capacity") < rendered.index("===CODE===")
 
 
 # --- round 13: the fresh-solve path ---
@@ -947,9 +954,9 @@ def sumprob(tmp_path):
     return Problem("pid", "python", "Given a list xs of ints, return the sum of all its prefix sums.", "f", [], 300.0)
 
 SOLVE_QUADRATIC = ("===CODE===\ndef f(xs):\n    t = 0\n    for i in range(len(xs)):\n        t += sum(xs[:i + 1])\n    return t\n===END===\n"
-                   "===ALGORITHM===\nRe-sum the whole prefix at every index: quadratic in the length.\n===END===\n")
+                   "===DESIGN===\nRe-sum the whole prefix at every index: quadratic in the length.\n===END===\n")
 SOLVE_LINEAR = ("===CODE===\ndef f(xs):\n    t = 0\n    run = 0\n    for x in xs:\n        run += x\n        t += run\n    return t\n===END===\n"
-                "===ALGORITHM===\nOne running prefix sum, linear.\n===END===\n")
+                "===DESIGN===\nOne running prefix sum, linear.\n===END===\n")
 ORACLE_SUM = ("===ORACLE===\nimport random\ndef reference(xs):\n    return sum(sum(xs[:i + 1]) for i in range(len(xs)))\n"
               "def gen(seed, mode):\n    r = random.Random(seed)\n    return ([r.randint(0, 20) for _ in range(r.randint(0, 6))],)\n===END===\n")
 STRESS_BIG_LIST = "===STRESS===\ndef gen_max(seed):\n    return (list(range(20000)),)\nEDGES = [([],), ([5],)]\n===END===\n"
@@ -971,7 +978,7 @@ def test_a_timing_failure_starts_a_fresh_solve_that_can_win_emission(tmp_path):
     assert rep["fresh_solves"] == 1 and rep["repairs"] == 0   # never sent to the patch-style repair
     p2 = _prompts(llm, "solve_fresh")[0]   # a fresh solve is its own tag: it is a post-gate call
     assert "A previous solution to this statement failed" in p2
-    assert "Re-sum the whole prefix at every index" in p2       # the previous ALGORITHM block
+    assert "Re-sum the whole prefix at every index" in p2       # the previous DESIGN block
     assert "argument 1: type list; length 20000" in p2           # the input's shape...
     assert "19997, 19998, 19999" not in p2                         # ...never the input itself
     assert "measured duration" in p2 and "vs limit 0.2 s" in p2
@@ -1313,12 +1320,13 @@ class _PartialReplies(FakeLLM):
             return Reply(r.content, "", r.usage, r.latency_s, r.model, "timeout", True)
         return r
 
-# The solve prompt's order: what a cut-off reply keeps is RULES/DESIGN/CODE, what it loses is
-# EXAMPLES/TRAPS/ALGORITHM -- so diff_examples is skipped and every oracle-derived step still runs.
-SOLVE_CUT_IN_TRAPS = ("===RULES===\nr\n===END===\n===DESIGN===\nd\n===END===\n"
-                      "===CODE===\ndef add(a, b):\n    return a + b\n===END===\n"
+# The solve prompt's order: CODE comes first, so a cut-off reply keeps it and loses only the record
+# blocks after it -- here EXAMPLES is gone too, so diff_examples is skipped and every oracle-derived
+# step still runs.
+SOLVE_CUT_IN_TRAPS = ("===CODE===\ndef add(a, b):\n    return a + b\n===END===\n"
+                      "===RULES===\nr\n===END===\n===DESIGN===\nd\n===END===\n"
                       "===TRAPS===\nwatch out for over")
-SOLVE_CUT_IN_CODE = "===RULES===\nr\n===END===\n===DESIGN===\nd\n===END===\n===CODE===\ndef add(a, b):\n    ret"
+SOLVE_CUT_IN_CODE = "===CODE===\ndef add(a, b):\n    ret"
 
 def test_a_timed_out_solve_with_a_complete_code_block_is_gated(tmp_path):
     llm = _PartialReplies({"solve": [SOLVE_CUT_IN_TRAPS], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})

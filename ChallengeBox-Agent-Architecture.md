@@ -139,26 +139,34 @@ Serious reasoning calls take 20 to 90 seconds each. A sequential analyzer → ar
 
 ### 5.2 SOLVE call (strong model, one call)
 
-One structured response with six sections. Merging analysis and code into one call halves latency and keeps the analysis in the same context that writes the code, which is where it matters.
+One structured response with five sections. Merging analysis and code into one call halves latency and keeps the analysis in the same context that writes the code, which is where it matters.
 
 Required sections:
 
 In the order the prompt asks for them:
 
-1. **Rules** — a numbered restatement of every behavioral sentence in the statement, quoting the text, capped at about 25 lines. Ambiguities listed separately with the chosen reading.
-2. **Design** — state representation, the invariant per operation, complexity at the stated maxima, one hand trace of the hardest boundary, and an explicit rejection of any approach that iterates a huge bounded count or materializes an enormous structure.
-3. **Code** — in a fenced block with a fixed marker. The orchestrator extracts by marker, never by trusting prose.
-4. **Examples** — 3–5 hand-traced `(args, expected)` pairs, machine-readable (§5.2.1).
-5. **Traps** — for each constraint, what a naive approach would do and why it fails. The prompt lists the trap classes from §2.1 as a checklist the model must address one by one.
-6. **Algorithm** — data structures, complexity against the stated maximum sizes, overflow treatment, recursion treatment.
+1. **Code** — in a fenced block with a fixed marker. The orchestrator extracts by marker, never by trusting prose.
+2. **Examples** — 3–5 hand-traced `(args, expected)` pairs, machine-readable (§5.2.1).
+3. **Rules** — a numbered restatement of the behavioral sentences of the statement, quoting the text, at most 15 numbered lines with the ambiguities and their chosen readings among them.
+4. **Design** — state representation, the invariant per operation, complexity at the stated maxima, overflow and recursion treatment, and one hand trace of the hardest boundary, in at most ~20 lines.
+5. **Traps** — one line for each trap class from §2.1 that *actually applies*, saying what a naive approach would do and why it fails here. The classes that do not apply are skipped, not answered "n/a".
 
-RULES comes *before* CODE. The earlier "code first" ordering was measured against reasoning models that
-filled the token budget with prose before reaching the code; the configured strong model returns 2–4k
-tokens with no reasoning block, so a short quoted restatement first is affordable — and it is the
-restatement, not the code, that catches a misreading of the statement. The orchestrator parses by
-marker, so the order is a prompt decision only.
+CODE comes *first*, and the four blocks after it are a **record** of thinking already done, not a plan
+for it — the prompt's opening instruction is to think the statement, its rules and the cost of the
+approach through before writing anything, and it carries the complexity-rejection rule (reject an
+approach that iterates a huge bounded count, materializes an enormous structure, or recurses linearly
+in the input) ahead of the CODE block rather than inside a DESIGN block that now comes later.
 
-The prompt carries one optional section on top of those six, `{{previous_attempt}}`, which is empty
+RULES-before-CODE was the earlier order, chosen for a non-reasoning model so it would read before it
+coded. A reasoning model does that reading in its reasoning tokens, so the visible RULES and DESIGN
+blocks became a second pass costing 1–2k output tokens — 30–60 s at the measured rates — before the
+first line of code: in bench21 the CODE block had not closed at the 240 s cap and salvage (§8.2)
+recovered nothing. Putting CODE first also makes salvage strictly more likely to pay, since the block
+the gate cannot do without is the one written earliest. ALGORITHM, which overlapped DESIGN almost
+entirely, is folded into it: one block, not two. The orchestrator parses by marker (`parse_blocks` is
+order-independent), so the order is a prompt decision only.
+
+The prompt carries one optional section on top of those five, `{{previous_attempt}}`, which is empty
 for the concurrent generation calls and filled in only for a **fresh solve** (§5.7.1): the failed
 attempt's algorithm and code, and the concrete failure that ended it.
 
@@ -417,7 +425,7 @@ ended it (`solve.fresh_solve`, `[limits] max_fresh_solves`, default 1):
    inputs.
 
 The prompt is `solve.md` with its optional `{{previous_attempt}}` section filled in (it is empty
-everywhere else): the previous attempt's `===ALGORITHM===` block and its code, then the failure —
+everywhere else): the previous attempt's `===DESIGN===` block and its code, then the failure —
 input/expected/actual with the source of *expected* named for a differential failure, and for a
 timing failure the input's **shape** rather than the input (`verify.describe_input`: per argument,
 type, length, nesting depth, largest integer magnitude, and the operation-kind histogram when it is
@@ -524,7 +532,7 @@ ORACLE follows on the same evidence pointing the other way. The qwen-authored or
 
 **What a cut-off call really cost.** A stream abandoned at its timeout never reaches its usage chunk, and the only figure left is `len(buffer) // 4` — which ignores reasoning tokens entirely and is therefore wrong by an order of magnitude for a thinking model: bench17 and bench18 reported $0.12 between them while the key's usage rose by $0.32. An optional per-role `usage_lookup_url` (`https://openrouter.ai/api/v1/generation?id={id}` for OpenRouter; empty for every provider that has no such endpoint) closes it. When a call ends `partial`, or its stream carried no usage at all, and the first streamed chunk carried a generation `id`, `llm._lookup_usage` issues **one** GET with the call's own auth header, 10 s, never retried; its `total_cost` and token counts replace the estimate in the call record and the `estimated` flag comes off, and the run logs `cost.lookup id=… cost=…`. Any failure is ignored and the flagged estimate stands — a cost figure is a report line, never a control decision inside the call. The response is read leniently (`data` wrapper, `tokens_prompt` / `tokens_completion` / `total_cost`), so this stays a config field and not a branch on provider name.
 
-**Salvaging a cut-off reply.** Because the body is streamed, a call abandoned at its own `timeout_s` is not empty: whatever the model had already sent is in the caller's accumulator (one per attempt, so an abandoned thread can never write into a later call's buffer), and the reply comes back with `partial = True`, `error = "timeout"` and that text. Whether it is *usable* is a structural question, not a judgment: `llm.terminated_blocks` reports which blocks closed with their own `===END===`, and `llm.salvageable(reply)` accepts a partial reply only when `===CODE===` is one of them. The prompts are ordered for this — SOLVE puts RULES and DESIGN before CODE and EXAMPLES/TRAPS/ALGORITHM after it, REPAIR puts VERDICT before CODE — so a cut in the last blocks costs commentary, while a cut inside CODE leaves truncated source and is discarded (the raw-reply fallback is suppressed for a partial reply, or it would write that truncation out as the solution). A salvaged SOLVE reply is built into a candidate and gated normally, logs `solve.partial cand=… salvaged_blocks=[…] missing=[…]`, and sets the report's `solver_status` to `"partial"`; its missing EXAMPLES block simply skips the `diff_examples` step. Usage on such a call is whatever the stream reported before the cut; when no usage chunk arrived the tokens are estimated from the buffer length (≈4 characters per token) and the call record is flagged `estimated`, so no cost total reads it as measured. bench17 is what this is for: one Opus attempt spent 199.5 s of a 200 s cap, and the run shipped `no_candidate` with a complete solution in the discarded buffer.
+**Salvaging a cut-off reply.** Because the body is streamed, a call abandoned at its own `timeout_s` is not empty: whatever the model had already sent is in the caller's accumulator (one per attempt, so an abandoned thread can never write into a later call's buffer), and the reply comes back with `partial = True`, `error = "timeout"` and that text. Whether it is *usable* is a structural question, not a judgment: `llm.terminated_blocks` reports which blocks closed with their own `===END===`, and `llm.salvageable(reply)` accepts a partial reply only when `===CODE===` is one of them. The prompts are ordered for this — SOLVE asks for CODE first and EXAMPLES/RULES/DESIGN/TRAPS after it (§5.2), REPAIR puts VERDICT before CODE — so a cut in the later blocks costs only the record of the reasoning, while a cut inside CODE leaves truncated source and is discarded (the raw-reply fallback is suppressed for a partial reply, or it would write that truncation out as the solution). A salvaged SOLVE reply is built into a candidate and gated normally, logs `solve.partial cand=… salvaged_blocks=[…] missing=[…]`, and sets the report's `solver_status` to `"partial"`; its missing EXAMPLES block simply skips the `diff_examples` step. Usage on such a call is whatever the stream reported before the cut; when no usage chunk arrived the tokens are estimated from the buffer length (≈4 characters per token) and the call record is flagged `estimated`, so no cost total reads it as measured. bench17 is what this is for: one Opus attempt spent 199.5 s of a 200 s cap, and the run shipped `no_candidate` with a complete solution in the discarded buffer.
 
 ### 8.2 Levers
 

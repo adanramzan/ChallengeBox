@@ -336,10 +336,10 @@ def terminated_blocks(text: str) -> set[str]:
 
 def salvageable(reply) -> bool:
     """Whether a reply abandoned at its timeout still carries a usable solution: it is `partial` and
-    its ===CODE=== block closed. The SOLVE prompt puts RULES and DESIGN before CODE and
-    EXAMPLES/TRAPS/ALGORITHM after it, and the REPAIR prompt puts VERDICT before CODE, so what a
-    cut-off reply loses is commentary the gate does not need. A cut that landed inside CODE leaves
-    truncated source, which is not a candidate."""
+    its ===CODE=== block closed. The prompts are ordered for this -- SOLVE asks for CODE first and
+    EXAMPLES/RULES/DESIGN/TRAPS after it, REPAIR puts VERDICT before CODE -- so what a cut-off reply
+    loses is the record of the reasoning, which the gate does not need. A cut that landed inside CODE
+    leaves truncated source, which is not a candidate."""
     return bool(getattr(reply, "partial", False)) and "CODE" in terminated_blocks(reply.text)
 
 
