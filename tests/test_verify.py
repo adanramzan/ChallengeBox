@@ -1042,6 +1042,74 @@ def test_with_no_further_source_a_suspicious_stress_run_is_what_it_was(tmp_path)
     assert ev["stress"].passed and ev["stress"].skipped and ev["stress"].detail.get("suspicious")
 
 
+# --- round 14 batch 9: the stress author states the answer it expects on its own max-size input ---
+
+EXP_ORACLE = ("def reference(a, b):\n    return a + b\n"
+              "def gen(seed, mode):\n"
+              "    if mode == 'large':\n        return (10**18, 1)\n"
+              "    return (seed, 1)\n")
+EXP_LIMITS = {"cases_small": 5, "cases_medium": 2, "mem_mb": 2048,
+              "stress_limit_python_s": 5.0, "stress_limit_rust_s": 2.0}
+
+def _exp_stress(expected_line: str) -> str:
+    return "def gen_max(seed):\n    return (10**18, 10**18)\nEDGES = [(1, 1)]\n" + expected_line
+
+def test_expected_max_is_read_statically_and_only_as_literal_arithmetic():
+    assert V.expected_max(_exp_stress("EXPECTED_MAX = 2 * 10**18\n")) == 2 * 10**18
+    assert V.expected_max(_exp_stress('EXPECTED_MAX = "42\\n"\n')) == "42\n"
+    assert V.expected_max(_exp_stress("")) is V.NO_EXPECTED_MAX
+    # never obtained by running anything: a call, a name or an attribute is not read at all
+    for bad in ("EXPECTED_MAX = solve(gen_max(1))\n", "EXPECTED_MAX = LIMIT\n", "EXPECTED_MAX = sys.maxsize\n",
+                "EXPECTED_MAX = 1\nEXPECTED_MAX = 2\n"):   # ... and an ambiguous double assignment
+        assert V.expected_max(_exp_stress(bad)) is V.NO_EXPECTED_MAX, bad
+
+def test_a_wrong_expected_max_marks_the_evidence_suspicious_without_failing_the_candidate(tmp_path):
+    bad = V.stress(PY, GOOD, (2, 3), workdir=str(tmp_path / "a"), limit_s=5.0, mem_mb=2048, expected=99)
+    assert bad.passed and bad.skipped   # a skipped pass: not evidence, but never a failure of its own
+    assert bad.detail["expected_max_agree"] is False and bad.detail["suspicious"] == V.EXPECTED_MAX_MISMATCH_REASON
+    ok = V.stress(PY, GOOD, (2, 3), workdir=str(tmp_path / "b"), limit_s=5.0, mem_mb=2048, expected=5)
+    assert ok.passed and not ok.skipped and ok.detail["expected_max_agree"] is True and "suspicious" not in ok.detail
+
+def test_a_wrong_expected_max_falls_through_to_the_next_source(tmp_path):
+    # bench19: a legal 5.8 MB gen_max whose own off-by-one ended processing at operation 60,123, so
+    # the timing measured 30% of the input. Size and duration heuristics both pass it; the author's
+    # own stated answer is what catches it.
+    lines = []
+    gi = V.prepare_gate_inputs(PY, EXP_ORACLE, _exp_stress("EXPECTED_MAX = 999\n"), EXP_LIMITS,
+                               workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lines.append)
+    assert gi.stress_expected == 999 and gi.stress_source == "gen_max"
+    ev = {e.kind: e for e in V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=EXP_LIMITS, log=lines.append)}
+    assert any("stress.expected_max agree=False" in l for l in lines)
+    assert any("stress.fallthrough from=gen_max to=gen_large" in l for l in lines)
+    assert gi.stress_source == "gen_large"
+    assert "expected_max_agree" not in ev["stress"].detail   # the claim was about gen_max's input only
+
+def test_a_matching_expected_max_is_logged_and_changes_nothing(tmp_path):
+    lines = []
+    gi = V.prepare_gate_inputs(PY, EXP_ORACLE, _exp_stress("EXPECTED_MAX = 2 * 10**18\n"), EXP_LIMITS,
+                               workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lines.append)
+    ev = {e.kind: e for e in V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=EXP_LIMITS, log=lines.append)}
+    assert any("stress.expected_max agree=True" in l for l in lines)
+    assert not any("stress.fallthrough" in l for l in lines) and gi.stress_source == "gen_max"
+    assert ev["stress"].passed and not ev["stress"].skipped
+
+def test_no_expected_max_leaves_the_stress_step_exactly_as_it_was(tmp_path):
+    lines = []
+    gi = V.prepare_gate_inputs(PY, EXP_ORACLE, _exp_stress(""), EXP_LIMITS,
+                               workdir=str(tmp_path / "gi"), budget=FakeBudget(), log=lines.append)
+    assert gi.stress_expected is V.NO_EXPECTED_MAX
+    ev = {e.kind: e for e in V.run_gate(PY, GOOD, gi, workdir=str(tmp_path / "g"), budget=FakeBudget(), limits=EXP_LIMITS, log=lines.append)}
+    assert not any("stress.expected_max" in l for l in lines)
+    assert ev["stress"].passed and not ev["stress"].skipped and "expected_max_agree" not in ev["stress"].detail
+
+@needs_rustc
+def test_expected_max_for_rust_is_compared_as_stdout_text(tmp_path):
+    good = V.stress(RUST, RUST_SUM_I128, "3\n1 2 3\n", workdir=str(tmp_path / "a"), limit_s=5.0, mem_mb=2048, expected="6")
+    assert good.detail["expected_max_agree"] is True and not good.skipped   # token comparison: "6\n" vs "6"
+    bad = V.stress(RUST, RUST_SUM_I128, "3\n1 2 3\n", workdir=str(tmp_path / "b"), limit_s=5.0, mem_mb=2048, expected="7")
+    assert bad.detail["expected_max_agree"] is False and bad.passed and bad.skipped
+
+
 # --- round 14 batch 8: a linear bounds() lets a real max-size input count ---
 
 # validate() cannot finish on a max-size input, so every real one is unjudged and its timing never

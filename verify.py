@@ -42,6 +42,11 @@ class Evidence:
     detail: dict = field(default_factory=dict)
     skipped: bool = False
 
+# The STRESS author declined to say what its own max-size input should answer, or said it in a way
+# the restricted grammar does not accept. Distinct from None, which a reference could legitimately
+# return: the difference between "no claim" and "the claim is None".
+NO_EXPECTED_MAX = object()
+
 @dataclass
 class GateInputs:
     cases_small: list = field(default_factory=list)
@@ -54,6 +59,7 @@ class GateInputs:
     stress_source: str = ""   # gen_max | gen_large | medium_degraded -- which generator produced the timing input
     stress_validity: str = ""   # accepted | bounds_checked | unjudged -- what the oracle could say about the timing input
     stress_tried: list = field(default_factory=list)   # which of STRESS_SOURCES have already produced (or failed to produce) a timing input
+    stress_expected: object = NO_EXPECTED_MAX   # the STRESS author's own EXPECTED_MAX for gen_max(1) (set in prepare_stress_inputs)
     validate_trusted: bool = False   # the oracle's validate() accepted at least one generated input and was not distrusted
     input_skeleton: object = None   # the container shape the oracle's own gen() produces, per argument (see input_skeleton)
     validate_reject_frac: float = 0.0   # rejected/checked over small+medium: how far the oracle's validate() and gen() disagree
@@ -206,6 +212,30 @@ def parse_examples(problem, block_text: str) -> list[Case]:
             continue
         cases.append(Case(args, expected, "example"))
     return cases
+
+def expected_max(stress_src: str):
+    """The answer the STRESS author says its own `gen_max(1)` has, read out of the module's
+    `EXPECTED_MAX = <expr>` assignment. NO_EXPECTED_MAX when there is none, more than one, or the
+    expression is outside the grammar.
+
+    Read STATICALLY, with the hand-traced examples' restricted evaluator (_example_literal: literals
+    plus integer arithmetic, so `10**18` and `200000 * 10**18 + 1` are in and the magnitude caps
+    apply). Nothing is executed, and that is the point rather than a precaution: the one thing the
+    prompt forbids is obtaining the answer by running a solution, and a name, a call or an attribute
+    -- which is what that would have to look like -- is exactly what this grammar refuses. A module
+    that computes its expectation instead of stating it is therefore read as having stated nothing."""
+    try:
+        tree = ast.parse(stress_src)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return NO_EXPECTED_MAX
+    found = [n.value for n in tree.body if isinstance(n, ast.Assign)
+             and any(isinstance(t, ast.Name) and t.id == "EXPECTED_MAX" for t in n.targets)]
+    if len(found) != 1:
+        return NO_EXPECTED_MAX
+    try:
+        return _example_literal(found[0])
+    except (ValueError, TypeError, ZeroDivisionError, OverflowError, MemoryError, RecursionError):
+        return NO_EXPECTED_MAX
 
 def example_line_count(block_text: str) -> int:
     """How many expressions parse_examples actually looked at -- so `dropped` counts malformed ones,
@@ -1124,6 +1154,7 @@ def prepare_stress_inputs(problem, gi: GateInputs, stress_src: str, limits: dict
         return
     if stress_src.strip():
         stress_src = _STDLIB_PREAMBLE + stress_src
+        gi.stress_expected = expected_max(stress_src)
         edges = run_python_cases(stress_src + "\ndef _edges():\n    return list(EDGES)\n", "_edges", [()], workdir=os.path.join(workdir, "edges"), timeout_s=budget.step_timeout(60.0, reserve_s=20.0))
         if edges and edges[0].ok and isinstance(edges[0].output, list):
             cleaned_edges = [_clean_stdin(problem, s) for s in edges[0].output]
@@ -1166,7 +1197,10 @@ def prepare_gate_inputs(problem, oracle_src: str, stress_src: str, limits: dict,
 UNJUDGED_STRESS_REASON = ("max-size input could not be validated (reference did not finish); "
                           "timing is indicative only")
 
-def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, mem_mb: int, degraded: bool = False, min_plausible_s: float = 0.0, unjudged: bool = False, validity: str = "") -> Evidence:
+EXPECTED_MAX_MISMATCH_REASON = ("candidate's answer on the max-size input differs from the author's "
+                                "expected answer")
+
+def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, mem_mb: int, degraded: bool = False, min_plausible_s: float = 0.0, unjudged: bool = False, validity: str = "", expected=NO_EXPECTED_MAX) -> Evidence:
     if stress_input is None:
         return Evidence("stress", True, 0, 0.0, {"skipped": "no stress input"}, skipped=True)
     t0 = time.monotonic()
@@ -1202,6 +1236,25 @@ def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, 
         detail["degraded"] = UNJUDGED_STRESS_REASON
     elif degraded:
         detail["degraded"] = "gen_max failed; this is the largest medium case, not a true max-size input -- this timing is not a real max-size stress check"
+    # The STRESS author states the answer its own gen_max(1) should have (prompts/stress.md), derived
+    # by reasoning about the input it built. Agreement is not proof -- the author can be wrong, so
+    # this never fails a candidate on its own -- but DISAGREEMENT means one of the two is wrong about
+    # this input, and the likeliest cause by far is an input that does not do what its author
+    # believed. bench19's gen_max was inside every stated bound and carried 70,231 operations at
+    # 10^18, but one off-by-one emitted a duplicate operation at index 60,123; the statement's "stop
+    # at the first invalid operation" rule ended processing there and 139,877 operations -- the whole
+    # large section -- were never executed. The candidate answered in 0.012 s and nothing noticed,
+    # because `suspicious` was only a duration heuristic and 5.8 MB passes any size check. Generic
+    # over every early-exit shape, where a maximal input can terminate at item 1 and still weigh
+    # megabytes. A mismatch takes the same fall-through to the next source that a suspicious timing
+    # does; an existing `degraded` reason is more specific about the input and is not overwritten.
+    mismatch = False
+    if expected is not NO_EXPECTED_MAX and r.ok and not r.timed_out:
+        detail["expected_max_agree"] = agree = same(problem, r, expected)
+        if not agree:
+            mismatch = True
+            detail["suspicious"] = EXPECTED_MAX_MISMATCH_REASON
+            detail.setdefault("degraded", EXPECTED_MAX_MISMATCH_REASON)
     # An answer that arrives faster than any real work could is not a timing measurement, whatever
     # the input weighed. On bench14 gen_max's first operation named an identifier the input never
     # created, so the candidate rejected the whole 476 KB input at operation 1 in 0.000 s and the
@@ -1218,7 +1271,7 @@ def stress(problem, source: str, stress_input, *, workdir: str, limit_s: float, 
     # benchmark already treat as "not checked". A degraded run that was still too slow is kept as a
     # real failure -- too slow on a smaller-than-max input is only more damning.
     return Evidence("stress", passed or unjudged, 1, time.monotonic() - t0, detail,
-                    skipped=unjudged or ((degraded or suspicious) and passed))
+                    skipped=unjudged or ((degraded or suspicious or mismatch) and passed))
 
 def overflow_check(problem, binary: str | None, stress_input, *, limit_s: float, mem_mb: int) -> Evidence:
     """Reruns the max-size stress input on the OVERFLOW-CHECKED build (the one already compiled and
@@ -1376,8 +1429,14 @@ def run_gate(problem, source: str, gi: GateInputs, *, workdir: str, budget, limi
     if avail <= 0:
         e = Evidence("stress", True, 0, 0.0, {"skipped": "no budget"}, skipped=True)
     else:
+        # EXPECTED_MAX is a claim about gen_max(1) specifically, so it is only ever compared against
+        # that source's input -- a fall-through to gen(large) or a medium case is a different input
+        # and the author's answer says nothing about it.
         e = stress(problem, source, gi.stress_input, workdir=os.path.join(workdir, "stress"), limit_s=min(limit, avail), mem_mb=limits["mem_mb"], degraded=gi.stress_degraded,
-                   min_plausible_s=limits.get("stress_min_plausible_s", 0.0), unjudged=gi.stress_validity == "unjudged", validity=gi.stress_validity)
+                   min_plausible_s=limits.get("stress_min_plausible_s", 0.0), unjudged=gi.stress_validity == "unjudged", validity=gi.stress_validity,
+                   expected=gi.stress_expected if gi.stress_source == "gen_max" else NO_EXPECTED_MAX)
+        if "expected_max_agree" in e.detail:
+            log(f"stress.expected_max agree={e.detail['expected_max_agree']}")
         # A suspicious measurement is no measurement, and the suspect is the INPUT: the candidate
         # answered before any real work could have happened. An UNJUDGED one is no measurement
         # either -- nothing in the run could say the input was legal, so stress() recorded a skipped

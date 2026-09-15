@@ -17,6 +17,8 @@ Define `gen_max(seed: int)` returning {{gen_returns}}. Its purpose is to separat
 
 Allocate memory proportional to the input you return, never to a quantity the statement merely describes, such as a repetition count or capacity that can reach 10^18.
 
+**Also define `EXPECTED_MAX`: the exact answer the statement gives for `gen_max(1)`** — seed 1 is the call the architecture makes — meaning exactly what must come back from the solution: the return value for a Python entrypoint, the complete stdout text for a Rust program. This is optional and strongly wanted: it is the only thing that can catch an input which is perfectly legal, perfectly large, and still measures nothing because the solution stops a tenth of the way through it (one run's `gen_max` held 200 000 operations, an off-by-one made operation 60 123 invalid, the statement says to stop at the first invalid one, and the entire section the check existed for was never executed — in 0.012 seconds, on 5.8 MB). Derive it by reasoning about the input you just built: if you built it so that every operation is valid and the statement fixes the answer for that case, say what that makes it; if it is a large number that is expensive to write out, give the arithmetic rather than the digits. It must be a plain literal, or integer arithmetic over literals (`0`, `200000`, `10**18`, `200000 * 10**18 + 1`) — a name, a call, a comprehension or anything else is not read, and you must never obtain it by writing or running a solution. If you cannot derive it with confidence, leave `EXPECTED_MAX` out rather than guess: a candidate that disagrees with it is never failed for that alone, but a wrong expectation still throws away the timing measurement.
+
 Define `EDGES = [...]`, 5 to 10 literal inputs of the same shape: the minimum or empty case where one is allowed, a single element, repeats and ties, first and last positions, values sitting exactly at the stated numeric limits, and at least one case that separates the statement's literal wording from a plausible misreading of it.
 
 Every entry in `EDGES` must satisfy the statement's preconditions exactly as `gen_max`'s output does. A hand-typed literal is the single easiest place to break them, and an invalid edge case is worse than no edge case, because the comparison it produces is meaningless and it burns a repair attempt chasing a bug that is not there. Walk each entry against the preconditions before you emit it. In particular, never name an identifier, key or position the input itself never created, and never repeat a value in a collection the statement calls distinct.
@@ -34,7 +36,7 @@ An invalid input makes every later comparison meaningless, and it is the most co
 * Never assign to a name you also read inside the same function, and never to an imported module name. `random = random.Random(seed)` raises `UnboundLocalError`. Bind the generator to a fresh name such as `rng`.
 * Never draw from a possibly-empty range. Guard **every** `randrange`, `randint`, `choice` and `sample` call site — not just the obvious first one — so the range or sequence is non-empty at that exact point, and skip that step when it is not. An `IndexError` or `ValueError` from one unguarded draw buried deep in a loop is just as fatal as one in the first line.
 * `EDGES` must hold literal values, not calls that build them.
-* Nothing runs at import time except `import` statements, `def`s, and the `EDGES = [...]` literal. No module-level loops, asserts, or calls — a single failing assert at import discards both `gen_max` and `EDGES`. If you want to check `EDGES`, do it by hand before answering, not in code.
+* Nothing runs at import time except `import` statements, `def`s, and the `EDGES = [...]` and `EXPECTED_MAX = ...` literals. No module-level loops, asserts, or calls — a single failing assert at import discards both `gen_max` and `EDGES`. If you want to check `EDGES`, do it by hand before answering, not in code.
 * Never indent the contents of a multi-line string literal (e.g. a `"""..."""` block spanning several lines) to match the surrounding code. Every line after the first becomes part of the value verbatim, so indenting it adds leading whitespace the real input never has. Start continuation lines at column 0, or build the string with `"\n".join([...])` instead.
 
 The architecture will validate `gen_max()` and `EDGES` before timing a candidate. Build them from a running state model and ensure they satisfy argument preconditions; do not discard an operation merely because its specified result is the statement's invalid-operation result.
@@ -42,7 +44,7 @@ The architecture will validate `gen_max()` and `EDGES` before timing a candidate
 Respond with exactly one block:
 
 ===STRESS===
-python source defining gen_max and EDGES
+python source defining gen_max, EDGES and (if you can derive it) EXPECTED_MAX
 ===END===
 
 Problem statement:
