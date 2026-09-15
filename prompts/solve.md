@@ -2,7 +2,7 @@ You are solving a hard algorithmic problem. The statement below is the only spec
 
 Target language: {{language}}. Contract: {{contract}}
 
-Think the whole thing through before you write anything: the statement's rules, the trap list further
+Settle the approach quickly, weighing the statement's rules, the trap list further
 down, and the cost of your approach at the stated maxima. Reject, before the first line of code, any
 approach that iterates a count or capacity the statement bounds by a huge number, materializes or
 rescans a structure whose described size exceeds memory, or recurses to a depth proportional to the

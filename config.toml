@@ -224,7 +224,9 @@ repair = "strong"
 # prompt size" -- was measured with max_tokens at 12000, which the reasoning tokens spend before any
 # ===CODE=== block is written; the call then runs to its cap and returns nothing. Reasoning tokens
 # count against max_tokens, so the budget has to cover the thinking AND the answer: 24000 here, with
-# effort = "medium" rather than high so the thinking does not eat the deadline either.
+# effort = "low" even for the initial solve so the thinking does not eat the deadline either: at
+# medium the call on 5cb294c18288 was cut at 239.4s with no closed CODE block, after prior repeated
+# cutoffs around the 240s cap.
 [profiles.openrouter.strong]
 base_url = "https://openrouter.ai/api/v1"
 model = "anthropic/claude-opus-5"
@@ -243,7 +245,7 @@ stall_timeout_s = 45.0  # absolute: time-to-first-token is a network/model laten
 price_in_per_m = 5.0
 price_out_per_m = 25.0  # OpenRouter reports usage.cost and the client prefers it; these are the fallback
 omit_temperature = true  # Claude 5 takes no sampling temperature once thinking is on (same reason as [profiles.anthropic.strong])
-extra = { reasoning = { effort = "medium" } }
+extra = { reasoning = { effort = "low" } }
 # What a call really cost, asked of the provider when the stream was cut off before its usage chunk
 # arrived. The buffer estimate llm.py falls back to ignores reasoning tokens entirely, so a salvaged
 # thinking call under-reports by an order of magnitude: bench17 and bench18 reported $0.12 between

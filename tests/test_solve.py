@@ -933,6 +933,18 @@ def test_generator_prompts_require_reaching_the_bound(tmp_path):
     assert "at the maximum that mode allows" in oracle
 
 def test_solve_prompt_asks_a_thinking_model_for_the_code_first(tmp_path):
+    from llm import load_config
+
+    # The initial solve must ask OpenRouter's strong model for LOW reasoning
+    # effort, because the prompt demands code before prose.
+    strong = load_config("config.toml", "openrouter")["roles"]["strong"]
+    assert strong.extra["reasoning"]["effort"] == "low"
+
+    # ...and the prompt must not contradict itself by telling the model to
+    # think everything through before writing anything.
+    rendered = S.render("solve", **S.prompt_vars(prob(tmp_path)))
+    assert "Think the whole thing through before you write anything" not in rendered
+    assert S.SOLVE_BLOCKS[0] == "CODE"
     # A reasoning model reads in its reasoning tokens, so RULES and DESIGN before CODE are a second
     # pass that costs 1-2k output tokens (30-60 s at measured rates) before the first line of code --
     # in bench21 the code block had not closed at the 240 s cap and salvage recovered nothing. The
