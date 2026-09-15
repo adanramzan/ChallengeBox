@@ -216,8 +216,8 @@ repair = "strong"
 # scaffold -- a classifier false positive, the only difference from a prompt that passed being the
 # entrypoint NAME. Deterministic with reasoning.effort set (3 of 3), absent with the reasoning
 # parameter omitted (1 of 1), and not reproducible on anthropic/claude-sonnet-5 or
-# openai/gpt-5.6-terra. So solve.Run.chat retries once without reasoning and then once here.
-# Remove the key and there is no fallback: the refusal reply stands.
+# openai/gpt-5.6-terra. So solve.Run.chat retries once with the role's `refusal_extra` shape and
+# then once here. Remove the key and there is no fallback: the refusal reply stands.
 fallback = "fast"
 
 # Any OpenAI-compatible endpoint can be added as another [profiles.<name>.<role>] table.
@@ -255,6 +255,15 @@ price_in_per_m = 5.0
 price_out_per_m = 25.0  # OpenRouter reports usage.cost and the client prefers it; these are the fallback
 omit_temperature = true  # Claude 5 takes no sampling temperature once thinking is on (same reason as [profiles.anthropic.strong])
 extra = { reasoning = { effort = "low" } }
+# The request shape a REFUSED call is retried with, merged shallowly over `extra` so this `reasoning`
+# table REPLACES the one above for that one retry (solve.Run.chat's first rung). Measured live on the
+# prompt this model refuses: effort "low" refused 4 of 4 and "minimal" refused, so an effort rung is
+# not a rung at all; { max_tokens = 4000 } passed and { effort = "medium" } passed. Omitting the
+# reasoning key also passes the classifier, but it turns on ADAPTIVE thinking -- one live run at that
+# rung thought for the whole 239 s budget (4 449 tokens of reasoning summary, no content) and shipped
+# nothing. So a bounded token budget: it clears the classifier and keeps latency near low effort,
+# which is what the retry has to fit inside what is left of the deadline. No key here = no first rung.
+refusal_extra = { reasoning = { max_tokens = 6000 } }
 # What a call really cost, asked of the provider when the stream was cut off before its usage chunk
 # arrived. The buffer estimate llm.py falls back to ignores reasoning tokens entirely, so a salvaged
 # thinking call under-reports by an order of magnitude: bench17 and bench18 reported $0.12 between

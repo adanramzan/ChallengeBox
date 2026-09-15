@@ -235,12 +235,13 @@ class Run:
         # a false positive (the measured difference against a prompt that passed was the entrypoint
         # NAME), and deterministic -- 3 of 3 for anthropic/claude-opus-5 with reasoning.effort set,
         # so sending the same request again only burns the deadline. Two things cleared it when
-        # measured: dropping the reasoning parameter entirely (1 of 1 on the refused prompt), and a
-        # different model (neither claude-sonnet-5 nor gpt-5.6-terra refused). One call each, in
-        # that order, each bounded by what is left of this call's budget and by the cost cap.
-        if r.refused and not self.over_cost():
-            self.log(f"call.refused tag={tag} retry=no_reasoning")
-            r = self._send(role, tag, cap_s, prompt, no_reasoning=True)
+        # measured: a different request shape (the role's refusal_extra, which for the refused model
+        # is a bounded reasoning token budget), and a different model (neither claude-sonnet-5 nor
+        # gpt-5.6-terra refused). One call each, in that order, each bounded by what is left of this
+        # call's budget and by the cost cap. A role with no refusal_extra has no first rung.
+        if r.refused and self.has_refusal_extra(role) and not self.over_cost():
+            self.log(f"call.refused tag={tag} retry=refusal_extra")
+            r = self._send(role, tag, cap_s, prompt, refusal_retry=True)
         fb = (self.cfg.get("prompt_roles") or {}).get("fallback")
         known = getattr(self.llm, "roles", None)
         if r.refused and fb and fb != role and (known is None or fb in known) and not self.over_cost():
@@ -248,7 +249,14 @@ class Run:
             r = self._send(fb, tag, cap_s, prompt)
         return r
 
-    def _send(self, role: str, tag: str, cap_s: float, prompt: str, *, no_reasoning: bool = False):
+    def has_refusal_extra(self, role: str) -> bool:
+        """Whether this role configures a retry shape for a refused call. A client that carries no
+        role config at all (FakeLLM) is taken to have one, the same way the fallback rung takes an
+        unknown role table as no reason to skip itself."""
+        roles = getattr(self.llm, "roles", None)
+        return roles is None or bool(getattr(roles.get(role), "refusal_extra", None))
+
+    def _send(self, role: str, tag: str, cap_s: float, prompt: str, *, refusal_retry: bool = False):
         """One request. The refusal ladder above sends the same prompt through here more than once,
         and every attempt is bounded by the budget as it stands when it starts."""
         timeout = self.budget.step_timeout(min(cap_s, self.llm.roles[role].timeout_cap_s if hasattr(self.llm, "roles") else cap_s),
@@ -257,7 +265,7 @@ class Run:
         # The default request shape is the role's own config; only the refusal retry says otherwise,
         # and it says so by passing the flag at all.
         r = self.llm.chat(role, "You are a precise competitive-programming engineer.", prompt, timeout_s=timeout, tag=tag,
-                          **({"no_reasoning": True} if no_reasoning else {}))
+                          **({"refusal_retry": True} if refusal_retry else {}))
         self.save_reply(tag, prompt, r)
         self.log(f"{tag}.done error={r.error} latency={r.latency_s:.1f} usage={r.usage}")
         if getattr(r, "cost_lookup", None):

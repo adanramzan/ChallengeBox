@@ -50,6 +50,12 @@ class Role:
     # default) means there is nothing to ask and the buffer estimate stands. A provider difference,
     # so it lives here rather than in a branch in chat(); the response shape is read leniently.
     usage_lookup_url: str = ""
+    # The request shape a REFUSED call is retried with, merged over `extra` for that one retry (see
+    # solve.Run.chat). The merge is shallow, so a `reasoning` key here REPLACES the role's whole
+    # reasoning table rather than merging into it -- the point of the retry is that the two differ
+    # in kind, not in one field. Empty (the default) means this role has no first rung and a refusal
+    # goes straight to the fallback role.
+    refusal_extra: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -88,7 +94,8 @@ def load_config(path: str, profile: str) -> dict:
                         int(r.get("transport_retries", 2)), float(r.get("transport_backoff_s", 2.0)),
                         r.get("token_param", "max_tokens"), bool(r.get("omit_temperature", False)), float(r.get("price_in_per_m", 0.0)), float(r.get("price_out_per_m", 0.0)),
                         bool(r.get("stream", True)), float(r.get("stall_timeout_s", 30.0)),
-                        dict(r.get("tag_extra", {})), float(r.get("repair_cap_s", 0.0)), r.get("usage_lookup_url", ""))
+                        dict(r.get("tag_extra", {})), float(r.get("repair_cap_s", 0.0)), r.get("usage_lookup_url", ""),
+                        dict(r.get("refusal_extra", {})))
              for name, r in prof.items()}
     # `roles` is the per-role model config above; `prompt_roles` is the [roles] table -- which model
     # role each PROMPT is sent to (solve.PROMPT_ROLES holds the defaults when it is absent). Two
@@ -233,15 +240,15 @@ class LLM:
         for key, n in limits.items():
             self._sems[key] = threading.Semaphore(n)
 
-    def chat(self, role: str, system: str, user: str, *, timeout_s: float, max_tokens: int | None = None, tag: str = "", no_reasoning: bool = False) -> Reply:
+    def chat(self, role: str, system: str, user: str, *, timeout_s: float, max_tokens: int | None = None, tag: str = "", refusal_retry: bool = False) -> Reply:
         r = self.roles[role]
         limit = max_tokens or r.max_tokens
         extra = {**r.extra, **r.tag_extra[tag]} if tag in r.tag_extra else r.extra
-        if no_reasoning:
-            # The one request-shape change a refusal retry makes (see solve.Run.chat): the same
-            # prompt that was refused with reasoning.effort set was answered with the parameter
-            # absent. Sending effort = "none" is not the same request and was not what was measured.
-            extra = {k: v for k, v in extra.items() if k != "reasoning"}
+        if refusal_retry:
+            # The one request-shape change a refusal retry makes (see solve.Run.chat). Shallow on
+            # purpose: refusal_extra's `reasoning` replaces the role's whole reasoning table, so the
+            # retry cannot inherit the effort that was refused.
+            extra = {**extra, **r.refusal_extra}
         body = {"model": r.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 r.token_param: limit, "temperature": 0.2, "stream": r.stream,
                 **({"stream_options": {"include_usage": True}} if r.stream else {}), **extra}
@@ -436,11 +443,11 @@ class FakeLLM:
         if cost is not None:
             self.usage["cost"] = cost   # lets a test drive Run.cost_usd() past the cap
 
-    def chat(self, role: str, system: str, user: str, *, timeout_s: float, max_tokens: int | None = None, tag: str = "", no_reasoning: bool = False) -> Reply:
+    def chat(self, role: str, system: str, user: str, *, timeout_s: float, max_tokens: int | None = None, tag: str = "", refusal_retry: bool = False) -> Reply:
         with self._lock:
             key = tag if tag in self.script else role
             assert self.script.get(key), f"FakeLLM: no scripted reply left for {key!r} (tag={tag!r}, role={role!r})"
             text = self.script[key].pop(0)
             self.prompts.append((role, system, user))
-            self.calls.append({"role": role, "tag": tag, "model": "fake", "latency_s": 0.0, "usage": dict(self.usage), "error": None, "timed_out": False, "no_reasoning": no_reasoning})
+            self.calls.append({"role": role, "tag": tag, "model": "fake", "latency_s": 0.0, "usage": dict(self.usage), "error": None, "timed_out": False, "refusal_retry": refusal_retry})
         return Reply(text, "", dict(self.usage), 0.0, "fake", None)

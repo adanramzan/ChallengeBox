@@ -336,7 +336,12 @@ def test_config_gives_the_thinking_role_per_tag_efforts_and_a_repair_cap():
     assert strong.tag_extra == {"repair": {"reasoning": {"effort": "low"}},
                                 "solve_fresh": {"reasoning": {"effort": "low"}}}
     assert strong.repair_cap_s == 120.0
+    # The refusal retry's shape: a BOUNDED reasoning budget, not an effort (low and minimal are both
+    # refused on the prompt this fires for) and not an absent reasoning key (that means adaptive
+    # thinking, which spent a whole 239 s budget live and returned nothing).
+    assert list(strong.refusal_extra) == ["reasoning"] and "max_tokens" in strong.refusal_extra["reasoning"]
     assert load_config(str(ROOT / "config.toml"), "openai")["roles"]["strong"].tag_extra == {}
+    assert load_config(str(ROOT / "config.toml"), "openai")["roles"]["strong"].refusal_extra == {}
 
 def test_config_carries_the_prompt_to_role_mapping():
     cfg = load_config(str(ROOT / "config.toml"), "openrouter")
@@ -582,11 +587,16 @@ def test_a_refusal_is_not_retried_and_is_reported_as_one(planned):
     assert not r.text and _Handler.requests == 1
     assert llm.calls[-1]["refused"] and llm.calls[-1]["error"] == r.error
 
-def test_no_reasoning_drops_only_the_reasoning_extra(planned):
+def test_a_refusal_retry_replaces_the_reasoning_extra_and_keeps_the_rest(planned):
+    # The merge is shallow: refusal_extra's `reasoning` stands in for the whole table the tag_extra
+    # would otherwise send, so the retry cannot inherit the effort that was refused. Keys the role
+    # sets outside `reasoning` are untouched -- only the request's reasoning shape changes.
     role = Role("strong", planned, "m", "", 100, 1, 30.0, {"reasoning": {"effort": "low"}, "usage": {"include": True}},
-                tag_extra={"solve": {"reasoning": {"effort": "high"}}})
+                tag_extra={"solve": {"reasoning": {"effort": "high"}}},
+                refusal_extra={"reasoning": {"max_tokens": 6000}})
     llm = LLM({"strong": role})
-    llm.chat("strong", "s", "u", timeout_s=30.0, tag="solve", no_reasoning=True)
-    assert "reasoning" not in _Handler.last_body and _Handler.last_body["usage"] == {"include": True}
+    llm.chat("strong", "s", "u", timeout_s=30.0, tag="solve", refusal_retry=True)
+    assert _Handler.last_body["reasoning"] == {"max_tokens": 6000}   # replaced, not merged with effort
+    assert _Handler.last_body["usage"] == {"include": True}
     llm.chat("strong", "s", "u", timeout_s=30.0, tag="solve")
     assert _Handler.last_body["reasoning"] == {"effort": "high"}
