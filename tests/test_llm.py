@@ -344,7 +344,9 @@ def test_config_carries_the_prompt_to_role_mapping():
     # (anthropic/claude-sonnet-5) rather than a non-reasoning coder. Preparation cannot start before
     # the ORACLE reply lands, and in bench21 the strong role's oracle at low effort took 155 s -- so
     # the oracle's author has to read the statement AND return in well under the solve's 152-240 s.
-    assert cfg["prompt_roles"] == {"solve": "strong", "oracle": "fast", "stress": "fast", "repair": "strong"}
+    # `fallback` is the table's odd one out: not a prompt, but the role a REFUSED call is retried on.
+    assert cfg["prompt_roles"] == {"solve": "strong", "oracle": "fast", "stress": "fast", "repair": "strong",
+                                   "fallback": "fast"}
     assert set(cfg["prompt_roles"].values()) <= set(cfg["roles"])   # every mapped role exists in the profile
     fast = cfg["roles"]["fast"]
     assert fast.extra == {"reasoning": {"effort": "low"}} and fast.omit_temperature

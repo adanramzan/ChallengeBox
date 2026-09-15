@@ -18,3 +18,10 @@ def test_config_has_openrouter_roles_and_cost_cap():
     assert 0 < cfg["limits"]["max_cost_usd_per_problem"] <= 2.0
     assert cfg["limits"]["safety_margin_s"] > 0
     assert cfg["phases"]["generate_until"] < cfg["phases"]["repair_until"] < cfg["phases"]["settle_until"] < 1
+
+def test_roles_fallback_names_a_role_every_profile_has():
+    # A refusal falls back to this role (solve.Run.chat); a typo here would silently mean "no
+    # fallback" for the profile that lacks it.
+    cfg = tomllib.loads((ROOT / "config.toml").read_text())
+    fb = cfg["roles"].get("fallback")
+    assert fb is None or all(fb in prof for prof in cfg["profiles"].values())

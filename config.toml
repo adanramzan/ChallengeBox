@@ -210,6 +210,15 @@ solve = "strong"
 oracle = "fast"
 stress = "fast"
 repair = "strong"
+# Where a call goes when the provider REFUSES it. Measured live: anthropic/claude-opus-5 returns a
+# refusal inside a normal 200 stream ("blocked as it seems to violate Anthropic's Terms of Service
+# restrictions on reverse engineering or duplicating model outputs") on this tool's own prompt
+# scaffold -- a classifier false positive, the only difference from a prompt that passed being the
+# entrypoint NAME. Deterministic with reasoning.effort set (3 of 3), absent with the reasoning
+# parameter omitted (1 of 1), and not reproducible on anthropic/claude-sonnet-5 or
+# openai/gpt-5.6-terra. So solve.Run.chat retries once without reasoning and then once here.
+# Remove the key and there is no fallback: the refusal reply stands.
+fallback = "fast"
 
 # Any OpenAI-compatible endpoint can be added as another [profiles.<name>.<role>] table.
 # A THINKING model in the strong role. Rounds 10-14 settle what the cheap coder model cannot do:

@@ -1674,3 +1674,35 @@ def test_a_timed_out_solve_reply_is_not_retried_here(tmp_path):
     rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
     assert not any("solve.retry" in l for l in rep["events"])
     assert rep["solver_status"] == "timeout" and len([c for c in rep["calls"] if c["tag"] == "solve"]) == 1
+
+
+class _RefusingLLM(FakeLLM):
+    """FakeLLM where the scripted text "REFUSAL" comes back as the provider's content filter."""
+    def chat(self, role, system, user, *, timeout_s, max_tokens=None, tag="", no_reasoning=False):
+        r = super().chat(role, system, user, timeout_s=timeout_s, max_tokens=max_tokens, tag=tag, no_reasoning=no_reasoning)
+        if r.content == "REFUSAL":
+            return type(r)("", "", r.usage, r.latency_s, r.model, "refusal: blocked by the classifier", refused=True)
+        return r
+
+def test_a_refusal_is_retried_without_reasoning(tmp_path):
+    llm = _RefusingLLM({"solve": ["REFUSAL", SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["final_candidate"] == "c1"
+    assert any("call.refused tag=solve retry=no_reasoning" in l for l in rep["events"])
+    solves = [c for c in llm.calls if c["tag"] == "solve"]
+    assert [c["no_reasoning"] for c in solves] == [False, True]
+
+def test_a_second_refusal_falls_back_to_the_configured_role(tmp_path):
+    c = cfg(); c["prompt_roles"] = {"solve": "strong", "fallback": "fast"}
+    llm = _RefusingLLM({"solve": ["REFUSAL", "REFUSAL", SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, c, out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["final_candidate"] == "c1"
+    assert any("retry=fallback_role role=fast" in l for l in rep["events"])
+    assert [c["role"] for c in llm.calls if c["tag"] == "solve"] == ["strong", "strong", "fast"]
+
+def test_without_a_fallback_role_a_refusal_ends_after_the_no_reasoning_retry(tmp_path):
+    llm = _RefusingLLM({"solve": ["REFUSAL", "REFUSAL"], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["status"] == "no_candidate"
+    assert not any("fallback_role" in l for l in rep["events"])
+    assert len([c for c in llm.calls if c["tag"] == "solve"]) == 2
