@@ -665,9 +665,28 @@ def solve(problem: Problem, llm, cfg: dict, *, out_path: str, run_dir: str, dead
         # is waiting on anything but the candidate itself.
         attempt_no = {f: i + 1 for i, f in enumerate(f_solves)}
         r_solves = []
+        solve_retried = False
         for f in as_completed(f_solves):
             r_solves.append(f.result())
             cand = build_candidate(r_solves[-1], attempt_no[f])
+            # A reply that came back carrying no code at all is the same bet the oracle retry makes:
+            # the call answered, it just answered with nothing, so asking again is cheap and the only
+            # move left. A live run got an empty streamed reply back in 2.5 s and shipped no_candidate
+            # with 236 s unused. It is specifically a reply with no closed ===CODE=== block that is
+            # worth another call: an attempt dropped as a DUPLICATE carried perfectly good code and
+            # the run already has that candidate. Two more never come here: a reply cut off by its
+            # TIMEOUT (salvage already had it, and a second call would run to the same cap) and a
+            # REFUSED one (Run.chat has already climbed its own ladder, and a refusal repeats).
+            if cand is None and not solve_retried and not gate_crashed and r_solves[-1].error != "timeout" \
+                    and not r_solves[-1].refused and "CODE" not in terminated_blocks(r_solves[-1].text):
+                need = fresh_solve_cap(cfg, run.budget) + gate_pass_estimate(cfg, run.budget)
+                if run.budget.can_afford(need) and not run.over_cost():
+                    solve_retried = True
+                    run.log("solve.retry reason=no_block, retrying once")
+                    r_solves.append(run.chat(run.role("solve"), "solve", fresh_solve_cap(cfg, run.budget), **pv))
+                    cand = build_candidate(r_solves[-1], attempt_no[f])
+                else:
+                    run.log(f"solve.retry skipped reason=budget need={need:.0f} remaining={run.budget.remaining():.0f}")
             if cand is None or prep_error is not None or gate_crashed:
                 continue   # a timed-out or empty reply produces no candidate; a crashed prep gates nothing
             try:

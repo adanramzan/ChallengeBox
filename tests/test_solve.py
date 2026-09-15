@@ -1640,3 +1640,37 @@ def test_config_ships_afford_thresholds_a_fast_oracle_can_meet():
     import tomllib
     lim = tomllib.loads((pathlib.Path(S.__file__).parent / "config.toml").read_text())["limits"]
     assert lim["oracle_retry_afford_s"] == 60.0 and lim["oracle_selfrepair_afford_s"] == 60.0
+
+
+# --- a SOLVE reply that carried no code, and a provider refusal ---
+
+def test_solve_reply_with_no_code_is_retried_once(tmp_path):
+    # A live run got an empty streamed reply back in 2.5 s, built no candidate and sat out the
+    # remaining 236 s. The call answered; it just answered with nothing, so ask once more.
+    llm = FakeLLM({"solve": ["", SOLVE_OK], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert rep["final_candidate"] == "c1" and (tmp_path / "s.py").read_text().startswith("def add")
+    assert any("solve.retry reason=no_block" in l for l in rep["events"])
+    assert len([c for c in rep["calls"] if c["tag"] == "solve"]) == 2
+
+def test_solve_retry_does_not_fire_when_the_budget_cannot_afford_it(tmp_path):
+    class TightClock:
+        t = 0.0
+        def __call__(self):
+            TightClock.t += 200.0   # burns past the 285 s usable budget almost immediately
+            return TightClock.t
+    llm = FakeLLM({"solve": [""], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"), clock=TightClock())
+    assert not any("solve.retry reason=no_block" in l for l in rep["events"])
+    assert rep["status"] == "no_candidate" and len([c for c in rep["calls"] if c["tag"] == "solve"]) == 1
+
+def test_a_timed_out_solve_reply_is_not_retried_here(tmp_path):
+    # Salvage owns a cut-off reply, and a second call would only run to the same cap.
+    class _TimedOutSolve(FakeLLM):
+        def chat(self, role, system, user, *, timeout_s, max_tokens=None, tag="", no_reasoning=False):
+            r = super().chat(role, system, user, timeout_s=timeout_s, max_tokens=max_tokens, tag=tag, no_reasoning=no_reasoning)
+            return type(r)("", "", r.usage, r.latency_s, r.model, "timeout") if tag == "solve" else r
+    llm = _TimedOutSolve({"solve": [""], "oracle": [ORACLE_OK], "stress": [STRESS_OK]})
+    rep = S.solve(prob(tmp_path), llm, cfg(), out_path=str(tmp_path / "s.py"), run_dir=str(tmp_path / "run"))
+    assert not any("solve.retry" in l for l in rep["events"])
+    assert rep["solver_status"] == "timeout" and len([c for c in rep["calls"] if c["tag"] == "solve"]) == 1
