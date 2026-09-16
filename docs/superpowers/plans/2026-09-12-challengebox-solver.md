@@ -41,7 +41,7 @@ User decisions already made: OpenRouter only; pure-config roles (`strong`, `fast
 - Model output is never trusted as code without passing `sandbox.python_static` / `sandbox.rust_static`.
 - Deadline: `Budget` uses `time.monotonic()`; every model call and subprocess gets `budget.step_timeout(cap)`. Emission happens before `deadline_s * scale - safety_margin_s`.
 - Rust compile flags: gate build `rustc --edition 2021 -O -C overflow-checks=on`; stress build `-C overflow-checks=off`. Output compared as `str.split()` token lists (Python's `split()` with no argument splits on exactly the judge's ASCII whitespace set).
-- Commit after every task with a conventional message. Never commit `runs/` or API keys.
+- Commit after every task with a conventional message — no attribution trailers (no `Co-Authored-By`, no `Claude-Session`, no "Generated with Claude Code"). **Never push.** Never commit `runs/` or API keys.
 
 ---
 

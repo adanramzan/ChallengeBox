@@ -2,7 +2,7 @@
 
 **See [`SOLVER.md`](SOLVER.md) for setup and usage.** This document is the design rationale.
 
-**Status:** implementation-ready
+**Status:** implemented and test-covered; live-model quality remains provider/model dependent
 **Deliverable:** a runnable tool: `python solve.py <problem.json> -o <solution file>`
 **Scope:** one week, one developer
 
@@ -72,7 +72,7 @@ Every sample is a state machine or simulation with a literal, small-scale interp
 4. **Speed is a gate, not an audit.** Every candidate runs on a generated maximum-size input under a wall-clock limit before it can be finalized.
 5. **The deadline is a clock, not a prompt.** A monotonic budget controller assigns every model call and every subprocess a timeout derived from time remaining.
 6. **Few calls, run in parallel.** Roughly five serious model calls fit in 300 seconds. Independent calls are issued concurrently.
-7. **Lazy plumbing.** One provider, one CLI command, five source files. Effort goes into verification, not scaffolding.
+7. **Lazy plumbing.** One OpenAI-compatible client, one CLI, four Python modules, and one config file. Effort goes into verification, not scaffolding.
 
 ---
 
@@ -82,8 +82,8 @@ Every sample is a state machine or simulation with a literal, small-scale interp
 flowchart TD
     A["problem JSON"] --> B["intake + contract"]
     B --> C1["SOLVE call (strong model)<br/>analysis + traps + algorithm + code"]
-    B --> C2["ORACLE call (strong model, low effort)<br/>literal Python reference + small-input generator"]
-    B --> C3["STRESS call (strong model, low effort)<br/>max-size input generator + edge-case list"]
+    B --> C2["ORACLE call (fast role, low effort)<br/>literal Python reference + small-input generator"]
+    B --> C3["STRESS call (fast role, low effort)<br/>max-size input generator + edge-case list"]
     C1 --> G["deterministic gate"]
     C2 --> G
     C3 --> G
@@ -102,20 +102,18 @@ The three generation calls run concurrently, and preparation of the gate's input
 
 Usable time is `deadline_s` minus a 15-second safety margin. Phases are expressed as percentages so other deadlines scale.
 
-| Window (s) | Share | Phase | Allowed |
+| Relative usable time | 300 s example | Phase | Actual rule |
 |---:|---:|---|---|
-| 0–5 | 2% | intake | parse, validate, build contract, start clock |
-| 5–95 | 30% | generate | three concurrent model calls — since they run concurrently, the phase costs max() of the three, not their sum, so each can get most of the phase rather than a third of it. The ORACLE and STRESS calls are capped at `[phases].generate_call_share` (config.toml, default 0.70) of usable time. The SOLVE call is capped at `usable × (1 − [limits].solve_reserve_frac)` (0.84, ≈240 s here) instead: at `solve_attempts = 1` it is the only call that can produce an answer, so its ceiling is everything except what a gate pass and emission need. Role caps underneath: strong 240 s, fast 150 s |
-| 95–115 | 7% | gate | compile, contract checks, differential, stress |
-| 115–235 | 40% | repair | up to two shrink → repair → gate cycles, each capped at `verify.repair_cap` and started only while that cap plus one gate pass (`[limits].gate_pass_frac`, 0.21 of usable ≈ 60 s here) still fits, plus at most one fresh solve (§5.7) under the same rule with the generate cap |
-| 235–270 | 12% | settle | no new model calls; the last gate result stands; write report |
-| 270–285 | 5% | emit | write the solution file atomically |
-| 285–300 | 5% | margin | reserved; never scheduled |
+| 0–0.32 | 0–91 s | generate | intake runs at the start; SOLVE, ORACLE, and STRESS are submitted concurrently. ORACLE/STRESS use `[phases].generate_call_share` (0.70) and SOLVE uses `1 − [limits].solve_reserve_frac` (0.84) of usable time. Role caps still apply: strong 240 s, fast 150 s. |
+| 0.32–0.39 | 91–111 s | gate | compile/import, contract, differential, behavior, stress, and overflow steps run while their grants and remaining budget permit. |
+| 0.39–0.81 | 111–231 s | repair | semantic and syntax repair loops may run; each repair/fresh solve must fit its call cap plus one gate-pass estimate. |
+| 0.81–0.93 | 231–265 s | settle | no new repair or fresh-solve call; the last gate result stands and the report is assembled. |
+| 0.93–1.00 | 265–285 s | emit | report is written before the selected solution is written atomically. The final 15 s is the safety margin outside usable time. |
 
 bench17 is why the SOLVE call has its own rule: one Opus attempt was capped at 200 s (0.70 × 285 s usable), timed out at 199.5 s, and the run shipped `no_candidate` with 85 s of budget unused. A share of the phase is the right shape for the two measuring calls, which stopped being on the critical path once preparation began overlapping the solver (§5.3); it is the wrong shape for the one call the run cannot do without. The role's own `timeout_cap_s` still applies underneath — `Run.chat` takes the min() — which is where a model's measured ceiling belongs, and a call clipped at that cap now still yields its code when `===CODE===` was emitted (§8.1, salvaging a cut-off reply).
 
-The windows above are advisory, not enforced boundaries: the only phase cutoff the orchestrator
-actually checks is the repair loop's (it will not start another repair once `Budget.phase()` has left
+The phase boundaries above are advisory for gate work, not hard stops: the orchestrator explicitly
+checks the repair loop's phase (it will not start another repair once `Budget.phase()` has left
 `repair`). What guarantees the deadline is `step_timeout` — every model call and every subprocess is
 capped at the remaining time minus a reserve — plus the `safety_margin_s` that is subtracted from
 `deadline_s` before any of this arithmetic, not the phase table. That is deliberate: enforcing the
@@ -157,7 +155,7 @@ What stays in **absolute seconds** is what does not scale with the deadline, eac
 
 ### 4.2 Why this fits
 
-Serious reasoning calls take 20 to 90 seconds each. A sequential analyzer → architect → judge → coder → critic → tester → repairer chain is seven calls before the first verified candidate and does not fit. This design issues three calls at once, then spends the remaining time on deterministic checks and at most two repairs. Worst case is five model calls plus one optional adjudication call and one optional fresh solve.
+Serious reasoning calls can consume most of the deadline. The implementation therefore submits the three initial roles concurrently, gates SOLVE replies as they arrive, and spends remaining time on deterministic checks and bounded optional work. The default is one SOLVE attempt, one ORACLE, one STRESS, up to two semantic repairs plus two syntax repairs, and at most one fresh solve; transport retries, refusal fallbacks, no-block retries, oracle self-repair, and oracle adjudication can add requests when their budget/cost checks allow them.
 
 ---
 
@@ -276,7 +274,12 @@ outside evidence saying which of the two references was wrong.
 This is the generic replacement for a sample-specific smoke check that briefly existed and was deleted: it
 scores on every problem rather than one, and it costs no extra model call.
 
-### 5.3 ORACLE call (strong model at low effort, concurrent)
+`llm.parse_blocks` is deliberately forgiving at the boundary: it takes the last occurrence of a marker,
+extracts the longest fenced body, removes an unmatched fence and a bare leading `python`/`rust` line, and
+lets an unterminated block run to end-of-reply. `terminated_blocks` separately records only blocks with their
+own `===END===`; `salvageable` accepts a timed-out reply only when its `===CODE===` block is closed.
+
+### 5.3 ORACLE call (fast role at low effort, concurrent)
 
 Produces three Python functions in one response:
 
@@ -286,7 +289,7 @@ Produces three Python functions in one response:
 
 The oracle is Python for both target languages. For Rust problems this gives a second language and free big integers, which removes the risk that oracle and candidate share an overflow.
 
-The oracle writes the largest output of the three concurrent calls (three functions, not one), so it is reliably the slowest and the one most likely to hit its timeout. If the first attempt returns no `===ORACLE===` block at all (a timeout, most often), the orchestrator retries the ORACLE call exactly once — a local counter, not a `GateInputs` field — guarded by `budget.can_afford(130)` (the measured worst-case oracle latency is 128 s) so the retry never fires this close to the deadline. This is independent of `regenerate_oracle` (§5.7), which reissues the oracle for two different reasons, each with its own separate one-shot counter (§5.3.1 and §5.7). **The SOLVE call has the same one-shot retry**, for the same reason: a reply that came back carrying no closed `===CODE===` block produced no candidate at all, and a live run got an empty streamed reply in 2.49 s and then sat out its remaining 236 s. It fires once per run (`solve.retry reason=no_block`) while `budget.remaining()` covers a generate-capped call plus one gate pass, and never for a reply that timed out (salvage owns that one, and a second call would run to the same cap) or that was refused (§8.1 climbs its own ladder for those).
+The oracle writes the largest output of the three concurrent calls (three functions, not one), so it is reliably the slowest and the one most likely to hit its timeout. If the first attempt returns no `===ORACLE===` block at all (a timeout or empty reply), the orchestrator retries it at most once. A timeout retry requires the configured oracle role's timeout cap plus the configured repair affordance; a non-timeout missing-block retry uses `oracle_afford_s()` and `oracle_retry_afford_s`, both bounded by remaining budget and the cost cap. This is independent of `regenerate_oracle` (§5.7), which reissues the oracle for self-repair and adjudication with separate one-shot counters (§5.3.1 and §5.7). **The SOLVE call has the same one-shot no-block retry**, while its budget covers a fresh-solve-sized call plus one gate pass; it does not retry a timeout (salvage owns that case) or a refusal (the refusal ladder handles it).
 
 Before any generated oracle or stress source is executed, a fixed preamble — `import random, math, itertools, collections, string, heapq, bisect` — is prepended to it. The prompt tells the model to *use* `random.Random(seed)` but never explicitly tells it to import anything, and one live run produced a module with no imports at all, whose `gen()` died with `NameError`. A duplicate import is harmless if the model already wrote one. The preamble is prepended to the exact string that gets written to disk as that run's `cand.py`, so any traceback line number always matches what's actually sitting in the run directory — it only differs from the raw LLM completion's own line count.
 
@@ -316,7 +319,7 @@ When the oracle is unusable and the budget can still afford one more oracle-shap
 
 This has its **own one-shot counter**, `GateInputs.oracle_selfrepairs`, entirely independent of `oracle_regens` (§5.7's adjudication counter) — `regenerate_oracle` takes a `counter` argument naming which field to increment, so the two recovery paths never share a budget. A run can recover from a broken oracle early on via self-repair and still adjudicate a genuine candidate/oracle disagreement later via the repair loop; both can fire, once each, in the same run. Both counts are reported (`oracle_selfrepaired`, `oracle_regenerated`), and the trigger is logged distinctly (`oracle.selfrepair ...`) so it's visible in `report.json`'s `events` separately from an adjudication regeneration (`oracle.regen ...`).
 
-### 5.4 STRESS call (strong model at low effort, concurrent)
+### 5.4 STRESS call (fast role at low effort, concurrent)
 
 Produces `gen_max(seed)` — one input at every stated maximum simultaneously (max N, max Q, max values, max nesting, deepest recursion path, worst-case operation mix), plus a short list of hand-picked edge cases as literal inputs.
 
@@ -479,7 +482,7 @@ wrong in the same way, and every repair was a variant of the same approach (G4).
 
 ### 5.8 Finalize
 
-The finalizer picks the candidate that passed the most gate steps, then the fewest mismatches and failures, then — among candidates whose evidence is otherwise identical, which is the common case since most gate steps are pass/fail — the one with the **smaller measured max-size stress time**, and only then the earlier attempt. The timing tie-break is applied only when every tied candidate has a real measurement (the step ran, passed, and its input was a validated maximum; a degraded, skipped or sentinel duration is not one), so a candidate never wins or loses on the absence of evidence. bench15 emitted the first of two byte-identically-scored candidates purely by attempt order; the other takes 8–12 s on legal maximum-size inputs where the emitted one takes 0.74 s. It writes `report.json` before the solution file, so a failure writing one never loses the other. A candidate that fails to compile (Rust) or fails a gate step is still written — that scores 0 either way, and a missing file is worse than a wrong one — and the run exits 1. Only a genuinely empty SOLVE reply (no `===CODE===` block and no reply text to fall back to) leaves nothing to write; that case exits 3 and is recorded in the report as `status: "no_candidate"`. If the reply had no `===CODE===` block but was non-empty, the raw reply text is written verbatim as a last-resort candidate instead, so a file exists whenever the model produced any output at all.
+The finalizer picks the candidate that passed the most gate steps, then the fewest mismatches and failures, then — among candidates whose evidence is otherwise identical, which is the common case since most gate steps are pass/fail — the one with the **smaller measured max-size stress time**, and only then the earlier attempt. The timing tie-break is applied only when every tied candidate has a real measurement (the step ran, passed, and its input was a validated maximum; a degraded, skipped or sentinel duration is not one), so a candidate never wins or loses on the absence of evidence. bench15 emitted the first of two byte-identically-scored candidates purely by attempt order; the other takes 8–12 s on legal maximum-size inputs where the emitted one takes 0.74 s. It writes `report.json` before the solution file, so a failure writing one never loses the other. A candidate that fails to compile (Rust) or fails a gate step is still written — that scores 0 either way, and a missing file is worse than a wrong one — and the run exits 1. A run exits 3 with `status: "no_candidate"` whenever no usable candidate exists, including empty/malformed/refused replies or a timeout whose CODE block did not close. A non-empty non-partial reply without a CODE marker is still used verbatim as a last-resort candidate, so that case can emit a file and be reported as a gate failure.
 
 ---
 
@@ -489,13 +492,13 @@ The finalizer picks the candidate that passed the most gate steps, then the fewe
 
 - `ast.parse` succeeds; the entrypoint is a top-level `def`.
 - Every import is in `sys.stdlib_module_names`.
-- No `open`, `input`, `print`, `sys.stdin`, `sys.stdout`, `os.system`, `subprocess`, `socket`, `random` without a seed.
+- No `open`, `input`, `print`, `exec`, `eval`, `compile`, `sys.stdin`, `sys.stdout`, `os`, `subprocess`, `socket`, `random`, or other forbidden I/O/process imports.
 - Recursion smell: a function that calls itself over the input structure triggers a warning that feeds the stress step; `sys.setrecursionlimit` is allowed but the stress input must still pass.
 
 ### 6.2 Rust static
 
 - `fn main()` present. No `extern crate`, no `unsafe`, no `std::fs`, `std::net`, `std::process::Command`, `std::env::args`.
-- Warn on `HashMap`/`HashSet` iteration reaching output; nondeterminism check in §6.3 catches the actual bug.
+- The static pass does not try to prove collection iteration order; the two-process nondeterminism check in §6.3 catches output that actually varies.
 
 ### 6.3 Behavioral (both languages, run inside the gate)
 
@@ -530,13 +533,14 @@ The finalizer picks the candidate that passed the most gate steps, then the fewe
 
 The controller is a monotonic clock, and every step is given `min(step_cap, remaining - reserve)`.
 
-1. **Entering the repair window with a failing candidate:** repairs continue while a full cycle (60 s) still fits before the settle window.
+1. **Entering the repair window with a failing candidate:** a repair continues only while its configured cap (`max(repair_call_share × usable, repair_cap_s)`) plus one gate-pass estimate fits; syntax and semantic repair counters are independent.
 2. **Entering settle:** no new model calls are made and no candidate is re-gated; the last gate result for each candidate stands as-is, and the finalizer picks the best of what already exists.
 3. **Entering emit:** whatever candidate ranks best is written, even if it failed differential testing, because an unverified answer has nonzero expected value and a missing file has none. The report records exactly which gates it failed.
-4. **A model call overruns:** it is cancelled at its timeout; the orchestrator proceeds with whatever candidates exist. The strong SOLVE call is the only step that can leave the system with nothing, so it gets the largest share of the budget and nothing else waits on it once the fast calls return.
+4. **A model call overruns:** the call stops being waited on at its timeout. A streamed prefix is retained; a SOLVE/REPAIR reply is usable only when its CODE block closed, otherwise it is discarded. The orchestrator proceeds with whatever candidates exist. The strong SOLVE call is the only initial role that can create a candidate, so it gets the largest share and is gated as it lands.
 5. **A subprocess hangs:** killed by process group at its timeout; treated as a stress failure.
 
-The first compiling candidate is checkpointed immutably. A repair that fails to compile is discarded, not emitted.
+Candidate files are retained for inspection. A repaired child that fails to compile remains in the report, but
+the finalizer normally selects the best-scoring parent; an emitted candidate can still have gate failures.
 
 ---
 
@@ -544,18 +548,28 @@ The first compiling candidate is checkpointed immutably. A repair that fails to 
 
 ### 8.1 Model roles
 
-| Call | Model tier | Count per problem | Approx. tokens in / out |
-|---|---|---:|---:|
-| SOLVE | strong reasoning | 1 | 3k / 8k |
-| ORACLE | strong reasoning, low effort | 1 (+1 on a timeout retry, +1 more on adjudication) | 2k / 3k |
-| STRESS | strong reasoning, low effort | 1 | 2k / 2k |
-| REPAIR | strong reasoning | 0–2 | 6k / 5k each |
+| Call | Current role/profile | Default and optional requests | Token accounting |
+|---|---|---|---|
+| SOLVE | `roles.solve` → `strong` | 1 by default; at most one no-block retry; one fresh solve may be added after a timing/approach/regression failure | actual prompt/completion usage in `report.json`; reasoning tokens count when the provider reports them |
+| ORACLE | `roles.oracle` → `fast` | 1; at most one missing-block retry, one self-repair, and one adjudication regeneration | same; each optional request is cost/remaining-budget checked |
+| STRESS | `roles.stress` → `fast` | 1 | same |
+| REPAIR | `roles.repair` → `strong` | 0–2 semantic repairs plus 0–2 syntax/compile repairs | same; transport/refusal retries can add attempts |
 
-Worst case is roughly 25k input and 30k output tokens per problem. Monetary cost is computed from prices in the config file and reported per run; if prices are not configured the report says "cost unavailable" rather than guessing.
+There is no fixed six-call/60k-token ceiling in the implementation. Per-role `max_tokens`, transport retry settings,
+the optional-call counters, and `[limits].max_cost_usd_per_problem` are the practical bounds. Monetary cost is
+computed from provider `usage.cost` when available, otherwise from configured per-million input/output prices;
+if no prices are configured the report says `cost unavailable` and the cost cap cannot protect the run.
 
 **Which models.** Both roles are now *thinking* models, at different sizes: the strong role is `anthropic/claude-opus-5` through OpenRouter (`max_tokens = 24000`, thinking at `effort = "medium"` — the only level the provider's classifier accepts, and a token budget does not bind on this model; see §5.7), the fast role `anthropic/claude-sonnet-5` at `effort = "low"` (`max_tokens = 12000`). The initial solve ran at `medium` until it was measured cutting off near the 240 s cap with no complete `===CODE===` block — 239.4 s on 5cb294c18288 — then at `low`, then at a computed token budget, and is back at `medium`: `low` turned out to be refused by the classifier and the token budget turned out not to bind, while CODE-first salvage made a cut reply survivable (§5.7). Rounds 10–15 settled why. On 5cb294c18288 the coder model in the strong role read the *semantics* correctly — the emitted candidate matched an independent reference on 8 366 differential cases and six hand traces — and never once read the *complexity*: four candidates for that statement (two independent solves, two repairs) all materialized a layout the statement calls "enormous" and all iterated a count it bounds by 10^18, so the emitted solution needs ~10^11 s at the stated limits. No prompt or gate change reaches that; connecting "enormous" to "do not build the list" is the reasoning the strong role exists to buy. The earlier finding that no reasoning model returns inside a 300 s deadline was measured with `max_tokens = 12000`: reasoning tokens count against `max_tokens`, so the thinking spent the whole budget before any `===CODE===` block was written and the call returned nothing. The budget now covers thinking *and* answer. Oracle/candidate independence — the reason the two roles were put on different models after a round where both ran the same one — is carried by generation context rather than by model identity: the oracle is written in its own call, from the statement alone, and never sees the candidate. `[limits] max_cost_usd_per_problem` is 1.50 accordingly: at $5/$25 per 1M the cap must bound a runaway, not stop the second repair of an ordinary run.
 
 **Which prompt goes to which role is config too.** `config.toml`'s top-level `[roles]` table maps prompt name → role, read once through `Run.role()`; a config without the table gets `solve.PROMPT_ROLES`, and the shipped table is now that same mapping: SOLVE and REPAIR to the strong role, ORACLE and STRESS to the fast one.
+
+Extension points are configuration-only: add another `[profiles.<name>.<role>]` with an OpenAI-compatible
+endpoint/model/key, token parameter, temperature/streaming behavior, concurrency, timeout and pricing; map
+`solve`, `oracle`, `stress`, `repair`, and `fallback` in `[roles]`; and tune `[limits]`, `[grants]`, and
+`[phases]`. Per-role `tag_extra`, `refusal_extra`, `reasoning_budget`, `repair_cap_s`, and
+`usage_lookup_url` cover provider-specific request shapes without branches in `llm.py`. The shipped
+`anthropic` and `openai` profiles are configured but their latency is not benchmarked here.
 
 The two measuring calls have two requirements at once, and round 15 measured a model failing each of them. They must **read the statement** — the oracle is the ground truth of the entire system, every differential tier is worth exactly what the reference is worth, and no prompt or gate change reaches a reference with no code path for half the statement. And they must **return fast**, because `prepare_gate_inputs` cannot start before the ORACLE reply lands (§5.3), so the oracle's latency is dead time at the front of every run unless it finishes well inside the solve call's own 152–240 s.
 
@@ -575,7 +589,8 @@ So the prompts are back on the fast role, and the fast role is now a model that 
 
 ### 8.2 Levers
 
-- Hard caps: 6 model calls, 2 semantic repairs + 2 syntax repairs (independent budgets, §5.7), 1 oracle regeneration, 60k output tokens per problem.
+- Bounded optional work: 2 semantic repairs + 2 syntax repairs, 1 fresh solve, 1 oracle self-repair, and 1 oracle adjudication regeneration; initial/no-block/retry/fallback requests remain subject to budget and cost checks.
+- Default cost cap: `$1.50` per problem for the shipped OpenRouter profile; per-role token caps are `24,000` strong and `12,000` fast, and actual provider usage is recorded per request.
 - The statement and trap checklist are the shared prompt prefix on every call, so provider prompt caching applies where available.
 - The gate is free. Every token-spending step is preceded by a free step that can end the run early.
 - Fast-model calls never touch the algorithm. Strong-model calls never generate test scaffolding.
@@ -607,7 +622,7 @@ This is process isolation, not a hardened sandbox. Containers are a documented u
 ```text
 challengebox/
 ├── README.md              # setup, one command, assumptions, limitations
-├── ARCHITECTURE.md        # this document
+├── ChallengeBox-Agent-Architecture.md # this document
 ├── solve.py               # CLI, orchestrator, budget controller, finalizer
 ├── llm.py                 # one OpenAI-compatible client, any provider by config: structured output, timeout, usage capture
 ├── sandbox.py             # python/rust runners, static contract checks
@@ -619,14 +634,43 @@ challengebox/
 │   └── repair.md
 ├── config.toml            # models, prices, limits, safety margin
 ├── tests/
-│   ├── test_budget.py     # fake clock: phase transitions, timeouts, emit-before-deadline
+│   ├── test_budget.py     # fake clock, grants, phase transitions
+│   ├── test_config.py     # profile and fallback configuration
+│   ├── test_llm.py        # HTTP/SSE, retries, roles, parsing, salvage and cost lookup
 │   ├── test_sandbox.py    # contract checks, timeouts, cleanup, both languages
-│   └── test_verify.py     # differential with a planted bug, shrink, mutation/state/nondeterminism
+│   ├── test_solve.py      # orchestration, retries, status, repair and report behavior
+│   └── test_verify.py     # differential, shrink, oracle/stress trust, behavior and gates
 ├── samples/               # provided problems, used as the benchmark suite
 └── runs/                  # gitignored artifacts
 ```
 
-Five source files. A second provider, a plugin system, exit-code taxonomies, and dashboards are deliberately absent; add them when a reviewer asks.
+Module map: `solve.py` owns CLI dispatch, `Budget`, `Run`, concurrency, candidate lineage,
+finalization and benchmark output; `llm.py` owns profile loading, OpenAI-compatible transport,
+stream/retry/refusal handling, marker parsing/salvage and `FakeLLM`; `sandbox.py` owns problem loading,
+static contract checks, isolated Python/Rust execution, compilation and resource limits; `verify.py` owns
+`GateInputs`/`Evidence`, oracle/stress preparation, input validation and respelling, differential/behavior/
+stress/overflow gates, shrinking, repair prompts and oracle regeneration. `prompts/` supplies the four model
+contracts; `config.toml` supplies profiles, prompt-role routing, limits, phase shares and grants.
+
+Four Python modules plus configuration. A plugin system, dashboards, and a separate provider SDK are deliberately absent; add them when a reviewer asks.
+
+The concrete ownership and artifact flow is:
+
+```mermaid
+flowchart LR
+    I["problem JSON"] --> O["solve.py<br/>orchestrator + Budget"]
+    C["config.toml"] --> O
+    P["prompts/*.md"] --> O
+    O --> L["llm.py<br/>model calls"]
+    L -->|candidate code| V["verify.py<br/>verify gate"]
+    L -->|oracle reference + fixtures| V
+    L -->|stress generator + cases| V
+    V -->|candidate / oracle / stress cases| S["sandbox.py<br/>compile + isolated execution"]
+    S -->|execution results| V
+    V -->|evidence + selected candidate| O
+    O --> R["runs/&lt;run&gt;/<br/>report.json + artifacts"]
+    O --> E["emitted solution"]
+```
 
 ### 10.1 CLI
 
@@ -640,13 +684,18 @@ Other flags: `--profile <name>` forces a `config.toml` profile (default: the fir
 `--run-dir` overrides where run artifacts land. There is no `--seed` flag — cases are generated with
 `range(n)`, not a configurable seed.
 
-Exit codes: 0 solution emitted and passed all gates; 1 solution emitted but with gate failures (details in report, including a non-compiling Rust candidate); 2 invalid input or a missing API key; 3 no candidate could be emitted at all (an empty SOLVE reply).
+Exit codes: 0 solution emitted and passed all gates; 1 solution emitted but is unverified or has gate failures (details in report, including a non-compiling Rust candidate); 2 invalid input or a missing API key; 3 no candidate could be emitted (for example, empty/malformed/refused replies or an unsalvageable timeout).
 
 ---
 
 ## 11. Run report
 
-`runs/<problem_id>/report.json` contains: the normalized problem, every candidate source with its parent, every model call's role, model, latency, and token usage, every gate step's evidence, the shrunk counterexamples, the regression cases, the phase timeline, and the final status. No API keys or environment contents are persisted.
+The default run directory is `runs/<problem_id[:12]>-<YYYYmmdd-HHMMSS>/`; `--run-dir` uses the exact directory
+supplied. `report.json` contains problem id/language/profile/deadline, candidate ids and parent/replacement
+links, every model call's role/model/latency/usage/error flags, gate evidence, token totals, cost/cap,
+gate-input summary, events, and final status. Candidate sources, raw prompts/replies, oracle/stress fixtures,
+and parsed products live beside it rather than being embedded wholesale in the report. No API keys or
+environment contents are persisted.
 
 `runs/<problem_id>/replies/` holds both sides of every model call verbatim — `<tag>-<n>.prompt.txt` and `<tag>-<n>.txt`, `n` counting that tag's calls — salvaged partial replies included. Everything else in a run directory is the *parsed* product of a reply (`candidates/c1.py` is the `===CODE===` block and nothing else), so whatever a parser dropped used to be unrecoverable: bench19 logged `parsed=3 dropped=2` example lines and two adjudications could only infer which two and why. The API key is a request header in `llm.chat` and is never part of a rendered prompt or a completion, so nothing secret reaches these files.
 
@@ -687,15 +736,27 @@ Ordered by value, not by layer. Each step ends with a runnable check.
 
 Steps 1–5 are the MVP. If time is short, step 7 is the first to cut, then step 6's adjudication.
 
+The current runnable test suite is `uv run --group dev pytest -q` and covers all five modules above;
+the latest HEAD benchmark notes report 350 tests passing.
+
 ---
 
 ## 13. Benchmark reporting
 
-| Problem | Lang | Compiles | Diff small | Diff medium | Behavior | Stress | Repairs | Calls | Tokens | Elapsed | Hidden tests |
-|---|---|---|---|---|---|---|---:|---:|---:|---:|---|
-| `<id>` | py/rs | yes/no | pass/fail/n.a. | … | … | … | 0–2 | n | in/out | s | unknown |
+| Problem | Lang | Compile | Examples | Public | Edge | Small | Medium | Behavior | Stress | Overflow | Repairs | Syntax repairs | Calls | Tokens in/out | Elapsed s | Cost USD | Status | Hidden tests |
+|---|---|---|---|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|---|
+| `<id>` | py/rs | pass/fail/n.a. | pass/fail/skip | pass/fail/n.a. | pass/fail/skip | pass/fail/skip | pass/fail/skip | pass/fail/skip | pass/fail/degraded/skip | pass/fail/skip | 0–2 | 0–2 | n | in/out | s | n/a | status | unknown |
 
 "Pass" means passed the local gates. The hidden-test column is always "unknown" because the evaluator is not available. The README states this plainly.
+
+The latest recorded live benchmark at HEAD (`60696ce`, round 17, 2026-09-15) covered five samples with
+one run each under the current Opus-medium/Sonnet-low configuration. Independent adjudication judged all
+five emitted solutions correct: two runs reported `passed_all_gates`, one was `emitted_unverified` because
+the stress module failed to import, and two were `emitted_with_failures` because the generated oracle or
+hand-traced examples were wrong. Counted runs took 131–242 s and about $0.13–$0.67 each; the Opus solve
+latencies were 108, 216, 225, and one 239 s cut salvaged at CODE, while the Sonnet fallback solved the
+refused case in 116 s. This demonstrates correctness potential, not a five-of-five certification of the
+architecture: the remaining gaps are verification-source quality and late-budget affordability.
 
 ---
 
@@ -707,7 +768,7 @@ Steps 1–5 are the MVP. If time is short, step 7 is the first to cut, then step
 - **Process isolation only.** Generated code runs as the invoking user with resource limits, not in a container.
 - **Model latency variance.** A slow strong-model response compresses the repair window; the controller adapts but cannot create time.
 - **Rust stress timing includes process spawn overhead.** The measured duration covers process start, not just the candidate's compute; on this machine that overhead is roughly 0.5 s, which makes the effective Rust stress limit tighter than the configured `stress_limit_rust_s`.
-- **The benchmark has never been run against a live model.** No `OPENROUTER_API_KEY` was available in the development environment, so `benchmark.md` for the ten samples does not yet exist and the pipeline has only been exercised through `FakeLLM` in tests.
+- **The benchmark is not a full hidden-test result.** The latest live round covered five samples once and used independent adjudication; it did not run the evaluator's hidden tests, and three of five runs were not locally certified despite the adjudicators judging their emitted solutions correct. Earlier all-sample runs used older model/config combinations, so their pass rates are not directly comparable.
 
 ---
 

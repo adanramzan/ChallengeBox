@@ -19,15 +19,16 @@ uv run python solve.py samples/<id>.json -o runs/out.py    # or out.rs for a Rus
 ```
 
 Exit codes: `0` passed all local gates, `1` emitted but with unverified or failing gates, `2` invalid
-problem input, `3` no candidate at all. Useful flags: `--deadline-scale 0.25` shrinks the usable budget
+problem input, missing API key, or invalid benchmark directory, `3` no candidate at all. Useful flags: `--deadline-scale 0.25` shrinks the usable budget
 for testing the emit-under-pressure path; `--profile <name>` forces a `config.toml` profile (default: the
 first whose API key is set) and `--config <path>` a different config file; `--run-dir` overrides where artifacts land (default `runs/<problem_id[:12]>-<YYYYmmdd-HHMMSS>/`,
 timestamped so re-running a problem never overwrites the previous run).
 
 ## Where reports land, and how to read `report.json`
 
-Each run writes `<run_dir>/report.json`, `<run_dir>/log.txt`, and `<run_dir>/candidates/c*.{py,rs}`.
-The solution file itself goes wherever `-o` points.
+Each run writes `<run_dir>/report.json`, `<run_dir>/log.txt`, `<run_dir>/replies/`,
+`<run_dir>/oracle/`, `<run_dir>/candidates/c*.{py,rs}`, and per-candidate gate workdirs
+`<run_dir>/c*/`. The solution file itself goes wherever `-o` points.
 
 In `report.json`:
 
@@ -100,52 +101,45 @@ The report never claims a solution is "verified" — only what was checked and w
 
 ## Models, prices, cost cap
 
-Configured per role in `config.toml` under `[profiles.openrouter.<role>]`. As of 2026-09-12:
+Configured per role in `config.toml` under `[profiles.openrouter.<role>]`. As of 2026-09-15:
 
-| Role | Used by | Model | Max tokens | Concurrency |
-|---|---|---|---:|---:|
-| `strong` | SOLVE, REPAIR | `qwen/qwen3-coder` | 12000 | 3 |
-| `fast` | ORACLE, STRESS | `deepseek/deepseek-chat-v3-0324` | 8000 | 3 |
+| Role | Used by | Model | Effort | Max tokens | Concurrency | Timeout cap |
+|---|---|---|---|---:|---:|---:|
+| `strong` | SOLVE, REPAIR | `anthropic/claude-opus-5` | medium | 24000 | 3 | 240 s |
+| `fast` | ORACLE, STRESS | `anthropic/claude-sonnet-5` | low | 12000 | 3 | 150 s |
 
-**Both roles must be non-reasoning models**, which is why `extra` is empty rather than carrying a
-`reasoning` key. Reasoning models were tried first and failed completely: every call hit its token
-ceiling with 100% reasoning tokens and zero content, so no block was ever emitted and the raw
-reasoning prose was written as the solution. Neither `reasoning.effort` nor `reasoning.max_tokens`
-changed that. The prompts already ask for the analysis as parseable blocks, so a separate hidden
-reasoning channel buys nothing here and costs the entire output budget.
+Both OpenRouter roles are Claude 5 thinking models. `max_tokens` covers the reasoning and answer:
+the strong role uses medium effort with 24000 tokens, while the fast role uses low effort with 12000.
+The current prompt mapping is SOLVE/REPAIR → strong and ORACLE/STRESS → fast; both role tables allow
+three concurrent calls and cap individual latency at 240 s and 150 s respectively.
 
-Despite the names, the `fast` role is the slower of the two in practice — it writes three functions
-per call against the `strong` role's one, and its latency tracks output size at roughly 34 tokens
-per second. Its measured oracle latency across the ten samples was 38 s minimum, 73 s median,
-128 s maximum, which is what sets `timeout_cap_s` below.
+Despite the names, the `fast` role writes three functions per call against the `strong` role's one.
+Round 17 measured its oracle latency at 26–99 s across five runs; the 150 s role cap remains the
+absolute ceiling.
 
 Prices are whatever OpenRouter bills for these models at call time; the report reads them back from
 `usage.cost` on each response. Other providers don't report it, so their profiles carry `price_in_per_m` /
 `price_out_per_m` and the client computes it — without those, cost reads $0 and the cap never fires. OpenRouter includes `usage.cost`
 on every response by default now — the request body needs no extra parameter for this (the older
 `usage: {include: true}` flag is deprecated). The per-problem cost cap is
-`[limits] max_consecutive_case_timeouts = 5` — the Python harness stops running a batch after this
-many consecutive per-case timeouts (`[limits] per_case_limit_s` each) and reports the rest as
-`skipped: batch abandoned ...`: a reference or candidate that times out on five small inputs in a row
-is dead, not slow. `0` disables it.
-
-`[limits] max_cost_usd_per_problem = 0.10` — every optional model call (the oracle retry, the
+`[limits] max_cost_usd_per_problem = 1.50` — every optional model call (the oracle retry, the
 oracle self-repair, each repair attempt, and an adjudication regeneration) checks cumulative cost
 first via `Run.over_cost()` and is skipped once the cap is reached, emitting the best candidate so
 far. Only the three initial concurrent calls are unchecked — nothing has been spent yet.
 
-The three generate-phase calls (SOLVE, ORACLE, STRESS) each get `[phases] generate_call_share` (default
-`0.55`) of usable time — a real config knob, not a literal in `solve.py` — capped underneath by each
-role's own `timeout_cap_s` (`fast` is `150.0`, raised from a stale `110.0` so the measured 128 s oracle
-worst case is no longer clipped by the role cap; the share is what actually binds in practice). The
-ORACLE call writes the most output of the three (it defines `reference`, `gen`, *and* `validate`), so
-it's reliably the slowest and the one most likely to time out. If it comes back with no `===ORACLE===`
-block at all, the orchestrator retries it exactly once, only if `budget.can_afford(130)` — comfortably
-above the measured 128 s worst case — still holds; a retry this close to the deadline would just cost
-more time for nothing. That's separate machinery from the adjudication regeneration described below,
-which has its own independent one-shot counter — but it gets the same `generate_call_share`-derived
-timeout as the initial ORACLE call (not a smaller hardcoded fraction), because it writes the same three
-functions and is just as likely to need the full span.
+Unrelated to cost, `[limits] max_consecutive_case_timeouts = 5` makes the Python harness stop a batch
+after five consecutive per-case timeouts (`[limits] per_case_limit_s` each) and report the rest as
+`skipped: batch abandoned ...`; `0` disables that timeout guard.
+
+The three generate-phase calls (SOLVE, ORACLE, STRESS) each get `[phases] generate_call_share = 0.70`
+of usable time — a real config knob, not a literal in `solve.py` — capped underneath by the selected
+role's own timeout cap. The ORACLE call writes the most output of the three (it defines `reference`,
+`gen`, and `validate`), so it is the most likely to time out. If it returns without an `===ORACLE===`
+block, the orchestrator retries it at most once. For a non-timeout empty reply, `solve.py` checks
+`oracle_afford_s()`: the configured `[limits] oracle_retry_afford_s = 60.0` is a ceiling, reduced to
+the selected oracle role's `timeout_cap_s * 0.5 + 30`. If the first call timed out, affordability instead
+requires the role's full timeout cap plus `[limits] repair_afford_s = 60.0`. Adjudication regeneration
+and oracle self-repair use the same role-aware affordability helper and their own one-shot counters.
 
 ## How the three README questions are answered
 
@@ -197,8 +191,7 @@ sampling parameters), and `price_in_per_m` / `price_out_per_m` (any provider tha
 The `anthropic` and `openai` profiles have not been benchmarked. Their latency is unmeasured against
 the `[limits]` `*_afford_s` values, which were tuned to the OpenRouter models; a single-provider profile
 puts candidate and oracle in the same model family, weakening the independence the oracle relies on;
-and at Opus-tier prices `max_cost_usd_per_problem = 0.10` is spent by the first SOLVE calls, so optional
-repairs are skipped until it is raised.
+and the unmeasured profiles may reach the `$1.50` per-problem cap before optional repairs fit.
 
 ## Benchmark mode
 
@@ -212,9 +205,10 @@ with gate results (including the Rust-only `Overflow` column — `skip` for Pyth
 cost, final status, and a `Hidden tests` column that always reads `unknown` (the grading harness is not
 available to this tool).
 
-**The benchmark has not been run in this environment** — no `OPENROUTER_API_KEY` was configured, so no
-real model calls were made and no results table can be reported here. Running the command above with a
-valid key populates `runs/bench/benchmark.md` with real per-sample evidence and cost figures.
+Current benchmark evidence is recorded in `BENCHMARK-ANALYSIS-ROUND17.md`: five sample problems were
+run once each; two were `passed_all_gates`, one was `emitted_unverified`, and two were
+`emitted_with_failures`. Independent adjudication found no mismatches over 1,000–19,500 additional
+cases per problem, but that is local/adjudication evidence only — hidden-test status remains `unknown`.
 
 ## Limitations
 
@@ -240,5 +234,6 @@ valid key populates `runs/bench/benchmark.md` with real per-sample evidence and 
   container.
 - Model latency variance compresses the repair window on a slow strong-model response; the budget
   controller adapts but cannot create time.
-- The benchmark in this repository has not been run against a real model (no API key in this
-  environment), so `runs/bench/benchmark.md` does not yet exist here.
+- Round 17 is the current benchmark evidence: five problems, two full local passes, and three emitted
+  results needing honest qualification; independent adjudication found no mismatches on its additional
+  cases, but hidden-test status remains unknown.

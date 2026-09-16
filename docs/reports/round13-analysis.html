@@ -1,0 +1,106 @@
+<title>Round 13 Post-Mortem</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#f3f5f7; --paper:#ffffff; --ink:#18212b; --ink-2:#4a5563; --ink-3:#7a8493; --line:#d9dee5;
+  --accent:#0f6e73; --accent-soft:#e0f0f0; --no:#b42318; --no-soft:#fbe9e6; --warn:#9a6700; --warn-soft:#fbf1d6; --ok:#1f7a3a; --ok-soft:#e2f2e6;
+  --serif:"Source Serif 4",Georgia,"Times New Roman",serif; --sans:"IBM Plex Sans","Helvetica Neue",Arial,sans-serif; --mono:"IBM Plex Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#12171d; --paper:#1a2129; --ink:#e8ecf1; --ink-2:#b4bcc7; --ink-3:#7f8896; --line:#2c3541;
+  --accent:#5fc3c7; --accent-soft:#12383a; --no:#f0857a; --no-soft:#3d1c19; --warn:#e0b34a; --warn-soft:#3a2f12; --ok:#7ccf8f; --ok-soft:#173a22;
+}}
+:root[data-theme="dark"]{
+  --bg:#12171d; --paper:#1a2129; --ink:#e8ecf1; --ink-2:#b4bcc7; --ink-3:#7f8896; --line:#2c3541;
+  --accent:#5fc3c7; --accent-soft:#12383a; --no:#f0857a; --no-soft:#3d1c19; --warn:#e0b34a; --warn-soft:#3a2f12; --ok:#7ccf8f; --ok-soft:#173a22;
+}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.55;padding-block:40px 80px;padding-inline:clamp(16px,4vw,48px)}
+.wrap{max-width:1180px;margin:0 auto}
+h1{font-family:var(--serif);font-weight:700;font-size:clamp(28px,4vw,40px);line-height:1.15;margin:0 0 6px;text-wrap:balance}
+h2{font-family:var(--serif);font-weight:600;font-size:22px;margin:44px 0 12px;text-wrap:balance}
+h3{font-size:15px;font-weight:600;margin:22px 0 6px}
+p{max-width:70ch;margin:0 0 12px;color:var(--ink)}
+.eyebrow{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3);margin-bottom:10px}
+.meta{color:var(--ink-2);font-size:14px;max-width:80ch}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:24px 0 8px}
+.tile{background:var(--paper);border:1px solid var(--line);padding:14px 16px}
+.tile .n{font-family:var(--serif);font-size:34px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.tile .l{font-size:13px;color:var(--ink-2);margin-top:6px}
+.tile.no .n{color:var(--no)} .tile.warn .n{color:var(--warn)} .tile.acc .n{color:var(--accent)}
+.scroll{overflow-x:auto;border:1px solid var(--line);background:var(--paper)}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top;text-align:left}
+th{font-size:12px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);font-weight:600;background:var(--paper);position:sticky;top:0}
+td.id,td.num,th.num{font-family:var(--mono);font-size:12.5px;white-space:nowrap}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+tr:last-child td{border-bottom:none}
+.pill{display:inline-block;padding:1px 8px;border-radius:3px;font-size:12px;font-weight:600;white-space:nowrap}
+.pill.no{background:var(--no-soft);color:var(--no)} .pill.warn{background:var(--warn-soft);color:var(--warn)} .pill.ok{background:var(--ok-soft);color:var(--ok)} .pill.acc{background:var(--accent-soft);color:var(--accent)}
+.split{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.gap{background:var(--paper);border:1px solid var(--line);padding:14px 16px}
+.gap h3{margin:0 0 6px;display:flex;gap:10px;align-items:baseline}
+.gap .k{font-family:var(--mono);color:var(--accent);font-size:12.5px}
+.gap .runs{font-size:12.5px;color:var(--ink-3);margin-left:auto;white-space:nowrap}
+.gap p{font-size:14px;margin-bottom:8px}
+.gap p.fix{color:var(--ink-2)} .gap p.fix b{color:var(--ink)}
+ol.next{max-width:75ch;padding-left:22px} ol.next li{margin-bottom:6px}
+code{font-family:var(--mono);font-size:.92em;background:var(--accent-soft);padding:0 4px;border-radius:2px}
+.foot{margin-top:40px;font-size:13px;color:var(--ink-3);max-width:80ch}
+@media (max-width:640px){ h2{margin-top:32px} }
+</style>
+<div class="wrap">
+<div class="eyebrow">ChallengeBox solver · benchmark round 13 · 2026-09-14 · problem 5cb294c18288, two runs</div>
+<h1>One problem, two runs, nothing checked, zero hidden-test passes</h1>
+<p class="meta">Working tree at <code>659bd34</code> plus the uncommitted architecture changes under review. Original models, strong <code>qwen/qwen3-coder</code>, fast <code>deepseek/deepseek-chat-v3-0324</code>, run through a scratch copy of the config. The first run produced nothing checkable, so the problem was run a second time. An independent Opus adjudicator wrote its own literal reference for each run, hand-traced the statement, and diffed both candidates and the oracle on 1,000–2,000 random small inputs.</p>
+
+<div class="tiles">
+  <div class="tile no"><div class="n">0 / 2</div><div class="l">emitted solutions that would pass hidden tests</div></div>
+  <div class="tile no"><div class="n">3 / 4</div><div class="l">oracle calls lost to a 120 s cap (lowered by mistake in the scratch config; committed cap is 150 s); the one that returned was 45 % wrong</div></div>
+  <div class="tile warn"><div class="n">4 / 4</div><div class="l">strong-model candidates wrong on the same clause (<code>repeat</code>) and non-terminating at the limits</div></div>
+  <div class="tile acc"><div class="n">2 / 2</div><div class="l">first-attempt candidates destroyed by an unclosed markdown fence</div></div>
+</div>
+<p>Read together: the strong model is the ceiling on this problem, the fast model cannot write this oracle at all or inside the cap, and two of the uncommitted changes made the runs worse. The sequential start cost 17–24 s of oracle time, and the hardcoded smoke check threw away the only ground truth run B had.</p>
+
+<h2>Per-run verdicts</h2>
+<div class="scroll"><table>
+<thead><tr><th>Run</th><th>Failed at</th><th>Emitted</th><th>Hidden</th><th>Primary cause</th><th>Model or architecture</th><th>Key evidence</th></tr></thead>
+<tbody>
+<tr><td class="id">A · bench13</td><td>oracle timed out twice; gate had nothing to check</td><td class="id">c2</td><td><span class="pill no">NO</span></td><td><span class="pill acc">ARCH-BUDGET</span></td><td>architecture, then model</td><td>stress call on the same model returned in 56 s at ~33 tok/s, so an 8000-token oracle needs ~240 s; retry re-sent the identical prompt at the identical cap; c2 wrong on the <code>open</code> cursor, array slots and nested <code>repeat</code>, 21.3 % mismatch; <code>default 10^18</code> never returns; c1 6.9 % wrong and a syntax error from the fence</td></tr>
+<tr><td class="id">B · bench13b</td><td>oracle timeout, retry at 243 s, then smoke check</td><td class="id">c2</td><td><span class="pill no">NO</span></td><td><span class="pill warn">MODEL-SOLVE</span></td><td>model, amplified by architecture</td><td>both attempts exact on containers, arrays, defaults and the invalid-op result (0/750 when no <code>repeat</code> is reachable) and wrong only on <code>repeat</code>: c2 flattens <code>(repeat 0 3)</code> as AAABBB instead of ABABAB, 9/12 wrong on the canonical shape; c1 12/12 wrong there; oracle 452/1000 wrong and crashes on every array descriptor; all six smoke inputs malformed at <code>verify.py:64</code></td></tr>
+</tbody></table></div>
+<p class="meta">Round 10 reported this problem's c1 as "correct on 500/500". That was on random small inputs, which this round shows understate badly: 1.3 % random against 12/12 on the shape that fills a <code>repeat</code>. The round-10 c1 was probably wrong on <code>repeat</code> too.</p>
+
+<h2>Mechanical facts per run</h2>
+<p class="meta">Latencies in seconds per call, several calls separated by a slash. P pass, skip skipped. The oracle call is 106–128 s on this statement against a 120 s cap. Correction: that cap came from the scratch config used for this round, which lowered the fast role's cap from the committed 150 s by mistake; run B's retry at 106 s would have fit either, run A's two calls may or may not have fit 150 s. Solve calls are 17–24 s with zero reasoning tokens. Cost $0.013–0.016 against a $0.50 cap.</p>
+<div class="scroll"><table>
+<thead><tr><th>Run</th><th>Status</th><th class="num">Cand.</th><th class="num">Elapsed s</th><th class="num">Cost $</th><th class="num">Calls</th><th class="num">Tokens in/out</th><th class="num">solve</th><th class="num">oracle</th><th class="num">stress</th><th class="num">small / medium / edge</th><th>Gate steps</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td class="id">A</td><td>unverified</td><td class="num">2</td><td class="num">264.4</td><td class="num">0.0135</td><td class="num">5</td><td class="num">4653/7704</td><td class="num">17 / 24</td><td class="num">120 t/o / 120 t/o</td><td class="num">56</td><td class="num">0 / 0 / 0</td><td>compile P, rest skip</td><td>oracle and stress started at 24.3 s, after solve; candidates added at 144 s; c1 syntax error from fence; "no oracle source"</td></tr>
+<tr><td class="id">B</td><td>unverified</td><td class="num">2</td><td class="num">243.5</td><td class="num">0.0160</td><td class="num">5</td><td class="num">6369/10339</td><td class="num">17 / 17</td><td class="num">120 t/o / 106</td><td class="num">52</td><td class="num">0 / 0 / 0</td><td>compile P, rest skip</td><td>oracle and stress started at 17.3 s; oracle arrived at 243 s; smoke 6/6 failed (validate False on all six, reference 1 on five); 41 s left, no regeneration; c1 syntax error from fence</td></tr>
+</tbody></table></div>
+
+<h2>What the system is lacking, ranked by what it cost here</h2>
+<p class="meta">Every item is a class of failure any hidden problem can trigger, with the smallest generic change.</p>
+<div class="split">
+<div class="gap"><h3><span class="k">G1</span>Oracle latency above the cap, timeout retried identically<span class="runs">3 of 4 oracle calls</span></h3><p>The fast model streams at ~33 tok/s; a 4–8k-token oracle needs 120–240 s. Correction: the committed config already caps the fast role at 150 s; the 120 s cap this round ran under was a mistake in the scratch config, so "cap below measured latency" is withdrawn. What stands: the model's latency is at or above any cap the budget can afford, a timeout is logged as "no block" and retried with the same prompt at the same cap, and the sequential start adds the solve latency on top.</p><p class="fix"><b>Change:</b> retry only when the budget covers it, asking for shorter output; stream and abort on a no-bytes stall; restore the concurrent start; author the oracle with a model that returns in tens of seconds; ask for less by defining validate as "reference did not raise".</p></div>
+<div class="gap"><h3><span class="k">G2</span>An unclosed code fence destroys a candidate<span class="runs">both runs, c1</span></h3><p><code>llm._unfence</code> strips only a fence with a matching closer. The model opened a fence inside CODE and closed it after END, so the fence line landed in the file and the candidate failed static. Half the pool was lost both times, and c1 was the better candidate both times.</p><p class="fix"><b>Change:</b> also strip a leading fence line and a trailing bare fence when unmatched. One regex.</p></div>
+<div class="gap"><h3><span class="k">G3</span>The sample-specific smoke check is wrong and disables everything<span class="runs">run B</span></h3><p>Six hardcoded inputs for one entrypoint, all missing one tuple level, so every oracle fails all six. With the nesting restored the adjudicator's reference passes all six. The check fired, disabled differential evidence, and left 41 s for nothing. It scores zero on every other problem by construction.</p><p class="fix"><b>Change:</b> delete it. The generic replacement is examples the SOLVE model writes in its own block, run against candidate and oracle before gating.</p></div>
+<div class="gap"><h3><span class="k">G4</span>The prompt's complexity rule does not reach this model<span class="runs">all four candidates</span></h3><p>The DESIGN block says to reject any approach that expands a repetition up to 10^18 or scans a flattened layout. All four candidates do exactly that. With a non-reasoning model a prose rule is not a check.</p><p class="fix"><b>Change:</b> the independent timing gate on a grown input, and a fresh-solve path that hands the model the measured timeout, the input's sizes, and "do not use this approach".</p></div>
+<div class="gap"><h3><span class="k">G5</span>Random small inputs do not reach the hard state<span class="runs">run B, and round 10's verdict</span></h3><p>Random operation sequences go invalid before a <code>repeat</code> is filled, so a candidate wrong on the whole clause shows 1.3 % mismatch on random inputs and 100 % on the canonical shape. The oracle's gen and the shrinker share the blind spot.</p><p class="fix"><b>Change:</b> one rule in the oracle and stress prompts: at least half of generated sequences stay valid to the end and drive every bounded quantity to its bound; plus SOLVE-authored examples naming the hardest shape.</p></div>
+<div class="gap"><h3><span class="k">G6</span>Skipped steps logged as passed<span class="runs">both runs</span></h3><p>Six skipped gate steps print as <code>passed=True</code>; only the status line says nothing was checked.</p><p class="fix"><b>Change:</b> log skipped explicitly. Cosmetic, but it misleads every reader of the log.</p></div>
+</div>
+
+<h2>Model capability, stated plainly</h2>
+<p><b>Strong model</b> (<code>qwen/qwen3-coder</code>): four independent attempts at this statement, all correct on containers, arrays, defaults and the invalid-operation result, all wrong on <code>repeat</code>, all non-terminating at the limits, zero reasoning tokens, 17–24 s per call. Two attempts per run do not reach the intended algorithm; a re-solve with concrete failure evidence is the only lever left at this model.</p>
+<p><b>Fast model</b> (<code>deepseek/deepseek-chat-v3-0324</code>): three oracles for this problem across rounds 10 and 13, all unusable (constant answer, constant answer, 45 % wrong and crashing on arrays), 106–128 s per call. The self-consistency check does not catch it: reference ran clean on 45/45 of its own gen inputs.</p>
+<p>Cost is not the constraint: $0.013–0.016 per run against a $0.50 cap.</p>
+
+<h2>What to do next, in order</h2>
+<ol class="next">
+<li><b>G2 and G1.</b> Fence stripping, cap and retry, concurrent start. Mechanical, and they lost three of four oracle calls and both first candidates.</li>
+<li><b>Remove G3</b> and replace it with SOLVE-authored examples; add the G5 rule to the oracle and stress prompts.</li>
+<li><b>G4.</b> The timing gate and the fresh-solve path. The only path to a correct <code>repeat</code> with this model.</li>
+<li><b>Re-run this problem</b>, then the other three focus problems.</li>
+</ol>
+<p class="foot">Sources: <code>runs/bench13</code>, <code>runs/bench13b</code>, and the two adjudication reports under <code>.superpowers/sdd/2026-09-12-challengebox-solver/</code>. Markdown twin: <code>BENCHMARK-ANALYSIS-ROUND13.md</code>.</p>
+</div>

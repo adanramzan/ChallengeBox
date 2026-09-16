@@ -1,0 +1,90 @@
+<title>Round 16 Post-Mortem</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#f3f5f7; --paper:#ffffff; --ink:#18212b; --ink-2:#4a5563; --ink-3:#7a8493; --line:#d9dee5;
+  --accent:#0f6e73; --accent-soft:#e0f0f0; --no:#b42318; --no-soft:#fbe9e6; --warn:#9a6700; --warn-soft:#fbf1d6; --ok:#1f7a3a; --ok-soft:#e2f2e6;
+  --serif:"Source Serif 4",Georgia,"Times New Roman",serif; --sans:"IBM Plex Sans","Helvetica Neue",Arial,sans-serif; --mono:"IBM Plex Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#12171d; --paper:#1a2129; --ink:#e8ecf1; --ink-2:#b4bcc7; --ink-3:#7f8896; --line:#2c3541;
+  --accent:#5fc3c7; --accent-soft:#12383a; --no:#f0857a; --no-soft:#3d1c19; --warn:#e0b34a; --warn-soft:#3a2f12; --ok:#7ccf8f; --ok-soft:#173a22;
+}}
+:root[data-theme="dark"]{
+  --bg:#12171d; --paper:#1a2129; --ink:#e8ecf1; --ink-2:#b4bcc7; --ink-3:#7f8896; --line:#2c3541;
+  --accent:#5fc3c7; --accent-soft:#12383a; --no:#f0857a; --no-soft:#3d1c19; --warn:#e0b34a; --warn-soft:#3a2f12; --ok:#7ccf8f; --ok-soft:#173a22;
+}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.55;padding-block:40px 80px;padding-inline:clamp(16px,4vw,48px)}
+.wrap{max-width:1180px;margin:0 auto}
+h1{font-family:var(--serif);font-weight:700;font-size:clamp(28px,4vw,40px);line-height:1.15;margin:0 0 6px;text-wrap:balance}
+h2{font-family:var(--serif);font-weight:600;font-size:22px;margin:44px 0 12px;text-wrap:balance}
+p{max-width:70ch;margin:0 0 12px;color:var(--ink)}
+.eyebrow{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3);margin-bottom:10px}
+.meta{color:var(--ink-2);font-size:14px;max-width:80ch}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:24px 0 8px}
+.tile{background:var(--paper);border:1px solid var(--line);padding:14px 16px}
+.tile .n{font-family:var(--serif);font-size:34px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.tile .l{font-size:13px;color:var(--ink-2);margin-top:6px}
+.tile.ok .n{color:var(--ok)} .tile.acc .n{color:var(--accent)} .tile.warn .n{color:var(--warn)}
+.scroll{overflow-x:auto;border:1px solid var(--line);background:var(--paper)}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top;text-align:left}
+th{font-size:12px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);font-weight:600;background:var(--paper)}
+td.num,th.num{font-family:var(--mono);font-size:12.5px;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+.pill{display:inline-block;padding:1px 8px;border-radius:3px;font-size:12px;font-weight:600;white-space:nowrap}
+.pill.ok{background:var(--ok-soft);color:var(--ok)} .pill.warn{background:var(--warn-soft);color:var(--warn)}
+ul.plain{max-width:75ch;padding-left:22px} ul.plain li{margin-bottom:6px}
+code{font-family:var(--mono);font-size:.92em;background:var(--accent-soft);padding:0 4px;border-radius:2px}
+.foot{margin-top:40px;font-size:13px;color:var(--ink-3);max-width:80ch}
+@media (max-width:640px){ h2{margin-top:32px} }
+</style>
+<div class="wrap">
+<div class="eyebrow">ChallengeBox solver · benchmark round 16 · 2026-09-15 · focus problem 5cb294c18288, run 22</div>
+<h1>The first full pass</h1>
+<p class="meta">Branch <code>solver</code> at <code>36cafa0</code>, batch 10 plus the solve effort lowered to low, 333 tests passing. One run, no repairs, no regenerations. No adjudicator was spent; correctness was checked by diffing the candidate against run 20's, which an adjudicator verified on 12,632 inputs, over 1,650 inputs from the new oracle's generator.</p>
+
+<div class="tiles">
+  <div class="tile ok"><div class="n">passed</div><div class="l">every gate, nothing degraded, nothing rejected: status <code>passed_all_gates</code></div></div>
+  <div class="tile ok"><div class="n">0 / 1,650</div><div class="l">mismatches against the adjudicated run-20 candidate on the new oracle's generated inputs</div></div>
+  <div class="tile acc"><div class="n">131 s</div><div class="l">elapsed of 285 usable; 154 s left for repairs that were not needed</div></div>
+  <div class="tile acc"><div class="n">$0.36</div><div class="l">three calls: Opus low-effort solve, Sonnet low-effort oracle and stress</div></div>
+</div>
+
+<h2>What each check found</h2>
+<div class="scroll"><table>
+<thead><tr><th>Check</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>Hand-traced examples</td><td><span class="pill ok">5 of 5</span> one the reference crashed on, counted as an error, not a disagreement</td></tr>
+<tr><td>Edge cases</td><td><span class="pill ok">8 of 8</span> zero invalid</td></tr>
+<tr><td>Small tier</td><td><span class="pill ok">200 of 200</span> zero invalid, answers varied, no weak-tier flag</td></tr>
+<tr><td>Medium tier</td><td><span class="pill ok">20 of 20</span> zero invalid</td></tr>
+<tr><td>Behavior</td><td><span class="pill ok">pass</span></td></tr>
+<tr><td>Max-size timing</td><td><span class="pill ok">0.193 s</span> on a 4.4 MB input the reference itself validated; the author's expected answer matched</td></tr>
+</tbody></table></div>
+
+<h2>Mechanical facts</h2>
+<div class="scroll"><table>
+<thead><tr><th>Call</th><th>Model, effort</th><th class="num">Latency s</th><th class="num">Output tokens (reasoning)</th><th class="num">Cost $</th></tr></thead>
+<tbody>
+<tr><td>solve</td><td>claude-opus-5, low</td><td class="num">107.7</td><td class="num">8,805 (5,338)</td><td class="num">0.233</td></tr>
+<tr><td>oracle</td><td>claude-sonnet-5, low</td><td class="num">76.0</td><td class="num">8,562 (3,511)</td><td class="num">0.093</td></tr>
+<tr><td>stress</td><td>claude-sonnet-5, low</td><td class="num">29.8</td><td class="num">2,929 (1,835)</td><td class="num">0.038</td></tr>
+</tbody></table></div>
+<p class="meta">Timeline: stress reply at 30 s, oracle at 76 s, preparation done by 88 s while the solver was still running, solve reply at 108 s, example check to 128 s, full gate in 3.5 s, emit at 131 s. Against the medium-effort runs: solve latency 108 s versus 152–240 s, reasoning 5.3k versus 7–10k tokens, same correctness on everything checked.</p>
+
+<h2>What the run says about the open items</h2>
+<ul class="plain">
+<li><b>Solve effort.</b> Low effort produced a correct candidate 40 % faster than medium and well inside the cap. On this statement the extra effort was cost, not capability. One observation.</li>
+<li><b>Oracle and stress author.</b> Sonnet 5 at low effort accepted every one of its own inputs, every edge and the max-size input, and its expected answer matched. 76 s is inside the solver's latency, so preparation overlapped as designed.</li>
+<li><b>Code first.</b> The reply completed at 108 s, so salvage was not needed; any effect on code quality did not show.</li>
+<li><b>Bounds check.</b> Not exercised: the reference finished on the max-size input.</li>
+</ul>
+
+<h2>Not proven by one run</h2>
+<p>The low-effort latency spread is one point; medium ranged 152–240 s over ten runs. The oracle's quality is one sample. The worst-case timing shape is still the stress author's choice: this input ran in 0.19 s, and an adjudicated in-bounds worst case for a similar candidate ran 5–6 s against the 5 s limit.</p>
+
+<h2>State of the work</h2>
+<p>Implementation is complete for the agreed scope: one problem, one attempt, hosted models, every budget a fraction of the problem's deadline. Before a submission: commit the analysis documents and CLAUDE.md, keep <code>runs/</code> out of git, rotate the OpenRouter key, and read the architecture document once against the code.</p>
+<p class="foot">Sources: <code>runs/bench22</code>. Markdown twin: <code>BENCHMARK-ANALYSIS-ROUND16.md</code>.</p>
+</div>

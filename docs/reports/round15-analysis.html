@@ -1,0 +1,109 @@
+<title>Round 15 Post-Mortem</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#f3f5f7; --paper:#ffffff; --ink:#18212b; --ink-2:#4a5563; --ink-3:#7a8493; --line:#d9dee5;
+  --accent:#0f6e73; --accent-soft:#e0f0f0; --no:#b42318; --no-soft:#fbe9e6; --warn:#9a6700; --warn-soft:#fbf1d6; --ok:#1f7a3a; --ok-soft:#e2f2e6;
+  --serif:"Source Serif 4",Georgia,"Times New Roman",serif; --sans:"IBM Plex Sans","Helvetica Neue",Arial,sans-serif; --mono:"IBM Plex Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#12171d; --paper:#1a2129; --ink:#e8ecf1; --ink-2:#b4bcc7; --ink-3:#7f8896; --line:#2c3541;
+  --accent:#5fc3c7; --accent-soft:#12383a; --no:#f0857a; --no-soft:#3d1c19; --warn:#e0b34a; --warn-soft:#3a2f12; --ok:#7ccf8f; --ok-soft:#173a22;
+}}
+:root[data-theme="dark"]{
+  --bg:#12171d; --paper:#1a2129; --ink:#e8ecf1; --ink-2:#b4bcc7; --ink-3:#7f8896; --line:#2c3541;
+  --accent:#5fc3c7; --accent-soft:#12383a; --no:#f0857a; --no-soft:#3d1c19; --warn:#e0b34a; --warn-soft:#3a2f12; --ok:#7ccf8f; --ok-soft:#173a22;
+}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.55;padding-block:40px 80px;padding-inline:clamp(16px,4vw,48px)}
+.wrap{max-width:1180px;margin:0 auto}
+h1{font-family:var(--serif);font-weight:700;font-size:clamp(28px,4vw,40px);line-height:1.15;margin:0 0 6px;text-wrap:balance}
+h2{font-family:var(--serif);font-weight:600;font-size:22px;margin:44px 0 12px;text-wrap:balance}
+h3{font-size:15px;font-weight:600;margin:22px 0 6px}
+p{max-width:70ch;margin:0 0 12px;color:var(--ink)}
+.eyebrow{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3);margin-bottom:10px}
+.meta{color:var(--ink-2);font-size:14px;max-width:80ch}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:24px 0 8px}
+.tile{background:var(--paper);border:1px solid var(--line);padding:14px 16px}
+.tile .n{font-family:var(--serif);font-size:34px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.tile .l{font-size:13px;color:var(--ink-2);margin-top:6px}
+.tile.no .n{color:var(--no)} .tile.warn .n{color:var(--warn)} .tile.acc .n{color:var(--accent)} .tile.ok .n{color:var(--ok)}
+.scroll{overflow-x:auto;border:1px solid var(--line);background:var(--paper)}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top;text-align:left}
+th{font-size:12px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);font-weight:600;background:var(--paper);position:sticky;top:0}
+td.id,td.num,th.num{font-family:var(--mono);font-size:12.5px;white-space:nowrap}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+tr:last-child td{border-bottom:none}
+.pill{display:inline-block;padding:1px 8px;border-radius:3px;font-size:12px;font-weight:600;white-space:nowrap}
+.pill.no{background:var(--no-soft);color:var(--no)} .pill.warn{background:var(--warn-soft);color:var(--warn)} .pill.ok{background:var(--ok-soft);color:var(--ok)} .pill.acc{background:var(--accent-soft);color:var(--accent)}
+.split{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.gap{background:var(--paper);border:1px solid var(--line);padding:14px 16px}
+.gap h3{margin:0 0 6px;display:flex;gap:10px;align-items:baseline}
+.gap .k{font-family:var(--mono);color:var(--accent);font-size:12.5px}
+.gap .runs{font-size:12.5px;color:var(--ink-3);margin-left:auto;white-space:nowrap}
+.gap p{font-size:14px;margin-bottom:8px}
+.gap p.fix{color:var(--ink-2)} .gap p.fix b{color:var(--ink)}
+ol.next{max-width:75ch;padding-left:22px} ol.next li{margin-bottom:6px}
+code{font-family:var(--mono);font-size:.92em;background:var(--accent-soft);padding:0 4px;border-radius:2px}
+.foot{margin-top:40px;font-size:13px;color:var(--ink-3);max-width:80ch}
+@media (max-width:640px){ h2{margin-top:32px} }
+</style>
+<div class="wrap">
+<div class="eyebrow">ChallengeBox solver · benchmark round 15 · 2026-09-15 · focus problem 5cb294c18288, runs 17–21</div>
+<h1>Three correct candidates, one real timing pass, and a latency cliff</h1>
+<p class="meta">Branch <code>solver</code> from <code>5201aba</code> to <code>83f41e4</code>, batches 5–9, 324 tests passing. One Opus 5 attempt per run at medium effort. Runs 18, 19 and 20 were adjudicated by an independent Opus agent with its own reference, hand traces and 3,200–12,632 diffed inputs; runs 17 and 21 produced no candidate.</p>
+
+<div class="tiles">
+  <div class="tile ok"><div class="n">3 / 3</div><div class="l">finished candidates that are correct on every input family, including counts at 10<sup>18</sup></div></div>
+  <div class="tile ok"><div class="n">0.38 s</div><div class="l">run 20's real max-size timing on a bounds-checked 9.8 MB legal input, the first timing pass that counts</div></div>
+  <div class="tile no"><div class="n">2 / 5</div><div class="l">runs with no candidate: a single attempt cut at its cap, once before the code block closed</div></div>
+  <div class="tile warn"><div class="n">192 / 200</div><div class="l">identical small-tier answers from the qwen oracle's generator in run 20, the only reason its status stayed unverified</div></div>
+</div>
+<p>Read together: the solver is no longer the problem on this statement, and the harness now certifies timing on a legal maximum input. What remains is the oracle's generator, which is a model choice made in batch 9, and the latency cliff of a single thinking attempt, which batch 10 addresses by putting the code block first so a cut-off still yields the solution.</p>
+
+<h2>Per-run verdicts</h2>
+<div class="scroll"><table>
+<thead><tr><th>Run</th><th>Oracle / stress author</th><th>Solve</th><th>Correct</th><th>Max-size timing</th><th>Status</th><th>Why not a full pass</th></tr></thead>
+<tbody>
+<tr><td class="id">17</td><td>qwen / qwen</td><td>timeout at 200 s cap</td><td>–</td><td>–</td><td><span class="pill no">no candidate</span></td><td>reply discarded on timeout</td></tr>
+<tr><td class="id">18</td><td>qwen / qwen</td><td>cut at 240 s, code salvaged</td><td><span class="pill ok">0 / 12,225</span></td><td>skipped: 7-op input answered in 0 s</td><td><span class="pill warn">unverified</span></td><td>oracle rejected all examples and edges; tiny max input</td></tr>
+<tr><td class="id">19</td><td>qwen / opus-low</td><td>180 s</td><td><span class="pill ok">0 / 3,200</span></td><td>unjudged 5.8 MB input</td><td><span class="pill warn">unverified</span></td><td>oracle rejects 52 % of its own inputs; all 75 answers identical; health check ran too late</td></tr>
+<tr><td class="id">20</td><td>qwen / opus-low</td><td>166 s</td><td><span class="pill ok">0 / 12,632</span></td><td><span class="pill ok">passed 0.38 s, bounds-checked</span></td><td><span class="pill warn">unverified</span></td><td>small tier weak; regenerated oracle had a syntax error</td></tr>
+<tr><td class="id">21</td><td>opus-low / opus-low</td><td>cut at 240 s, code not closed</td><td>–</td><td>–</td><td><span class="pill no">no candidate</span></td><td>oracle took 155 s; code block behind two prose blocks</td></tr>
+</tbody></table></div>
+
+<h2>Mechanical facts per run</h2>
+<p class="meta">Latencies in seconds. Cost is what the key was charged where known.</p>
+<div class="scroll"><table>
+<thead><tr><th>Run</th><th>Status</th><th class="num">Elapsed</th><th class="num">Cost $</th><th class="num">solve</th><th class="num">oracle</th><th class="num">stress</th><th class="num">examples agree / disagree / rejected</th><th class="num">small / med / edge</th><th>Stress source, validity</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td class="id">17</td><td>no candidate</td><td class="num">199.5</td><td class="num">~0.16</td><td class="num">199.5 t/o</td><td class="num">20</td><td class="num">10</td><td class="num">–</td><td class="num">200 / 20 / 1</td><td>gen_large, accepted</td><td>partial reply discarded</td></tr>
+<tr><td class="id">18</td><td>unverified</td><td class="num">241.0</td><td class="num">~0.16</td><td class="num">240 cut, salvaged</td><td class="num">45</td><td class="num">37</td><td class="num">0 / 0 / 4</td><td class="num">200 / 6 / 0</td><td>gen_max 3.4 KB, suspicious</td><td>195 of 200 small answers identical, not yet detected</td></tr>
+<tr><td class="id">19</td><td>unverified</td><td class="num">183.2</td><td class="num">0.57</td><td class="num">180</td><td class="num">17</td><td class="num">79</td><td class="num">3 / 0 / 0</td><td class="num">75 / 7 / 8</td><td>gen_max 5.8 MB, unjudged, 2.4 s</td><td>health check at 180 s with 105 s left, under the 130 s threshold</td></tr>
+<tr><td class="id">20</td><td>unverified</td><td class="num">173.8</td><td class="num">0.57</td><td class="num">166</td><td class="num">18, regen 21</td><td class="num">71</td><td class="num">5 / 0 / 0</td><td class="num">200 / 0 / 9</td><td>gen_max 9.8 MB, bounds-checked, 0.382 s pass</td><td>health trigger at 41 s during overlap; replacement unusable, original kept</td></tr>
+<tr><td class="id">21</td><td>no candidate</td><td class="num">241.1</td><td class="num">0.57</td><td class="num">240 cut, no code</td><td class="num">155</td><td class="num">70</td><td class="num">–</td><td class="num">–</td><td>gen_max 6.8 MB, bounds-checked</td><td>three Opus calls filled the concurrency cap</td></tr>
+</tbody></table></div>
+
+<h2>What the system is lacking now</h2>
+<div class="split">
+<div class="gap"><h3><span class="k">T1</span>The code block sits behind two prose blocks<span class="runs">runs 17, 21</span></h3><p>Rules and design before code was right for a non-reasoning model. A thinking model reads in its reasoning tokens; the visible prose is a second pass before the first line of code, and a cut-off at the cap then salvages nothing.</p><p class="fix"><b>Change:</b> code first, examples second, then short rules, design and traps. In batch 10.</p></div>
+<div class="gap"><h3><span class="k">T2</span>Oracle and stress authors need a sub-minute model<span class="runs">run 21</span></h3><p>qwen was dropped for being wrong, not slow; Opus at low effort was right but took 155 s, starting preparation late and filling the concurrency cap.</p><p class="fix"><b>Change:</b> Sonnet 5 at low effort in the fast role for both authors. In batch 10.</p></div>
+<div class="gap"><h3><span class="k">T3</span>Solve latency variance against a fixed cap<span class="runs">3 of 10 cut</span></h3><p>Ten Opus solves at medium effort ran 152–240+ s; three did not finish by their cap.</p><p class="fix"><b>Change:</b> T1 makes a cut recoverable; if the cut rate stays high, lower the solve effort and measure correctness.</p></div>
+<div class="gap"><h3><span class="k">T4</span>Worst-case timing coverage is the author's guess<span class="runs">run 20</span></h3><p>The legal 9.8 MB input ran in 0.38 s; the adjudicator's in-bounds worst case for the same candidate ran in 5.2–6.3 s against our 5 s limit.</p><p class="fix"><b>Not addressed:</b> the judge's limit is unknown; <code>EXPECTED_MAX</code> catches inputs that stop early, not shapes that are merely easy.</p></div>
+<div class="gap"><h3><span class="k">T5</span>A bounds check from a weak model is unsound<span class="runs">run 20</span></h3><p>The qwen <code>bounds()</code> omitted descriptor nodes and nesting; the input happened to be legal.</p><p class="fix"><b>Change:</b> a stronger author (T2); cross-check <code>bounds()</code> against <code>validate()</code> on the small tier if spurious verdicts appear.</p></div>
+</div>
+
+<h2>Model capability, stated plainly</h2>
+<p><b><code>claude-opus-5</code>, medium effort, as the solver</b>: three candidates, all correct on 3,200–12,632 inputs, asymptotically right each time. 152–240+ s, about $0.40 per attempt. No longer the problem on this statement.</p>
+<p><b><code>claude-opus-5</code>, low effort, as the stress author</b>: valid edges and legal, large, 10<sup>18</sup>-bearing max inputs in three of three runs, one with an off-by-one that ended processing early, now detected by <code>EXPECTED_MAX</code>. 70–79 s. As the oracle author: 155 s, too slow for the overlap.</p>
+<p><b><code>qwen3-coder</code> as the oracle author</b>: constant answers, precondition checks off by one, no array path, a regenerated replacement with a syntax error. Retired from the role.</p>
+
+<h2>What to do next, in order</h2>
+<ol class="next">
+<li><b>Batch 10, then one run of 5cb2.</b> If the candidate lands and the oracle's tiers are varied, the run should reach <code>passed_all_gates</code> for the first time.</li>
+<li><b>If the solve is still cut</b> in more than one run of three, lower the solve effort and measure.</li>
+<li><b>Only then</b> the other three focus problems, then all ten.</li>
+<li><b>The key has about $0.60 left</b>; a run costs $0.55–0.70.</li>
+</ol>
+<p class="foot">Sources: <code>runs/bench17</code> to <code>runs/bench21</code>, and the adjudication reports under <code>.superpowers/sdd/2026-09-12-challengebox-solver/</code>. Markdown twin: <code>BENCHMARK-ANALYSIS-ROUND15.md</code>.</p>
+</div>
