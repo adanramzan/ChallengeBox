@@ -1,0 +1,108 @@
+<title>Round 14 Post-Mortem</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#f3f5f7; --paper:#ffffff; --ink:#18212b; --ink-2:#4a5563; --ink-3:#7a8493; --line:#d9dee5;
+  --accent:#0f6e73; --accent-soft:#e0f0f0; --no:#b42318; --no-soft:#fbe9e6; --warn:#9a6700; --warn-soft:#fbf1d6; --ok:#1f7a3a; --ok-soft:#e2f2e6;
+  --serif:"Source Serif 4",Georgia,"Times New Roman",serif; --sans:"IBM Plex Sans","Helvetica Neue",Arial,sans-serif; --mono:"IBM Plex Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#12171d; --paper:#1a2129; --ink:#e8ecf1; --ink-2:#b4bcc7; --ink-3:#7f8896; --line:#2c3541;
+  --accent:#5fc3c7; --accent-soft:#12383a; --no:#f0857a; --no-soft:#3d1c19; --warn:#e0b34a; --warn-soft:#3a2f12; --ok:#7ccf8f; --ok-soft:#173a22;
+}}
+:root[data-theme="dark"]{
+  --bg:#12171d; --paper:#1a2129; --ink:#e8ecf1; --ink-2:#b4bcc7; --ink-3:#7f8896; --line:#2c3541;
+  --accent:#5fc3c7; --accent-soft:#12383a; --no:#f0857a; --no-soft:#3d1c19; --warn:#e0b34a; --warn-soft:#3a2f12; --ok:#7ccf8f; --ok-soft:#173a22;
+}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.55;padding-block:40px 80px;padding-inline:clamp(16px,4vw,48px)}
+.wrap{max-width:1180px;margin:0 auto}
+h1{font-family:var(--serif);font-weight:700;font-size:clamp(28px,4vw,40px);line-height:1.15;margin:0 0 6px;text-wrap:balance}
+h2{font-family:var(--serif);font-weight:600;font-size:22px;margin:44px 0 12px;text-wrap:balance}
+h3{font-size:15px;font-weight:600;margin:22px 0 6px}
+p{max-width:70ch;margin:0 0 12px;color:var(--ink)}
+.eyebrow{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3);margin-bottom:10px}
+.meta{color:var(--ink-2);font-size:14px;max-width:80ch}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:24px 0 8px}
+.tile{background:var(--paper);border:1px solid var(--line);padding:14px 16px}
+.tile .n{font-family:var(--serif);font-size:34px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.tile .l{font-size:13px;color:var(--ink-2);margin-top:6px}
+.tile.no .n{color:var(--no)} .tile.warn .n{color:var(--warn)} .tile.acc .n{color:var(--accent)} .tile.ok .n{color:var(--ok)}
+.scroll{overflow-x:auto;border:1px solid var(--line);background:var(--paper)}
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top;text-align:left}
+th{font-size:12px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-3);font-weight:600;background:var(--paper);position:sticky;top:0}
+td.id,td.num,th.num{font-family:var(--mono);font-size:12.5px;white-space:nowrap}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+tr:last-child td{border-bottom:none}
+.pill{display:inline-block;padding:1px 8px;border-radius:3px;font-size:12px;font-weight:600;white-space:nowrap}
+.pill.no{background:var(--no-soft);color:var(--no)} .pill.warn{background:var(--warn-soft);color:var(--warn)} .pill.ok{background:var(--ok-soft);color:var(--ok)} .pill.acc{background:var(--accent-soft);color:var(--accent)}
+.split{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.gap{background:var(--paper);border:1px solid var(--line);padding:14px 16px}
+.gap h3{margin:0 0 6px;display:flex;gap:10px;align-items:baseline}
+.gap .k{font-family:var(--mono);color:var(--accent);font-size:12.5px}
+.gap .runs{font-size:12.5px;color:var(--ink-3);margin-left:auto;white-space:nowrap}
+.gap p{font-size:14px;margin-bottom:8px}
+.gap p.fix{color:var(--ink-2)} .gap p.fix b{color:var(--ink)}
+ol.next{max-width:75ch;padding-left:22px} ol.next li{margin-bottom:6px}
+code{font-family:var(--mono);font-size:.92em;background:var(--accent-soft);padding:0 4px;border-radius:2px}
+.foot{margin-top:40px;font-size:13px;color:var(--ink-3);max-width:80ch}
+@media (max-width:640px){ h2{margin-top:32px} }
+</style>
+<div class="wrap">
+<div class="eyebrow">ChallengeBox solver · benchmark round 14 · 2026-09-14 · focus problem 5cb294c18288</div>
+<h1>First correct candidate, failed by its own timing gate</h1>
+<p class="meta">Branch <code>solver</code> at <code>27e19a2</code>, 19 commits after round 13, 247 tests passing. Two runs of the focus problem are compared, qwen in both roles and then <code>claude-opus-5</code> at medium effort in the strong role, plus two side runs from a four-problem batch that the OpenRouter key limit cut short at $1.13. Every run was adjudicated by an independent Opus agent with its own literal reference, hand traces, and 1,000–4,000 diffed inputs including the <code>repeat</code> family that random inputs miss.</p>
+
+<div class="tiles">
+  <div class="tile ok"><div class="n">0 %</div><div class="l">mismatch of the emitted Opus candidate on every input family, including counts of 10<sup>18</sup></div></div>
+  <div class="tile ok"><div class="n">0.74 s</div><div class="l">its worst time on legal maximum inputs; the gate killed it at 20 s on an input nested 3,333× past the stated cap</div></div>
+  <div class="tile warn"><div class="n">150–200 s</div><div class="l">per Opus solve at medium effort; no repair or fresh solve fits after two parallel attempts</div></div>
+  <div class="tile no"><div class="n">2 / 2</div><div class="l">side runs lost to the qwen oracle: phantom counterexamples on one, a wrong conjunct on the other</div></div>
+</div>
+<p>Read together: with a thinking model in the strong role the candidates are right, and the system is now what stands between them and a clean pass. On the focus problem the model produced a correct, fast solution and the gate failed it on an input the statement forbids.</p>
+
+<h2>Per-run verdicts</h2>
+<div class="scroll"><table>
+<thead><tr><th>Run</th><th>Strong / fast</th><th>Emitted</th><th>Correct per adjudicator</th><th>Fast enough on legal max input</th><th>Status given</th><th>Hidden</th><th>Primary cause</th></tr></thead>
+<tbody>
+<tr><td class="id">bench14 · 5cb2</td><td>qwen / qwen</td><td class="id">c4, 2 repairs</td><td>yes, 0 % on every family</td><td>no: iterates <code>default k</code> to 10<sup>18</sup></td><td>unverified, false example dispute</td><td><span class="pill no">UNLIKELY</span></td><td><span class="pill warn">MODEL-SOLVE</span></td></tr>
+<tr><td class="id">bench15 · 5cb2</td><td>opus-5 / qwen</td><td class="id">c1 of 2</td><td>yes, 0 % on every family</td><td>yes: 0.74 s worst on in-spec maxima</td><td>with failures, stress on an illegal input</td><td><span class="pill ok">LIKELY</span></td><td><span class="pill acc">MODEL-STRESS</span></td></tr>
+<tr><td class="id">bench16 · 1c18 (side)</td><td>opus-5 / qwen</td><td class="id">c1</td><td>19.8 % wrong: one sentinel bug at R = N</td><td>yes, 0.87 s at max</td><td>with failures</td><td><span class="pill no">NO</span></td><td><span class="pill warn">MODEL-SOLVE</span></td></tr>
+<tr><td class="id">bench16 · 1dea (side)</td><td>opus-5 / qwen</td><td class="id">c1 of 2</td><td>yes, 0 % on 3,445 inputs, intended treap</td><td>5.1 s vs our 5 s cap; no stated limit</td><td>with failures, oracle wrong</td><td><span class="pill ok">LIKELY</span></td><td><span class="pill acc">ARCH-REPAIR</span></td></tr>
+</tbody></table></div>
+
+<h2>Mechanical facts per run</h2>
+<p class="meta">Latencies in seconds per call. Reasoning tokens are part of completion tokens. Opus at medium effort spends 7–10k reasoning tokens per solve; two parallel attempts cost no wall time but $0.75 per problem and leave no room for a repair (cap 67–71 s) or a fresh solve.</p>
+<div class="scroll"><table>
+<thead><tr><th>Run</th><th>Status</th><th class="num">Cand.</th><th class="num">Elapsed s</th><th class="num">Cost $</th><th class="num">solve</th><th class="num">oracle</th><th class="num">stress</th><th class="num">repair</th><th class="num">reasoning tok</th><th class="num">small / med / edge</th><th>Stress source</th><th class="num">examples agree / disagree / rejected</th><th>Gate result</th></tr></thead>
+<tbody>
+<tr><td class="id">bench14 5cb2</td><td>unverified</td><td class="num">4</td><td class="num">163.6</td><td class="num">0.049</td><td class="num">17 / 17</td><td class="num">30, regen 21</td><td class="num">51</td><td class="num">13 / 11</td><td class="num">0</td><td class="num">200 / 0 / 2</td><td>gen_max 476 KB, no <code>default</code> op, invalid op at index 1</td><td class="num">3 / 7 (all rejections) / –</td><td>c4 all pass; diff evidence degraded</td></tr>
+<tr><td class="id">bench15 5cb2</td><td>with failures</td><td class="num">2</td><td class="num">239.1</td><td class="num">0.763</td><td class="num">152 / 196</td><td class="num">29</td><td class="num">12</td><td class="num">–</td><td class="num">7.4k / 9.7k</td><td class="num">200 / 20 / 9</td><td>gen_max 8.7 MB, nesting 200,000 vs cap 60</td><td class="num">6 / 0 / 2</td><td>all correctness tiers pass; stress killed at cap</td></tr>
+<tr><td class="id">bench16 1c18</td><td>with failures</td><td class="num">1</td><td class="num">275.0</td><td class="num">0.375</td><td class="num">168 / t/o 200</td><td class="num">12</td><td class="num">9</td><td class="num">t/o 67</td><td class="num">8.6k</td><td class="num">200 / 20 / 9</td><td>medium, degraded</td><td class="num">3 / 1 / 0</td><td>edge 1/9, small 35/200, medium 6/20; all phantoms</td></tr>
+<tr><td class="id">bench16 1dea</td><td>with failures</td><td class="num">2</td><td class="num">192.8</td><td class="num">0.754</td><td class="num">167 / 173</td><td class="num">13</td><td class="num">11</td><td class="num">403</td><td class="num">7.9k / 9.6k</td><td class="num">158 / 13 / 9</td><td>gen_max 4.6 MB</td><td class="num">8 / 1 / 0</td><td>small 44/158 on the oracle's bug; stress 5.38 s vs 5</td></tr>
+</tbody></table></div>
+
+<h2>What the system is lacking now, ranked by what it cost on the focus problem</h2>
+<div class="split">
+<div class="gap"><h3><span class="k">S1</span>An unjudged max-size input is the only timing evidence<span class="runs">bench15</span></h3><p>The stress author defined a nesting cap of 60 and never used it; the input nested 200,000 deep. The validator is the literal reference, which cannot finish at max size, so it gave no verdict and the harness used the input undegraded. Both candidates were killed on an input the statement forbids; the correct one was emitted only by tie-break, and the other is 10× slower on legal maxima.</p><p class="fix"><b>Change:</b> no validate verdict means degraded stress evidence, never a failure; <code>gen_max</code> must assert every stated bound before returning; when two candidates pass, the faster measured one wins.</p></div>
+<div class="gap"><h3><span class="k">S2</span>Examples spelled with arithmetic are dropped<span class="runs">bench15</span></h3><p><code>ast.literal_eval</code> rejects <code>10**18</code>, so the two examples covering the 10<sup>18</sup> trap were lost and c1 kept three small ones.</p><p class="fix"><b>Change:</b> evaluate example lines with a restricted AST that allows integer arithmetic over constants.</p></div>
+<div class="gap"><h3><span class="k">S3</span>Gating waits for the slowest attempt<span class="runs">43 s, 31 s</span></h3><p>The orchestrator joins on all attempts before gating any. With a thinking model the second attempt can be 40 s behind or hit the cap.</p><p class="fix"><b>Change:</b> gate each candidate as its reply arrives.</p></div>
+<div class="gap"><h3><span class="k">S4</span>The repair call cannot fit a thinking model<span class="runs">bench16 1c18</span></h3><p>The repair cap is 25 % of usable, tuned to a 12 s model; against a 168 s role it is a guaranteed timeout.</p><p class="fix"><b>Change:</b> per-role reasoning effort for repairs and fresh solves (low), a cap that follows the role's measured latency, and a repair that cannot fit is skipped rather than started.</p></div>
+<div class="gap"><h3><span class="k">S5</span>Two candidates against one oracle is still not a signal<span class="runs">bench16 1dea</span></h3><p>Both candidates agreed byte-for-byte against the oracle on the failing input, a hand-traced example contradicted the oracle on the same rule, and the errored repair call's fallback verdict was <code>candidate</code>.</p><p class="fix"><b>Change:</b> identical candidate outputs on the failing case count toward the oracle dispute; an errored repair call yields no verdict.</p></div>
+<div class="gap"><h3><span class="k">S6</span>The examples author's inputs can be out of contract<span class="runs">5 of 18</span></h3><p>Handled since batch 4 (rejections are not disagreements), but each rejected example is a lost check.</p><p class="fix"><b>Change:</b> one sentence in the examples block: satisfy every stated precondition and spell containers exactly as the contract says.</p></div>
+</div>
+
+<h2>Model capability, stated plainly</h2>
+<p><b><code>anthropic/claude-opus-5</code>, medium effort</b>: correct semantics and intended complexity on 5cb2 and 1dea, and the right reading plus one sentinel bug on 1c18, where every earlier model misread the statement. 150–200 s per solve, $0.30–0.40 per attempt. This is the model to keep in the strong role.</p>
+<p><b><code>qwen/qwen3-coder</code> as the oracle author</b>: 12–30 s per call and usable on 5cb2, but wrong on 1c18 (two misreads, every counterexample a phantom) and on 1dea (one wrong conjunct). The oracle is now the weaker author, which is what S5 exists for.</p>
+<p>The OpenRouter key's total limit was hit at $1.13 into the four-problem batch; its last two rows are key failures, not solver results.</p>
+
+<h2>What to do next, in order</h2>
+<ol class="next">
+<li><b>S1 and S2.</b> They turned a correct, fast 5cb2 candidate into "with failures".</li>
+<li><b>S3 and S4.</b> They make a repair possible at all with the thinking model.</li>
+<li><b>S5 and S6.</b> Cheap, and the side runs show they cost real points.</li>
+<li><b>Re-run 5cb2 alone</b>, per the standing rule of one problem until it passes, then scale out.</li>
+</ol>
+<p class="foot">Sources: <code>runs/bench14</code>, <code>runs/bench15</code>, <code>runs/bench16</code>, and the adjudication reports under <code>.superpowers/sdd/2026-09-12-challengebox-solver/</code>. Markdown twin: <code>BENCHMARK-ANALYSIS-ROUND14.md</code>.</p>
+</div>
